@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+            content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+        <title>東方ダンマクカグラ Reborn 利用規約</title>
+        <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #12121a;
+            color: #e0e0e0;
+            font-family: sans-serif;
+            box-sizing: border-box;
+        }
+
+        .wrapper {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            padding: 12px 20px;
+            box-sizing: border-box;
+        }
+
+        @media screen and (orientation: landscape) {
+            .wrapper {
+                padding-left: calc(20px + env(safe-area-inset-left));
+                padding-right: calc(20px + env(safe-area-inset-right));
+                padding-bottom: calc(8px + env(safe-area-inset-bottom));
+            }
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #ff6584;
+            padding-bottom: 6px;
+            margin-bottom: 10px;
+            flex-shrink: 0;
+        }
+
+        h1 {
+            color: #ff6584;
+            font-size: 16px;
+            margin: 0;
+        }
+
+        .notice {
+            background: #1e1e2d;
+            border-left: 4px solid #4caf50;
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            color: #a5d6a7;
+            font-size: 13px;
+            font-weight: bold;
+            flex-shrink: 0;
+            line-height: 1.5;
+        }
+
+        .tos-content {
+            flex: 1;
+            overflow-y: auto;
+            background: #161622;
+            padding: 12px 14px;
+            border-radius: 6px;
+            border: 1px solid #222233;
+            margin-bottom: 12px;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .lang-title {
+            color: #ff6584;
+            font-size: 13px;
+            font-weight: bold;
+            margin: 14px 0 6px 0;
+        }
+
+        .lang-title:first-child {
+            margin-top: 0;
+        }
+
+        p {
+            line-height: 1.6;
+            font-size: 13px;
+            margin: 0 0 8px 0;
+        }
+
+        .desc {
+            color: #aaa;
+            font-size: 13px;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid #28283c;
+            margin: 10px 0;
+        }
+
+        .btn-container {
+            text-align: center;
+            flex-shrink: 0;
+            margin-bottom: 4px;
+        }
+
+        .tap-btn {
+            display: inline-block;
+            box-sizing: border-box;
+            background: linear-gradient(135deg, #ff6584, #f50057);
+            color: #ffffff;
+            font-size: 15px;
+            font-weight: bold;
+            border: none;
+            padding: 10px 40px;
+            border-radius: 20px;
+            box-shadow: 0 4px 15px rgba(255, 101, 132, 0.4);
+            cursor: pointer;
+            width: 80%;
+            max-width: 280px;
+            outline: none;
+            text-decoration: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .tap-btn:active {
+            transform: scale(0.97);
+            opacity: 0.9;
+        }
+        </style>
+        <script>
+        // Consent is recorded only when the user actually taps the button.
+        // Nothing here fires automatically: no timers, no scroll handlers.
+        function sendTosRead() {
+            try {
+                if (window.Unity && typeof window.Unity.call === 'function') {
+                    window.Unity.call('tos_read');
+                    return true;
+                }
+            } catch (e) {}
+            try {
+                if (window.webkit && window.webkit.messageHandlers
+                        && window.webkit.messageHandlers.unityControl) {
+                    window.webkit.messageHandlers.unityControl.postMessage('tos_read');
+                    return true;
+                }
+            } catch (e) {}
+            // Fall back to the custom scheme on the anchor itself.
+            return false;
+        }
+        </script>
+    </head>
+    <body>
+        <div class="wrapper">
+            <div class="header">
+                <h1>東方ダンマクカグラ Reborn</h1>
+            </div>
+
+            <div class="tos-content">
+                <p>本服务器为非营利性的数字保存（Digital
+                    Preservation）与学术研究项目。</p>
+                <p class="desc">·
+                    本项目完全承认并尊重原版权方及相关权利主体对《東方ダンマクカグラ》拥有的全部知识产权（包括但不限于商标、美术素材、代码、音乐等）。本项目不持有任何资产所有权，与官方无商业关联。服务完全免费，不含任何盈利性分成或商业化变现行为。</p>
+                <p class="desc">·
+                    若版权持有方认为本项目侵犯了您的权益，请联系我们，我们将在收到通知后立即无条件永久关闭服务器并销毁相关数据。</p>
+
+                <hr>
+
+                <p>本サーバーは、非営利目的のデジタル保存（Digital
+                    Preservation）および学術研究プロジェクトです。</p>
+                <p class="desc">·
+                    当プロジェクトは、原著作権者および関係権利主体が『東方ダンマクカグラ』に対して有する全ての知的財産権（商标、美術素材、コード、音楽などを含みますがこれらに限られません）を完全に認め、尊重します。当プロジェクトはいかなるゲーム資産の所有権も主張せず、公式との商業的な関係は一切ありません。本サービスは完全に無料であり、商業的な収益化や営利行為は行いません。</p>
+                <p class="desc">·
+                    万が一、正当な著作権者様が当プロジェクトの存在に異議を唱えられる場合は、ご連絡をいただければ、速やかに無条件でサーバーを永久に閉鎖し、関連データを全て破棄することをお約束いたします。</p>
+
+                <hr>
+
+                <p>This server operates as a
+                    non-profit, educational digital
+                    preservation and research project.</p>
+                <p class="desc">· We strictly respect all intellectual property
+                    rights held by the original developers, publishers, and
+                    related right-holders of "Touhou Danmaku Kagura", as well as
+                    Team Shanghai Alice (ZUN). This project does not claim any
+                    ownership over game assets and operates with zero
+                    monetization or commercial purposes.</p>
+                <p class="desc">· If any legitimate copyright owner objects to
+                    this historical preservation initiative, please contact us.
+                    We guarantee to shut down the server and delete all
+                    associated data within 24 hours upon identity
+                    verification.</p>
+            </div>
+
+            <div class="btn-container">
+                <a href="unity:tos_read" class="tap-btn"
+                    onclick="sendTosRead();">
+                    同意する / I Agree / 我同意
+                </a>
+            </div>
+        </div>
+    </body>
+</html>

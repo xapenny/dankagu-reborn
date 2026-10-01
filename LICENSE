@@ -1,0 +1,44 @@
+MIT License
+
+Copyright (c) 2026 白鷺シオナ (Shiona)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+ADDITIONAL NOTICE — SCOPE OF THIS LICENSE
+================================================================================
+
+This license covers the original server implementation source code in this
+repository only. It does NOT grant any rights to:
+
+  * "Touhou Danmaku Kagura" (東方ダンマクカグラ), its artwork, audio, music,
+    charts, master data, story text, or any other game content, which are the
+    property of their respective rights holders, including Unknown X
+    (AQUASTYLE / DeNA / xeen) and DeNA Co., Ltd.;
+  * the proprietary DeNA "Takasho" and "LCX" protocol implementations, or any
+    cryptographic key material belonging to those services.
+
+This project is an independent, non-commercial preservation effort. It was
+developed for interoperability with clients that users already possess, and it
+is not affiliated with, endorsed by, or sponsored by Team Shanghai Alice,
+Unknown X, DeNA Co., Ltd., or any of their affiliates. It ships no game content
+and no proprietary key material.
+
+Third-party components are covered by their own licenses; see
+THIRD_PARTY_NOTICES.md.

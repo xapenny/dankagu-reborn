@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Secrets and local configuration (never commit real values)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+
+# Game binaries and large assets (preserved on disk, ignored in git)
+reference/
+*.ipa
+*.apk
+*.adbk
+data/dankagu.db
+data/assets/*/
+data/assets-cdn/
+data/manifest/*.json
+# Decrypted master database extracted from the client.
+data/arg_m_master_dec.db
+# Operator-supplied response templates. Not distributed; provide your own.
+# See the README section on data you must supply.
+data/hexdata/*/
+
+# TLS material is generated locally, never distributed. Run:
+#   python -m dankagu.core.certs
+certs/
+
+# Protocol schemas are third-party content and are not redistributed here.
+# Fetch them with: python scripts/compile_protos.py --fetch
+# See THIRD_PARTY_NOTICES.md for the source and its license.
+protos/
+vendor-protos/
+
+# Generated protobuf/gRPC stubs are build output, not source. They are
+# recreated by: python scripts/compile_protos.py
+src/dankagu/grpc/generated/
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+Thumbs.db
+.DS_Store
+
+# Temporary outputs
+scratch/
+tmp/
+audit_mock.py
+
+# Local working directories
+work/
+out/
+
+server.log
+certs/*.crt
+certs/*.key
