@@ -30,10 +30,16 @@ jobs:
       matrix:
         python: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to full commit SHAs rather than mutable major tags,
+      # so the code CI runs cannot change underneath it. The trailing comment
+      # records the release each SHA corresponds to; Dependabot keeps both the
+      # SHA and that comment up to date.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
@@ -56,10 +62,12 @@ jobs:
     name: Lint & format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
 
@@ -77,14 +85,65 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check src tests scripts
 
+  workflow-lint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # actionlint and zizmor catch what no Python test can: a workflow file is
+      # not imported by anything in tests/, so a green test suite says nothing
+      # about it. Both are pinned release tarballs verified against their
+      # published SHA-256, so no third-party action executes here.
+      #
+      # To refresh a pin: bump the version, then take the new hash from the
+      # GitHub release's asset digest (or actionlint's checksums.txt asset).
+      # Dependabot cannot track these two URLs, so this is a manual bump.
+      - name: Install actionlint 1.7.12 (checksum verified)
+        run: |
+          set -euo pipefail
+          AL_VERSION=1.7.12
+          AL_SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          curl -sSfL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${AL_VERSION}/actionlint_${AL_VERSION}_linux_amd64.tar.gz"
+          echo "${AL_SHA256}  actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf actionlint.tar.gz actionlint
+          install -m 0755 actionlint /usr/local/bin/actionlint
+          actionlint --version
+
+      - name: Install zizmor 1.30.1 (checksum verified)
+        run: |
+          set -euo pipefail
+          ZZ_VERSION=1.30.1
+          ZZ_SHA256=e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a
+          curl -sSfL -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZZ_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZZ_SHA256}  zizmor.tar.gz" | sha256sum --check --strict
+          mkdir -p /tmp/zizmor
+          tar -xzf zizmor.tar.gz -C /tmp/zizmor
+          install -m 0755 /tmp/zizmor/zizmor /usr/local/bin/zizmor
+          zizmor --version
+
+      - name: actionlint
+        run: actionlint -color
+
+      - name: zizmor
+        # Persona-aware audit of every workflow. Findings are the purpose of
+        # the job, so a non-zero exit fails CI.
+        run: zizmor --persona auditor .github/workflows
+
   build:
     name: Build distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
 
@@ -98,7 +157,7 @@ jobs:
         run: uv build
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
