@@ -1,6 +1,7 @@
 """Takasho Friend servicer."""
 
 import logging
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler

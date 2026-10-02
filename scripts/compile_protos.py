@@ -120,7 +120,9 @@ def compile_all_protos() -> int:
             file_path = Path(root) / file_name
             content = file_path.read_text(encoding="utf-8")
             new_content = re.sub(r"(from\s+)(takasho\.)", r"\1dankagu.grpc.generated.\2", content)
-            new_content = re.sub(r"(import\s+)(takasho\.)", r"\1dankagu.grpc.generated.\2", new_content)
+            new_content = re.sub(
+                r"(import\s+)(takasho\.)", r"\1dankagu.grpc.generated.\2", new_content
+            )
             if new_content != content:
                 file_path.write_text(new_content, encoding="utf-8")
 

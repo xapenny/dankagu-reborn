@@ -1,7 +1,7 @@
 """Takasho LootBoxV3 servicer for gacha banners and pulls."""
 
 import logging
-from pathlib import Path
+
 import grpc
 
 from dankagu.config import settings
@@ -43,7 +43,11 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         logger.info(
             "🎁 Loaded %d pages of loot boxes (root page has %d items)",
             len(self.pages),
-            len(self.pages.get("", loot_box_pb2.LootBoxV3GetAvailableV1.Response()).loot_box_products),
+            len(
+                self.pages.get(
+                    "", loot_box_pb2.LootBoxV3GetAvailableV1.Response()
+                ).loot_box_products
+            ),
         )
 
     async def GetAvailableV1(

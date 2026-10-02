@@ -57,7 +57,10 @@ async def run_servers() -> None:
             return
         if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (10054, 10053, 121):
             return
-        if "An existing connection was forcibly closed by the remote host" in str(exc) or "_call_connection_lost" in msg:
+        if (
+            "An existing connection was forcibly closed by the remote host" in str(exc)
+            or "_call_connection_lost" in msg
+        ):
             return
         loop.default_exception_handler(context)
 
@@ -127,9 +130,19 @@ async def run_servers() -> None:
     logger.info("✅ [LCX Auth Android (HTTPS)] https://%s:%d", settings.host, settings.lcx_port)
 
     logger.info("==================================================================")
-    logger.info("👉 Step 1: Open a browser on your phone: http://%s:%d/ to install the CA", lan_ip, settings.asset_port)
-    logger.info("👉 Step 2: Point the client at %s (LCX https://%s:%d, gRPC %s:%d)",
-                settings.public_host or lan_ip, lan_ip, settings.lcx_ios_port, lan_ip, settings.grpc_port)
+    logger.info(
+        "👉 Step 1: Open a browser on your phone: http://%s:%d/ to install the CA",
+        lan_ip,
+        settings.asset_port,
+    )
+    logger.info(
+        "👉 Step 2: Point the client at %s (LCX https://%s:%d, gRPC %s:%d)",
+        settings.public_host or lan_ip,
+        lan_ip,
+        settings.lcx_ios_port,
+        lan_ip,
+        settings.grpc_port,
+    )
     logger.info("👉 Step 3: Launch Danmaku Kagura app!")
     logger.info("==================================================================")
 

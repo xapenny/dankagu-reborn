@@ -1,5 +1,6 @@
 import logging
 import time
+
 import grpc
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -31,7 +32,9 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response:
         logger.info("🔑 [PKVS] IncrementPlayerKeyValuesV1")
-        response = player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+        response = (
+            player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+        )
         for item in request.player_key_values:
             pkv = response.player_key_values.add()
             pkv.key = item.key

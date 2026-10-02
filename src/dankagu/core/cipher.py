@@ -1,6 +1,4 @@
-"""Takasho symmetric block cipher (ChaCha/Salsa variant).
-
-"""
+"""Takasho symmetric block cipher (ChaCha/Salsa variant)."""
 
 from typing import Final
 

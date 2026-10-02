@@ -1,6 +1,7 @@
 """Takasho BaasProduct servicer for subscription and pass products."""
 
 import logging
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler

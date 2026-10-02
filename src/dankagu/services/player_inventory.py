@@ -2,13 +2,13 @@
 
 import logging
 import time
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_inventory_pb2,
     player_inventory_pb2_grpc,
-    wallet_pb2,
 )
 
 logger = logging.getLogger("dankagu.services.player_inventory")

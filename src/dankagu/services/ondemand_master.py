@@ -30,7 +30,7 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
                 )
                 for e in gacha_resp.entries:
                     self._gacha_entries.setdefault(e.key, []).append(e.value)
-            except Exception as exc:
+            except Exception:
                 pass
 
     async def GetEntriesV1(

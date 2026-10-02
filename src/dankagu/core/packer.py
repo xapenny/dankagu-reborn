@@ -35,7 +35,9 @@ class TakashoPacker:
         if len(key) != 32:
             raise ValueError(f"Key must be 32 bytes, got {len(key)}")
         self._key: bytes = key
-        self._fallback_keys: list[bytes] = [k for k in (fallback_keys or []) if len(k) == 32 and k != key]
+        self._fallback_keys: list[bytes] = [
+            k for k in (fallback_keys or []) if len(k) == 32 and k != key
+        ]
         self._active_key: bytes = key
 
     def compute_hmac(self, nonce: bytes, body: bytes, key: bytes | None = None) -> bytes:
@@ -111,7 +113,9 @@ class TakashoPacker:
                 f"Data too short ({len(framed_data)} bytes), minimum {self.NONCE_SIZE} bytes"
             )
 
-        candidate_keys = [self._active_key] + [k for k in [self._key] + self._fallback_keys if k != self._active_key]
+        candidate_keys = [self._active_key] + [
+            k for k in [self._key] + self._fallback_keys if k != self._active_key
+        ]
         last_err: Exception | None = None
 
         for k in candidate_keys:
@@ -146,4 +150,3 @@ def _get_default_packer() -> TakashoPacker:
 
 # Default packer: runtime production key (if configured) with dev key fallback
 default_packer = _get_default_packer()
-

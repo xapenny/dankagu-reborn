@@ -1,6 +1,7 @@
 """Takasho Subscription RenewalReward servicer."""
 
 import logging
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler
@@ -50,9 +51,11 @@ def register_subscription_servicers(server: grpc.aio.Server) -> None:
             renewal_reward_pb2.RenewalRewardReceiveV1.Response,
         ),
     }
-    server.add_generic_rpc_handlers((
-        grpc.method_handlers_generic_handler(
-            "takasho.schema.fes.player_api.subscription.renewal_reward.RenewalReward",
-            method_handlers,
-        ),
-    ))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.subscription.renewal_reward.RenewalReward",
+                method_handlers,
+            ),
+        )
+    )

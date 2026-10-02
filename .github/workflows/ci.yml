@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# CI only ever reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the previous, still-running CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fail loudly if uv.lock drifts from pyproject.toml instead of silently
+  # resolving something that was never tested locally.
+  UV_FROZEN: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install dependencies
+        # `--extra dev` pulls pytest, pytest-asyncio, httpx, ruff and mypy.
+        run: uv sync --extra dev
+
+      - name: Fetch and compile protocol schemas
+        # Neither protos/ nor src/dankagu/grpc/generated/ is tracked: the
+        # schemas are third-party content and the stubs are build output.
+        # Both are recreated here from the upstream project. No token is
+        # needed for the public repository.
+        run: uv run python scripts/compile_protos.py --fetch
+
+      - name: Run test suite
+        run: uv run pytest -q
+
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Fetch and compile protocol schemas
+        # Required so ruff can resolve imports that reach the generated stubs.
+        run: uv run python scripts/compile_protos.py --fetch
+
+      - name: Ruff lint
+        # --output-format=github renders findings inline on the pull request.
+        run: uv run ruff check --output-format=github src tests scripts
+
+      - name: Ruff format check
+        run: uv run ruff format --check src tests scripts
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Fetch and compile protocol schemas
+        # Without this the wheel would contain no gRPC stubs and could not be
+        # imported, so the artifact would not represent a working install.
+        run: uv run python scripts/compile_protos.py --fetch
+
+      - name: Build sdist and wheel
+        # Catches packaging regressions in the hatchling configuration.
+        run: uv build
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

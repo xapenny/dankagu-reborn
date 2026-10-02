@@ -1,7 +1,6 @@
 """Takasho LoginBonus servicer."""
 
 import logging
-from pathlib import Path
 
 import grpc
 

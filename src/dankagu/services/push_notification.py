@@ -1,6 +1,7 @@
 """Takasho PushNotification servicer."""
 
 import logging
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler
@@ -22,11 +23,13 @@ class PushNotificationService(push_notification_pb2_grpc.PushNotificationService
     ) -> push_notification_pb2.PushNotificationGetConfigV2.Response:
         logger.info("🔔 [PushNotification] GetConfigV2")
         response = push_notification_pb2.PushNotificationGetConfigV2.Response()
-        response.topic_ids.extend([
-            "jp_release_i_remote_optin",
-            "jp_release_night",
-            "jp_release_i_night_optin",
-        ])
+        response.topic_ids.extend(
+            [
+                "jp_release_i_remote_optin",
+                "jp_release_night",
+                "jp_release_i_night_optin",
+            ]
+        )
         return response
 
     async def SetConfigV2(
