@@ -65,7 +65,15 @@ src/dankagu/grpc/generated/
 
 # IDE & OS
 .idea/
-.vscode/
+# `.vscode/*` rather than `.vscode/`: git does not descend into an excluded
+# directory, so the negations below would never take effect otherwise.
+.vscode/*
+# ...but keep the shared editor configuration so ruff behaviour in the editor
+# stays identical to the checks CI runs. Everything else under .vscode/ stays
+# ignored.
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/README.md
 *.swp
 *.swo
 *~

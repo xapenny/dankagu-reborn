@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json.schemastore.org/vscode-settings.json",
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "ruff.enable": true,
+  "ruff.lint.enable": true,
+  "ruff.lint.run": "onSave",
+  "ruff.configuration": "${workspaceFolder}/pyproject.toml",
+  "python.analysis.typeCheckingMode": "off",
+  "ruff.format.enable": true,
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "explicit",
+      "source.organizeImports.ruff": "explicit"
+    }
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.ruff_cache": true,
+    "**/.pytest_cache": true
+  },
+  "search.exclude": {
+    "src/dankagu/grpc/generated": true,
+    "protos": true,
+    "vendor-protos": true,
+    "uv.lock": true
+  },
+  "files.watcherExclude": {
+    "**/src/dankagu/grpc/generated/**": true,
+    "**/data/assets/**": true,
+    "**/data/manifest/**": true,
+    "**/data/hexdata/**": true
+  }
+}
