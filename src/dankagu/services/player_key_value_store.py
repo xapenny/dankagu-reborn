@@ -38,7 +38,11 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         for item in request.player_key_values:
             pkv = response.player_key_values.add()
             pkv.key = item.key
-            pkv.value = item.amount
+            # The request carries a delta (PlayerKeyValueIncrementInfo.delta);
+            # the response reports the resulting value (PlayerKeyValue.value).
+            # Reading `item.amount` here raised AttributeError - there is no
+            # such field - which the client surfaces as gRPC UNKNOWN.
+            pkv.value = item.delta
             pkv.expired_at = 4102412400
         return response
 
@@ -52,7 +56,8 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         for item in request.player_key_values:
             pkv = response.player_key_values.add()
             pkv.key = item.key
-            pkv.value = item.amount
+            # See IncrementPlayerKeyValuesV1: the field is `delta`, not `amount`.
+            pkv.value = item.delta
             pkv.expired_at = 4102412400
 
         now = int(time.time())
