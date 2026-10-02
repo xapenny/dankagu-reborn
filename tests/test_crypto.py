@@ -3,10 +3,18 @@ import base64
 import pytest
 
 from dankagu.core.cipher import Cipher
-from dankagu.core.packer import InvalidMacError, TakashoPackerError, default_packer
+from dankagu.core.packer import (
+    InvalidMacError,
+    TakashoPacker,
+    TakashoPackerError,
+    default_packer,
+)
 
 
 def test_cipher_known_vector() -> None:
+    # Synthetic known-answer key for this test only. It is passed straight to
+    # Cipher(...) and is unrelated to DANKAGU_TAKASHO_KEY_HEX (production) and
+    # to the public development key. Not a secret; safe to publish.
     key = bytes(
         [
             0x7C,
@@ -142,3 +150,75 @@ def test_packer_invalid_mac() -> None:
     forged_framed = nonce + cipher.transform(deflated)
     with pytest.raises(InvalidMacError):
         default_packer.unpack(forged_framed)
+
+
+# ---------------------------------------------------------------------------
+# Production-key path.
+#
+# Tests elsewhere exercise the packer through the module-level `default_packer`,
+# which in a clean environment has no production key and therefore always
+# succeeds via the *fallback* key. That leaves the primary key path - the one a
+# real operator runs - untested. These tests pin it down directly.
+# ---------------------------------------------------------------------------
+
+# Arbitrary 32-byte keys: the cipher and HMAC accept any key material, so a
+# roundtrip is a real assertion without needing a genuine client key.
+_PROD_LIKE_KEY = bytes(range(0x20, 0x40))
+_OTHER_KEY = bytes(range(0x60, 0x80))
+
+
+def test_packer_roundtrip_with_explicit_key() -> None:
+    packer = TakashoPacker(key=_PROD_LIKE_KEY)
+    assert packer._active_key == _PROD_LIKE_KEY
+
+    body = b"\x0a\x03takasho\x12\x02ok"
+    framed = packer.pack(body)
+
+    # 12-byte nonce prefix, and the ciphertext must not equal the plaintext.
+    assert len(framed) > 12
+    assert framed[12:] != body
+
+    assert packer.unpack(framed) == body
+
+
+def test_packer_roundtrip_with_runtime_supplied_production_key() -> None:
+    """The realistic deployment shape: a production key plus a dev fallback."""
+    packer = TakashoPacker(key=_PROD_LIKE_KEY, fallback_keys=[b"ZA1Cu0eZosC3o8YTFuGjloxRkCg6ugVv"])
+    body = b"payload"
+
+    framed = packer.pack(body)
+
+    # The frame was written with the production key, so it must be readable by
+    # a packer configured with that key alone.
+    assert TakashoPacker(key=_PROD_LIKE_KEY).unpack(framed) == body
+    assert packer.unpack(framed) == body
+
+
+def test_packer_wrong_key_without_fallback_is_rejected() -> None:
+    framed = TakashoPacker(key=_PROD_LIKE_KEY).pack(b"secret payload")
+
+    # No fallback configured, so there is nothing that can rescue this frame.
+    with pytest.raises(TakashoPackerError):
+        TakashoPacker(key=_OTHER_KEY).unpack(framed)
+
+
+def test_packer_falls_back_to_secondary_key() -> None:
+    """A frame written with the fallback key is still accepted when it is listed."""
+    framed = TakashoPacker(key=_OTHER_KEY).pack(b"written with the fallback key")
+
+    packer = TakashoPacker(key=_PROD_LIKE_KEY, fallback_keys=[_OTHER_KEY])
+    assert packer.unpack(framed) == b"written with the fallback key"
+    # The packer remembers which key worked, so later packs use it.
+    assert packer._active_key == _OTHER_KEY
+
+
+def test_compute_hmac_binds_body_and_nonce() -> None:
+    packer = TakashoPacker(key=_PROD_LIKE_KEY)
+    nonce = b"0123456789ab"  # must be exactly 12 bytes
+    mac = packer.compute_hmac(nonce, b"body")
+
+    assert len(mac) == 32
+    # Changing either input changes the MAC: the nonce is part of the key
+    # material, not merely a prefix on the wire.
+    assert packer.compute_hmac(nonce, b"other body") != mac
+    assert packer.compute_hmac(b"0123456789ac", b"body") != mac
