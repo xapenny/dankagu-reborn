@@ -1,7 +1,7 @@
 """Takasho GameProduct servicer for shop products and item purchases."""
 
 import logging
-from pathlib import Path
+
 import grpc
 
 from dankagu.config import settings
@@ -44,7 +44,11 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         logger.info(
             "🛍️ Loaded %d pages of game products (root page has %d items)",
             len(self.pages),
-            len(self.pages.get("", game_product_pb2.GameProductGetAvailableV1.Response()).game_products),
+            len(
+                self.pages.get(
+                    "", game_product_pb2.GameProductGetAvailableV1.Response()
+                ).game_products
+            ),
         )
 
     async def GetAvailableV1(
@@ -53,7 +57,9 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         context: grpc.aio.ServicerContext,
     ) -> game_product_pb2.GameProductGetAvailableV1.Response:
         token = request.page_token or ""
-        logger.info("🛍️ [GameProduct] GetAvailableV1 (page_token=%s)", token[:20] if token else "root")
+        logger.info(
+            "🛍️ [GameProduct] GetAvailableV1 (page_token=%s)", token[:20] if token else "root"
+        )
         if token in self.pages:
             return self.pages[token]
         return self.pages.get("", game_product_pb2.GameProductGetAvailableV1.Response())

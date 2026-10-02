@@ -1,7 +1,7 @@
 """Takasho Wallet servicer for currency balances and player items."""
 
 import logging
-from pathlib import Path
+
 import grpc
 
 from dankagu.config import settings

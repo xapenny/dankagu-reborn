@@ -14,6 +14,8 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 )
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     player_preference_pb2 as fes_player_preference_pb2,
+)
+from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     player_preference_pb2_grpc as fes_player_preference_pb2_grpc,
 )
 from dankagu.models.storage import PlayerStorageEntry
@@ -60,7 +62,9 @@ class PlayerPreferenceService(player_preference_pb2_grpc.PlayerPreferenceService
         context: grpc.aio.ServicerContext,
     ) -> player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response:
         logger.info("👤 [PlayerPreference] SetPreferenceAndSavePlayerStorageV1")
-        response = player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response()
+        response = (
+            player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response()
+        )
         return response
 
     async def GetMonthlyBillingLimitV1(
@@ -152,7 +156,9 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
         request: fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Response:
-        logger.info("🎮 [FesPlayerPreference] SetAndSavePlayerStorageV1 (%d entries)", len(request.entries))
+        logger.info(
+            "🎮 [FesPlayerPreference] SetAndSavePlayerStorageV1 (%d entries)", len(request.entries)
+        )
         now = int(time.time())
         if request.entries:
             session_factory = get_sessionmaker()
@@ -185,4 +191,3 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
             entry.updated_at = now
         response.revision = request.next_revision or "1"
         return response
-

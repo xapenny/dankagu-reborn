@@ -1,16 +1,17 @@
 """Takasho Club servicers (ClubPlayer, ClubChat, ClubAchievement)."""
 
 import logging
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
-    club_player_pb2,
-    club_player_pb2_grpc,
-    club_chat_pb2,
-    club_chat_pb2_grpc,
     club_achievement_pb2,
     club_achievement_pb2_grpc,
+    club_chat_pb2,
+    club_chat_pb2_grpc,
+    club_player_pb2,
+    club_player_pb2_grpc,
 )
 
 logger = logging.getLogger("dankagu.services.club")
@@ -150,11 +151,13 @@ def register_club_servicers(server: grpc.aio.Server) -> None:
             club_player_pb2.ClubPlayerUpdateRole.Response,
         ),
     }
-    server.add_generic_rpc_handlers((
-        grpc.method_handlers_generic_handler(
-            "takasho.schema.fes.player_api.club_player.ClubPlayer", player_handlers
-        ),
-    ))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.club_player.ClubPlayer", player_handlers
+            ),
+        )
+    )
 
     chat_servicer = ClubChatService()
     chat_handlers = {
@@ -174,11 +177,13 @@ def register_club_servicers(server: grpc.aio.Server) -> None:
             club_chat_pb2.ClubChatCreateMessage.Response,
         ),
     }
-    server.add_generic_rpc_handlers((
-        grpc.method_handlers_generic_handler(
-            "takasho.schema.fes.player_api.club_chat.ClubChat", chat_handlers
-        ),
-    ))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.club_chat.ClubChat", chat_handlers
+            ),
+        )
+    )
 
     ach_servicer = ClubAchievementService()
     ach_handlers = {
@@ -193,8 +198,10 @@ def register_club_servicers(server: grpc.aio.Server) -> None:
             club_achievement_pb2.ClubAchievementUnlockAndIncrementClubScalar.Response,
         ),
     }
-    server.add_generic_rpc_handlers((
-        grpc.method_handlers_generic_handler(
-            "takasho.schema.fes.player_api.club_achievement.ClubAchievement", ach_handlers
-        ),
-    ))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.club_achievement.ClubAchievement", ach_handlers
+            ),
+        )
+    )

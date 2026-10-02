@@ -53,9 +53,7 @@ class Settings(BaseSettings):
     )
     # hexdata_fes_dir: operator-supplied response templates for fes calls
     # (login_bonus, reconstruction_spot).
-    hexdata_fes_dir: Path = Field(
-        default=_PROJECT_ROOT / "data" / "hexdata" / "fes" / "player_api"
-    )
+    hexdata_fes_dir: Path = Field(default=_PROJECT_ROOT / "data" / "hexdata" / "fes" / "player_api")
 
     # Host & ports
     host: str = "0.0.0.0"
@@ -99,13 +97,9 @@ class Settings(BaseSettings):
         try:
             raw = bytes.fromhex(value)
         except ValueError as exc:
-            raise ValueError(
-                "DANKAGU_TAKASHO_KEY_HEX must be a hexadecimal string"
-            ) from exc
+            raise ValueError("DANKAGU_TAKASHO_KEY_HEX must be a hexadecimal string") from exc
         if len(raw) != 32:
-            raise ValueError(
-                f"DANKAGU_TAKASHO_KEY_HEX must decode to 32 bytes, got {len(raw)}"
-            )
+            raise ValueError(f"DANKAGU_TAKASHO_KEY_HEX must decode to 32 bytes, got {len(raw)}")
         return value
 
     # Derived values

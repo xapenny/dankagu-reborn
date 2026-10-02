@@ -1,7 +1,7 @@
 """Takasho ReconstructionSpot servicer for shrine reconstruction."""
 
 import logging
-from pathlib import Path
+
 import grpc
 
 from dankagu.config import settings
@@ -18,7 +18,9 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
     """Servicer for Hakurei Shrine reconstruction spots."""
 
     def __init__(self) -> None:
-        self.cached_response: reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response | None = None
+        self.cached_response: (
+            reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response | None
+        ) = None
         self._load_spots()
 
     def _load_spots(self) -> None:
@@ -36,7 +38,9 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
                 logger.error("Failed to parse reconstruction_spot.hex: %s", e)
 
         if self.cached_response is None:
-            self.cached_response = reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
+            self.cached_response = (
+                reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
+            )
 
     async def GetAvailableV1(
         self,

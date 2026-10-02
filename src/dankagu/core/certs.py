@@ -40,7 +40,9 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
         ca_key = serialization.load_pem_private_key(
             ca_key_path.read_bytes(), password=None, backend=default_backend()
         )
-        ca_cert = x509.load_pem_x509_certificate(ca_crt_path.read_bytes(), backend=default_backend())
+        ca_cert = x509.load_pem_x509_certificate(
+            ca_crt_path.read_bytes(), backend=default_backend()
+        )
         ca_name = ca_cert.subject
     else:
         logger.info("Generating fresh Root CA...")
@@ -49,11 +51,13 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
             key_size=2048,
             backend=default_backend(),
         )
-        ca_name = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, "DanKagu Root CA"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DanKagu Preservation"),
-            x509.NameAttribute(NameOID.COUNTRY_NAME, "JP"),
-        ])
+        ca_name = x509.Name(
+            [
+                x509.NameAttribute(NameOID.COMMON_NAME, "DanKagu Root CA"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DanKagu Preservation"),
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "JP"),
+            ]
+        )
         now = datetime.datetime.now(datetime.UTC)
         ca_cert = (
             x509.CertificateBuilder()
@@ -62,7 +66,9 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
             .public_key(ca_key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=3650))  # Root CA is exempt from 398-day limit
+            .not_valid_after(
+                now + datetime.timedelta(days=3650)
+            )  # Root CA is exempt from 398-day limit
             .add_extension(
                 x509.BasicConstraints(ca=True, path_length=None),
                 critical=True,
@@ -107,11 +113,13 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
     # The common name follows DANKAGU_PUBLIC_HOST. With no host configured it
     # falls back to a neutral local name rather than claiming a hostname this
     # server does not own.
-    server_name = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, settings.cert_common_name),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DanKagu Local Preservation"),
-        x509.NameAttribute(NameOID.COUNTRY_NAME, "JP"),
-    ])
+    server_name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, settings.cert_common_name),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DanKagu Local Preservation"),
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "JP"),
+        ]
+    )
 
     san_names: list[x509.GeneralName] = [
         # Game domains from configuration (plus any operator-supplied names).
@@ -122,6 +130,7 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
 
     # Discover this host's IPv4 addresses so the certificate also covers them
     import socket
+
     detected_ips: set[str] = set()
     try:
         detected_ips.add(detect_local_ip())
@@ -135,7 +144,10 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
     for ip_str in detected_ips:
         try:
             parsed = ipaddress.IPv4Address(ip_str)
-            if parsed != ipaddress.IPv4Address("127.0.0.1") and x509.IPAddress(parsed) not in san_names:
+            if (
+                parsed != ipaddress.IPv4Address("127.0.0.1")
+                and x509.IPAddress(parsed) not in san_names
+            ):
                 san_names.append(x509.IPAddress(parsed))
         except Exception:
             pass
@@ -169,10 +181,12 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
             critical=True,
         )
         .add_extension(
-            x509.ExtendedKeyUsage([
-                ExtendedKeyUsageOID.SERVER_AUTH,
-                ExtendedKeyUsageOID.CLIENT_AUTH,
-            ]),
+            x509.ExtendedKeyUsage(
+                [
+                    ExtendedKeyUsageOID.SERVER_AUTH,
+                    ExtendedKeyUsageOID.CLIENT_AUTH,
+                ]
+            ),
             critical=False,
         )
         .add_extension(
@@ -205,10 +219,14 @@ def generate_certificates(output_dir: Path, force_new_ca: bool = False) -> None:
         + b"\n"
     )
     server_crt_path.write_bytes(full_chain_bytes)
-    logger.info("✅ Apple-compliant server certificate (full chain) successfully generated: %s", server_crt_path)
+    logger.info(
+        "✅ Apple-compliant server certificate (full chain) successfully generated: %s",
+        server_crt_path,
+    )
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     from dankagu.config import settings
+
     generate_certificates(settings.certs_dir)

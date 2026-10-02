@@ -69,7 +69,12 @@ def create_grpc_server() -> grpc.aio.Server:
     # treat them as optional and never hand empty credential material to gRPC.
     cert_path = settings.certs_dir / "server.crt"
     key_path = settings.certs_dir / "server.key"
-    if cert_path.exists() and key_path.exists() and cert_path.stat().st_size and key_path.stat().st_size:
+    if (
+        cert_path.exists()
+        and key_path.exists()
+        and cert_path.stat().st_size
+        and key_path.stat().st_size
+    ):
         server_credentials = grpc.ssl_server_credentials(
             [(key_path.read_bytes(), cert_path.read_bytes())]
         )

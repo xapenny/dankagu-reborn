@@ -1,6 +1,7 @@
 """Takasho Ranking servicers (RegularRanking, ScoreRanking)."""
 
 import logging
+
 import grpc
 
 from dankagu.grpc.codec import takasho_unary_handler
@@ -22,7 +23,9 @@ class RegularRankingService(regular_ranking_pb2_grpc.RegularRankingServicer):
         request: regular_ranking_pb2.RegularRankingRegisterV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> regular_ranking_pb2.RegularRankingRegisterV1.Response:
-        logger.info("🏅 [RegularRanking] RegisterV1 (key=%s, score=%d)", request.ranking_key, request.score)
+        logger.info(
+            "🏅 [RegularRanking] RegisterV1 (key=%s, score=%d)", request.ranking_key, request.score
+        )
         response = regular_ranking_pb2.RegularRankingRegisterV1.Response()
         player_ranking = response.player_ranking
         player_ranking.ranking_key = request.ranking_key
@@ -130,11 +133,13 @@ def register_ranking_servicers(server: grpc.aio.Server) -> None:
             regular_ranking_pb2.RegularRankingGetTopRankingV1.Response,
         ),
     }
-    server.add_generic_rpc_handlers((
-        grpc.method_handlers_generic_handler(
-            "takasho.schema.fes.player_api.RegularRanking", regular_handlers
-        ),
-    ))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.RegularRanking", regular_handlers
+            ),
+        )
+    )
 
     score_servicer = ScoreRankingService()
     score_handlers = {
@@ -174,8 +179,10 @@ def register_ranking_servicers(server: grpc.aio.Server) -> None:
             score_ranking_pb2.ScoreRankingReceiveClassPrizeV1.Response,
         ),
     }
-    server.add_generic_rpc_handlers((
-        grpc.method_handlers_generic_handler(
-            "takasho.schema.fes.player_api.score_ranking.ScoreRanking", score_handlers
-        ),
-    ))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.score_ranking.ScoreRanking", score_handlers
+            ),
+        )
+    )

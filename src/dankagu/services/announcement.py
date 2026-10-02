@@ -1,7 +1,7 @@
 """Takasho Announcement servicer."""
 
 import logging
-from pathlib import Path
+
 import grpc
 
 from dankagu.config import settings
@@ -18,7 +18,9 @@ class AnnouncementService(announcement_pb2_grpc.AnnouncementServicer):
     """Servicer for game announcements and notices."""
 
     def __init__(self) -> None:
-        self.cached_announcements: announcement_pb2.AnnouncementGetAvailableV1.Response | None = None
+        self.cached_announcements: announcement_pb2.AnnouncementGetAvailableV1.Response | None = (
+            None
+        )
         self._load_announcements()
 
     def _load_announcements(self) -> None:
@@ -33,7 +35,9 @@ class AnnouncementService(announcement_pb2_grpc.AnnouncementServicer):
                         bytes.fromhex(hex_file.read_text(encoding="utf-8").strip())
                     )
                 )
-                logger.info("📢 Loaded %d announcements", len(self.cached_announcements.announcements))
+                logger.info(
+                    "📢 Loaded %d announcements", len(self.cached_announcements.announcements)
+                )
             except Exception as e:
                 logger.error("Failed to parse announcement hex: %s", e)
 
