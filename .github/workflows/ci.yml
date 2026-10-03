@@ -25,6 +25,20 @@ jobs:
   test:
     name: Tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_DB: dankagu
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +70,8 @@ jobs:
         run: uv run python scripts/compile_protos.py --fetch
 
       - name: Run test suite
+        env:
+          DANKAGU_DB_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu
         run: uv run pytest -q
 
   lint:

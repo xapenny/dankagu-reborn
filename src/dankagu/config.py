@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     jwt_secret: str = ""
 
     # Database
-    db_url: str = "sqlite+aiosqlite:///data/dankagu.db"
+    db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"
 
     # Validators
     @field_validator("takasho_key_hex")
@@ -103,10 +103,6 @@ class Settings(BaseSettings):
         return value
 
     # Derived values
-    @property
-    def sqlite_db_path(self) -> Path:
-        return self.data_dir / "dankagu.db"
-
     @property
     def takasho_key(self) -> bytes:
         """Decoded 32-byte Takasho transport key, or ``b""`` when unset."""

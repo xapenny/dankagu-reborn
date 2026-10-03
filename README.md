@@ -63,8 +63,8 @@ flowchart TD
     end
 
     subgraph Storage["Persistence"]
-        ORM["SQLAlchemy 2.0 Async"]
-        DB[("SQLite<br/>data/dankagu.db")]
+        ORM["SQLAlchemy 2.0 Async + asyncpg"]
+        DB[("PostgreSQL")]
     end
 
     Client -->|"1. HTTPS"| LCX_API
@@ -141,7 +141,7 @@ failing, so an unknown call returns a valid empty response instead of an error.
 
 **Stateful `PlayerStorage`.** Almost all player state is a key/value entry with
 an opaque binary payload. `GetEntriesV2` supports both `EXACT` matching and
-`FORWARD` prefix matching; `SetEntriesV2` performs an atomic SQLite upsert, so
+`FORWARD` prefix matching; `SetEntriesV2` performs an atomic PostgreSQL upsert, so
 concurrent updates cannot violate the composite primary key. Missing keys fall
 back to operator-supplied template data.
 
@@ -292,7 +292,7 @@ over `.env`.
 | `DANKAGU_GRPC_PORT` | `50051` | Takasho gRPC, plaintext. |
 | `DANKAGU_GRPC_TLS_PORT` | `50052` | Takasho gRPC over TLS. |
 | `DANKAGU_ASSET_PORT` | `8080` | Asset CDN, portal, `/status`. |
-| `DANKAGU_DB_URL` | `sqlite+aiosqlite:///data/dankagu.db` | SQLAlchemy async URL. |
+| `DANKAGU_DB_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu` | SQLAlchemy async PostgreSQL URL (`asyncpg`). |
 
 ### Secret handling
 

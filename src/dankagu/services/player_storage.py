@@ -5,7 +5,7 @@ import time
 
 import grpc
 from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
@@ -142,7 +142,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         async with session_factory() as session:
             for proto_entry in request.entries:
                 p_id = proto_entry.player_id or "default-player"
-                stmt = sqlite_insert(PlayerStorageEntry).values(
+                stmt = pg_insert(PlayerStorageEntry).values(
                     player_id=p_id,
                     key=proto_entry.key,
                     value=proto_entry.value,

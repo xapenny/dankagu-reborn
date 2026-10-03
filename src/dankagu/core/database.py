@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import StaticPool
 
 from dankagu.config import settings
 
@@ -22,18 +21,23 @@ _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
+def reset_engine() -> None:
+    """Reset the cached engine and sessionmaker (used when switching db URLs)."""
+    global _engine, _sessionmaker
+    _engine = None
+    _sessionmaker = None
+
+
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
-        # In-memory SQLite needs a single shared connection, otherwise each
-        # session would see an empty database.
-        is_memory = ":memory:" in settings.db_url or "mode=memory" in settings.db_url
         _engine = create_async_engine(
             settings.db_url,
             echo=False,
             future=True,
-            **({"poolclass": StaticPool} if is_memory else {}),
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20,
         )
     return _engine
 
