@@ -7,6 +7,7 @@ import grpc
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_preference_pb2,
@@ -189,5 +190,8 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
             entry.player_id = entry.player_id or "default-player"
             entry.created_at = entry.created_at or now
             entry.updated_at = now
-        response.revision = request.next_revision or "1"
+        p_id = request.player_preference.player_id if request.player_preference else None
+        response.revision = await StorageRevisionManager.set_revision_and_save(
+            request.next_revision, player_id=p_id
+        )
         return response

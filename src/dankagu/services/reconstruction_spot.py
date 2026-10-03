@@ -33,7 +33,17 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
                         bytes.fromhex(hex_data)
                     )
                 )
-                logger.info("⛩️ Loaded %d reconstruction spots", len(self.cached_response.spots))
+                # Ensure all spots and stages remain active through year 2100
+                for spot in self.cached_response.spots:
+                    spot.opened_at = 1590000000
+                    spot.finished_at = 4102498799
+                    spot.closed_at = 4102498799
+                    for stage in spot.stages:
+                        stage.opened_at = 1590000000
+                        stage.closed_at = 4102498799
+                logger.info(
+                    "⛩️ Loaded %d active reconstruction spots", len(self.cached_response.spots)
+                )
             except Exception as e:
                 logger.error("Failed to parse reconstruction_spot.hex: %s", e)
 
