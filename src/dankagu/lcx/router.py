@@ -249,6 +249,58 @@ async def post_analytics_event(request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def _decode_sdk_body(body: bytes, content_encoding: str) -> str:
+    """Best-effort decode of an SDK log payload.
+
+    The client may send the body gzip-encoded (advertising it via
+    `Content-Encoding`), or as a bare gzip/deflate stream. It is usually text, but
+    some SDK builds post protobuf, so fall back to a hex preview rather than
+    raising.
+    """
+    if content_encoding.lower() == "gzip" or body.startswith(b"\x1f\x8b"):
+        try:
+            body = gzip.decompress(body)
+        except Exception:
+            pass
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        head = body[:512]
+        return f"<binary {len(body)} bytes> {head.hex(' ')}"
+
+
+class SdkLogResponse(BaseModel):
+    """Acknowledged response; the client only checks that the call succeeded."""
+
+    result: bool = True
+
+
+@router.post("/sdk-log", response_model=SdkLogResponse)
+@router.post("/gcp/sdk-log", response_model=SdkLogResponse)
+@router.post("/gcp/log/sdk-log", response_model=SdkLogResponse)
+async def post_sdk_log(request: Request) -> SdkLogResponse:
+    """Capture the LCX SDK's own log uploads.
+
+    The client posts its SDK logs (and, on failure paths, tamper/security reports)
+    here. Logging the payload verbatim is the point: it surfaces what the client
+    thinks went wrong, which the earlier 404 was throwing away.
+    """
+    try:
+        body = await request.body()
+        encoding = request.headers.get("content-encoding", "")
+        text = _decode_sdk_body(body, encoding)
+        logger.warning(
+            "📥 [SDK Log] %d bytes (encoding=%r) from %s\n%s",
+            len(body),
+            encoding or "identity",
+            request.client.host if request.client else "?",
+            text,
+        )
+    except Exception as exc:  # never fail the upload
+        logger.warning("📥 [SDK Log] could not read body: %s", exc)
+    return SdkLogResponse()
+
+
 @router.api_route("/identity/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def fallback_identity(path: str) -> dict[str, Any]:
     """Fallback catch-all for any unhandled identity requests."""

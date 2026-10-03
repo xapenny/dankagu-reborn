@@ -114,6 +114,12 @@ async def run_servers() -> None:
         ssl_certfile=ssl_certfile if Path(ssl_certfile).exists() else None,
         ssl_keyfile=ssl_keyfile if Path(ssl_keyfile).exists() else None,
         log_level="info",
+        # The client keeps its TLS connections open for the whole session and reuses
+        # them. Uvicorn's default 5 s keep-alive closes an idle connection, and the
+        # client then waits on the dead socket - observed as multi-minute freezes at
+        # startup (two sockets idle ~30 s each, then CLOSE-WAIT with the server's TLS
+        # close_notify still unread). Keep them open far longer than any client idle.
+        timeout_keep_alive=600,
     )
     lcx_ios_server = uvicorn.Server(lcx_ios_config)
     logger.info("✅ [LCX Auth iOS (HTTPS)] https://%s:%d", settings.host, settings.lcx_ios_port)
@@ -125,6 +131,7 @@ async def run_servers() -> None:
         ssl_certfile=ssl_certfile if Path(ssl_certfile).exists() else None,
         ssl_keyfile=ssl_keyfile if Path(ssl_keyfile).exists() else None,
         log_level="info",
+        timeout_keep_alive=600,
     )
     lcx_server = uvicorn.Server(lcx_config)
     logger.info("✅ [LCX Auth Android (HTTPS)] https://%s:%d", settings.host, settings.lcx_port)

@@ -9,6 +9,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_storage_pb2,
@@ -72,8 +73,9 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         request: player_storage_pb2.PlayerStorageGetEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageGetEntriesV2.Response:
+        await StorageRevisionManager.initialize()
         response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
-        response.revision = "1"
+        response.revision = StorageRevisionManager.get_revision()
         now = int(time.time())
 
         session_factory = get_sessionmaker()
@@ -165,7 +167,10 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             resp_entry.value = proto_entry.value
             resp_entry.created_at = proto_entry.created_at or now
             resp_entry.updated_at = now
-        response.revision = request.next_revision or "1"
+        p_id = request.entries[0].player_id if request.entries else None
+        response.revision = await StorageRevisionManager.set_revision_and_save(
+            request.next_revision, player_id=p_id
+        )
         return response
 
     async def GetOtherPlayerEntriesV2(

@@ -53,11 +53,11 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1002,"Key":"AdmobTestDevice","OpenAt":"0","Value":""},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1003,"Key":"AdmobAlwaysTestDevice","OpenAt":"0","Value":"0"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1004,"Key":"AdmobTestClientVersion","OpenAt":"0","Value":"1.5.0"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":1011,"Key":"TestAdUnitId_A","OpenAt":"0","Value":"ca-app-pub-3940256099942544/5224354917"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":1012,"Key":"TestAdUnitId_I","OpenAt":"0","Value":"ca-app-pub-3940256099942544/1712485313"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":1013,"Key":"ProdAdUnitId_A","OpenAt":"0","Value":"ca-app-pub-9832876006157354/6112993928"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":1014,"Key":"ProdAdUnitId_I","OpenAt":"0","Value":"ca-app-pub-9832876006157354/4664180889"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":1015,"Key":"UseProdAdUnit","OpenAt":"0","Value":"1"},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":1011,"Key":"TestAdUnitId_A","OpenAt":"0","Value":""},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":1012,"Key":"TestAdUnitId_I","OpenAt":"0","Value":""},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":1013,"Key":"ProdAdUnitId_A","OpenAt":"0","Value":""},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":1014,"Key":"ProdAdUnitId_I","OpenAt":"0","Value":""},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":1015,"Key":"UseProdAdUnit","OpenAt":"0","Value":"0"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1016,"Key":"UseProdAdUnitOnDebugBuild","OpenAt":"0","Value":"0"}]'
             )
 
