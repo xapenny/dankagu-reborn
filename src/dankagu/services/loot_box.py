@@ -5,7 +5,6 @@ import logging
 import random
 import time
 import uuid
-from pathlib import Path
 
 import grpc
 
@@ -22,7 +21,7 @@ logger = logging.getLogger("dankagu.services.loot_box")
 VALID_GACHA_IDS = {1, 3, 159, 160, 161, 165, 169, 173, 4001, 90010}
 
 # Load card pool
-_CARD_POOL_PATH = Path(__file__).resolve().parent.parent / "core" / "card_pool.json"
+_CARD_POOL_PATH = settings.data_dir / "card_pool.json"
 _CARDS_BY_RARITY: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
 if _CARD_POOL_PATH.exists():
     try:
