@@ -1,6 +1,6 @@
 """Regression tests for the storage upsert paths.
 
-Every "save player storage" handler in this codebase uses the same SQLite
+Every "save player storage" handler in this codebase uses the same PostgreSQL
 ``INSERT ... ON CONFLICT (player_id, key) DO UPDATE`` shape:
 
 * ``services/player_storage.py``        - SetEntriesV2
@@ -9,7 +9,7 @@ Every "save player storage" handler in this codebase uses the same SQLite
 
 That shape is not a stylistic choice. The original implementation did a SELECT
 and then a plain INSERT, so the second write of an existing key raised
-``sqlite3.IntegrityError: UNIQUE constraint failed``. The client surfaced that
+a duplicate key constraint violation. The client surfaced that
 as error code ``20027-2`` and dropped the player back to the title screen. The
 code was fixed in several places; these tests pin the behaviour so it cannot
 regress silently again.

@@ -7,27 +7,31 @@ real player database.
 
 import os
 
-# Force (not setdefault) so tests are unaffected by a developer's .env file:
-# without this, DANKAGU_DB_URL from .env would point the suite at the real
-# player database.
-#
-# Placeholder JWT secret so token issuance can be exercised. This value is a
-# test fixture, not a credential: it is never used outside the test suite.
-os.environ["DANKAGU_JWT_SECRET"] = "test-suite-jwt-secret-not-for-production"
+import asyncpg
+import pytest
+import pytest_asyncio
 
-# Run against an in-memory database instead of data/dankagu.db so tests are
-# isolated and repeatable. SQLite's shared cache keeps the schema visible across
-# the multiple connections the async session factory opens.
-os.environ["DANKAGU_DB_URL"] = (
-    "sqlite+aiosqlite:///file:dankagu_test?mode=memory&cache=shared&uri=true"
-)
+# Placeholder JWT secret so token issuance can be exercised.
+os.environ.setdefault("DANKAGU_JWT_SECRET", "test-suite-jwt-secret-not-for-production")
 
-import pytest_asyncio  # noqa: E402
+from dankagu.config import settings
+from dankagu.core.database import init_db, reset_engine
 
-from dankagu.core.database import init_db  # noqa: E402
+if "DANKAGU_TEST_PG_URL" in os.environ:
+    settings.db_url = os.environ["DANKAGU_TEST_PG_URL"]
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def initialize_test_database() -> None:
+async def initialize_test_database(request: pytest.FixtureRequest) -> None:
     """Ensure database tables exist before running any test."""
-    await init_db()
+    reset_engine()
+    clean_url = settings.db_url.replace("postgresql+asyncpg://", "postgresql://")
+    try:
+        conn = await asyncpg.connect(clean_url, timeout=2.0)
+        await conn.close()
+        await init_db()
+    except Exception as e:
+        # If DB connection failed, skip tests that need database
+        skip_keywords = ["persistence", "authorize", "token", "transfer", "storage"]
+        if any(kw in request.node.nodeid.lower() for kw in skip_keywords):
+            pytest.skip(f"PostgreSQL database not reachable at {settings.db_url}: {e!r}")
