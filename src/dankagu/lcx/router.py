@@ -2,6 +2,7 @@
 
 import gzip
 import logging
+import secrets
 import time
 import uuid
 from typing import Annotated, Any
@@ -12,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_db_session
-from dankagu.lcx.tokens import generate_lcx_tokens
+from dankagu.lcx.tokens import decode_token_user_id, generate_lcx_tokens
 from dankagu.models.player import Player
 
 logger = logging.getLogger("dankagu.lcx.router")
@@ -61,39 +62,107 @@ async def post_user_access_token(
     db: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> dict[str, Any]:
     """Refresh or issue new user access token."""
-    # Find existing player or create a default guest player
-    result = await db.execute(select(Player).limit(1))
-    player = result.scalars().first()
+    user_id: str | None = None
+
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        user_id = decode_token_user_id(auth_header[7:].strip())
+
+    if not user_id:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                user_id = body.get("userId")
+                if not user_id and "signInSessionToken" in body:
+                    user_id = decode_token_user_id(str(body["signInSessionToken"]))
+                if not user_id and "accessToken" in body:
+                    user_id = decode_token_user_id(str(body["accessToken"]))
+        except Exception:
+            pass
 
     now = int(time.time())
-    if player is None:
-        user_id = str(uuid.uuid4())
-        player = Player(user_id=user_id, registered_at=now)
-        db.add(player)
-        await db.commit()
-        await db.refresh(player)
-    else:
-        user_id = player.user_id
+    player: Player | None = None
+    if user_id:
+        result = await db.execute(select(Player).where(Player.user_id == user_id))
+        player = result.scalars().first()
 
-    tokens = generate_lcx_tokens(user_id, player.registered_at)
+    if player is None:
+        if user_id:
+            player = Player(user_id=user_id, registered_at=now)
+            db.add(player)
+            await db.commit()
+            await db.refresh(player)
+        else:
+            result = await db.execute(select(Player).limit(1))
+            player = result.scalars().first()
+            if player is None:
+                user_id = str(uuid.uuid4())
+                player = Player(user_id=user_id, registered_at=now)
+                db.add(player)
+                await db.commit()
+                await db.refresh(player)
+
+    tokens = generate_lcx_tokens(player.user_id, player.registered_at)
     return {
-        "userId": user_id,
+        "userId": player.user_id,
         "accessToken": tokens["accessToken"],
         "signInSessionId": tokens["signInSessionId"],
         "analyticsSessionId": tokens["analyticsSessionId"],
     }
 
 
-async def _get_or_create_player(db: AsyncSession) -> Player:
-    """Retrieve existing player profile or seed initial local guest player."""
-    result = await db.execute(select(Player).limit(1))
-    player = result.scalars().first()
+async def _resolve_or_create_player(
+    db: AsyncSession, request: Request
+) -> Player:
+    """Retrieve player matching client credentials or register a distinct new player."""
+    user_id: str | None = None
+    device_account: str | None = None
+
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        user_id = decode_token_user_id(auth_header[7:].strip())
+
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            if not user_id and "userId" in body and body["userId"]:
+                user_id = str(body["userId"])
+            if not user_id and "signInSessionToken" in body and body["signInSessionToken"]:
+                user_id = decode_token_user_id(str(body["signInSessionToken"]))
+            if not user_id and "sessionToken" in body and body["sessionToken"]:
+                user_id = decode_token_user_id(str(body["sessionToken"]))
+            device_account = body.get("storeAccountIdHash") or body.get("deviceAccount")
+    except Exception:
+        pass
+
+    now = int(time.time())
+    player: Player | None = None
+
+    if user_id:
+        res = await db.execute(select(Player).where(Player.user_id == user_id))
+        player = res.scalars().first()
+
+    if player is None and device_account:
+        res = await db.execute(select(Player).where(Player.device_account == device_account))
+        player = res.scalars().first()
+
     if player is None:
-        user_id = str(uuid.uuid4())
-        player = Player(user_id=user_id, registered_at=int(time.time()))
-        db.add(player)
-        await db.commit()
-        await db.refresh(player)
+        if device_account or user_id:
+            uid = user_id or str(uuid.uuid4())
+            player = Player(user_id=uid, device_account=device_account, registered_at=now)
+            db.add(player)
+            await db.commit()
+            await db.refresh(player)
+        else:
+            res = await db.execute(select(Player).order_by(Player.registered_at.asc()).limit(1))
+            player = res.scalars().first()
+            if player is None:
+                uid = str(uuid.uuid4())
+                player = Player(user_id=uid, registered_at=now)
+                db.add(player)
+                await db.commit()
+                await db.refresh(player)
+
     return player
 
 
@@ -126,7 +195,7 @@ async def post_identity_session(
     db: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> dict[str, Any]:
     """Execute initial sign-in, session establishment, or account transfer."""
-    player = await _get_or_create_player(db)
+    player = await _resolve_or_create_player(db, request)
     return _build_verified_token_response(player)
 
 
@@ -139,11 +208,13 @@ async def get_active_published_store() -> dict[str, str]:
 
 @router.post("/identity/transfer/suggest")
 async def post_transfer_suggest(
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> dict[str, str]:
     """Suggest account transfer credentials."""
-    player = await _get_or_create_player(db)
-    return {"id": player.user_id[:8].upper(), "password": "password123"}
+    player = await _resolve_or_create_player(db, request)
+    suggested_pw = secrets.token_hex(4).upper()
+    return {"id": player.user_id[:8].upper(), "password": suggested_pw}
 
 
 @router.get("/gcp/analytics/config")

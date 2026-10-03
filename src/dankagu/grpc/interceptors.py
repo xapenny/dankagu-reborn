@@ -9,6 +9,11 @@ from typing import Any
 import grpc
 from grpc.aio import ServerInterceptor
 
+from dankagu.core.session import (
+    reset_current_player,
+    resolve_session_player_id,
+    set_current_player,
+)
 from dankagu.grpc.codec import default_packer
 
 logger = logging.getLogger("dankagu.grpc")
@@ -105,6 +110,18 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     )
                 )
 
+                session_token: str | None = None
+                if context.invocation_metadata():
+                    for meta_key, meta_val in context.invocation_metadata():
+                        if str(meta_key).lower() == "x-takasho-session-token":
+                            session_token = str(meta_val)
+                            break
+
+                player_id: str | None = None
+                if session_token:
+                    player_id = await resolve_session_player_id(session_token)
+
+                tokens = set_current_player(player_id, session_token)
                 try:
                     response = await original_behavior(request, context)
                 except Exception as exc:
@@ -115,6 +132,8 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                         exc_info=True,
                     )
                     raise
+                finally:
+                    reset_current_player(tokens)
 
                 elapsed_ms = (time.perf_counter_ns() - start_ns) // 1_000_000
                 context.set_trailing_metadata(

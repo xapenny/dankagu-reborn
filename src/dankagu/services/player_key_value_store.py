@@ -5,6 +5,7 @@ import grpc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
@@ -62,11 +63,12 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
             pkv.expired_at = 4102412400
 
         now = int(time.time())
+        current_pid = get_current_player_id()
         if request.entries:
             session_factory = get_sessionmaker()
             async with session_factory() as session:
                 for proto_entry in request.entries:
-                    p_id = proto_entry.player_id or "default-player"
+                    p_id = proto_entry.player_id or current_pid or "default-player"
                     stmt = pg_insert(PlayerStorageEntry).values(
                         player_id=p_id,
                         key=proto_entry.key,
@@ -86,10 +88,14 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
 
         response.entries.extend(request.entries)
         for entry in response.entries:
-            entry.player_id = entry.player_id or "default-player"
+            entry.player_id = entry.player_id or current_pid or "default-player"
             entry.created_at = entry.created_at or now
             entry.updated_at = now
-        p_id = request.entries[0].player_id if request.entries else None
+        p_id = (
+            request.entries[0].player_id
+            if request.entries and request.entries[0].player_id
+            else current_pid
+        )
         response.revision = await StorageRevisionManager.set_revision_and_save(
             request.next_revision, player_id=p_id
         )
@@ -102,11 +108,12 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Response:
         logger.info("🔑 [PKVS] UpdatePlayerKeyValuesAndSavePlayerStorageV1")
         now = int(time.time())
+        current_pid = get_current_player_id()
         if request.entries:
             session_factory = get_sessionmaker()
             async with session_factory() as session:
                 for proto_entry in request.entries:
-                    p_id = proto_entry.player_id or "default-player"
+                    p_id = proto_entry.player_id or current_pid or "default-player"
                     stmt = pg_insert(PlayerStorageEntry).values(
                         player_id=p_id,
                         key=proto_entry.key,
@@ -127,10 +134,14 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         response = player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Response()
         response.entries.extend(request.entries)
         for entry in response.entries:
-            entry.player_id = entry.player_id or "default-player"
+            entry.player_id = entry.player_id or current_pid or "default-player"
             entry.created_at = entry.created_at or now
             entry.updated_at = now
-        p_id = request.entries[0].player_id if request.entries else None
+        p_id = (
+            request.entries[0].player_id
+            if request.entries and request.entries[0].player_id
+            else current_pid
+        )
         response.revision = await StorageRevisionManager.set_revision_and_save(
             request.next_revision, player_id=p_id
         )

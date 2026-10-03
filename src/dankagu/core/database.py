@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -66,7 +67,22 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """Initialize database tables."""
+    """Initialize database tables and run lightweight migrations."""
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Ensure new player columns exist if running on an existing DB instance
+        for col_def in [
+            "short_id VARCHAR(16)",
+            "nickname VARCHAR(64) DEFAULT ''",
+            "birth_year INTEGER DEFAULT 0",
+            "birth_month INTEGER DEFAULT 0",
+            "consented_tos_version VARCHAR(32) DEFAULT ''",
+        ]:
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE players ADD COLUMN IF NOT EXISTS {col_def};")
+                )
+            except Exception:
+                pass
+

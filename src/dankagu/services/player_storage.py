@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
@@ -73,14 +74,18 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         request: player_storage_pb2.PlayerStorageGetEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageGetEntriesV2.Response:
+        current_pid = get_current_player_id()
         await StorageRevisionManager.initialize()
         response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
-        response.revision = StorageRevisionManager.get_revision()
+        response.revision = StorageRevisionManager.get_revision(current_pid)
         now = int(time.time())
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            result = await session.execute(select(PlayerStorageEntry))
+            stmt = select(PlayerStorageEntry)
+            if current_pid:
+                stmt = stmt.where(PlayerStorageEntry.player_id == current_pid)
+            result = await session.execute(stmt)
             db_entries = result.scalars().all()
             db_entry_map = {e.key: e for e in db_entries}
 
@@ -92,7 +97,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 if k in db_entry_map:
                     e = db_entry_map[k]
                     proto = response.entries.add()
-                    proto.player_id = e.player_id
+                    proto.player_id = current_pid or e.player_id
                     proto.key = e.key
                     proto.value = e.value
                     proto.created_at = e.created_at
@@ -100,7 +105,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     served_keys.add(k)
                 elif k in self.template_entries and k not in served_keys:
                     proto = response.entries.add()
-                    proto.player_id = "default-player"
+                    proto.player_id = current_pid or "default-player"
                     proto.key = k
                     proto.value = self.template_entries[k]
                     proto.created_at = now
@@ -112,7 +117,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 for k, e in db_entry_map.items():
                     if k.startswith(prefix) and k not in served_keys:
                         proto = response.entries.add()
-                        proto.player_id = e.player_id
+                        proto.player_id = current_pid or e.player_id
                         proto.key = e.key
                         proto.value = e.value
                         proto.created_at = e.created_at
@@ -123,7 +128,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 for k, val in self.template_entries.items():
                     if k.startswith(prefix) and k not in served_keys:
                         proto = response.entries.add()
-                        proto.player_id = "default-player"
+                        proto.player_id = current_pid or "default-player"
                         proto.key = k
                         proto.value = val
                         proto.created_at = now
@@ -138,10 +143,11 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageSetEntriesV2.Response:
         now = int(time.time())
+        current_pid = get_current_player_id()
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             for proto_entry in request.entries:
-                p_id = proto_entry.player_id or "default-player"
+                p_id = proto_entry.player_id or current_pid or "default-player"
                 stmt = pg_insert(PlayerStorageEntry).values(
                     player_id=p_id,
                     key=proto_entry.key,
@@ -162,12 +168,16 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         response = player_storage_pb2.PlayerStorageSetEntriesV2.Response()
         for proto_entry in request.entries:
             resp_entry = response.entries.add()
-            resp_entry.player_id = proto_entry.player_id or "default-player"
+            resp_entry.player_id = proto_entry.player_id or current_pid or "default-player"
             resp_entry.key = proto_entry.key
             resp_entry.value = proto_entry.value
             resp_entry.created_at = proto_entry.created_at or now
             resp_entry.updated_at = now
-        p_id = request.entries[0].player_id if request.entries else None
+        p_id = (
+            request.entries[0].player_id
+            if request.entries and request.entries[0].player_id
+            else current_pid
+        )
         response.revision = await StorageRevisionManager.set_revision_and_save(
             request.next_revision, player_id=p_id
         )
@@ -178,7 +188,46 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         request: player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Response:
-        return player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Response()
+        response = player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Response()
+        target_pids = list(request.player_ids)
+        if not target_pids:
+            return response
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id.in_(target_pids))
+            result = await session.execute(stmt)
+            db_entries = result.scalars().all()
+            db_entry_map = {(e.player_id, e.key): e for e in db_entries}
+
+        served_pairs: set[tuple[str, str]] = set()
+        for pid in target_pids:
+            for criterion in request.criteria:
+                if criterion.matching_type == Criterion.MatchingType.EXACT:
+                    k = criterion.key
+                    pair = (pid, k)
+                    if pair in db_entry_map and pair not in served_pairs:
+                        e = db_entry_map[pair]
+                        proto = response.entries.add()
+                        proto.player_id = pid
+                        proto.key = e.key
+                        proto.value = e.value
+                        proto.created_at = e.created_at
+                        proto.updated_at = e.updated_at
+                        served_pairs.add(pair)
+                else:  # FORWARD
+                    prefix = criterion.key
+                    for (entry_pid, k), e in db_entry_map.items():
+                        pair = (entry_pid, k)
+                        if entry_pid == pid and k.startswith(prefix) and pair not in served_pairs:
+                            proto = response.entries.add()
+                            proto.player_id = pid
+                            proto.key = e.key
+                            proto.value = e.value
+                            proto.created_at = e.created_at
+                            proto.updated_at = e.updated_at
+                            served_pairs.add(pair)
+        return response
 
 
 def register_player_storage_servicer(server: grpc.aio.Server) -> None:

@@ -71,3 +71,38 @@ def generate_lcx_tokens(user_id: str, registered_at: int) -> dict[str, str]:
         "signInSessionId": session_id,
         "analyticsSessionId": analytics_session_id,
     }
+
+
+def decode_token_user_id(token: str) -> str | None:
+    """Extract user_id from an LCX JWT token.
+
+    Attempts verification first, then falls back to unverified extraction if
+    secret differs (e.g. from genuine client tokens).
+    """
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(
+            token,
+            settings.require_jwt_secret(),
+            algorithms=[ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except Exception:
+        try:
+            payload = jwt.decode(token, options={"verify_signature": False})
+        except Exception:
+            return None
+
+    # LCX tokens store user id in "sub" or "data.userId" or "data.session.userId"
+    if "sub" in payload and payload["sub"]:
+        return str(payload["sub"])
+    data = payload.get("data")
+    if isinstance(data, dict):
+        if "userId" in data and data["userId"]:
+            return str(data["userId"])
+        session = data.get("session")
+        if isinstance(session, dict) and "userId" in session and session["userId"]:
+            return str(session["userId"])
+    return None
+
