@@ -43,6 +43,7 @@ async def test_lcx_identity_transfer() -> None:
         assert "accessToken" in data
         assert "lcxUserIdToken" in data
         assert "user" in data
+        assert data["user"]["store"] == "GUEST"
         assert "signInSessionToken" in data
 
 
@@ -56,9 +57,17 @@ async def test_lcx_auxiliary_endpoints() -> None:
         assert res.status_code == 200
         assert res.json()["isPubsubEnabled"] is False
 
+        res = await client.get("/identity/active-published-store")
+        assert res.status_code == 200
+        assert res.json() == {"store": "GUEST"}
+
+        res = await client.post("/gcp/identity/active-published-store")
+        assert res.status_code == 200
+        assert res.json() == {"store": "GUEST"}
+
         res = await client.post("/identity/link-state")
         assert res.status_code == 200
-        assert res.json()["hasAnyLink"] is True
+        assert res.json()["hasAnyLink"] is False
 
         res = await client.post("/identity/sign-out")
         assert res.status_code == 204

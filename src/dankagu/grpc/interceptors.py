@@ -19,6 +19,21 @@ from dankagu.grpc.codec import default_packer
 logger = logging.getLogger("dankagu.grpc")
 
 
+PUBLIC_RPC_PREFIXES = ("/takasho.schema.common_featureset.player_api.OndemandMaster/",)
+
+PUBLIC_RPC_METHODS = {
+    "/takasho.schema.common_featureset.player_api.System/AuthorizeV3",
+    "/takasho.schema.common_featureset.player_api.System/AuthorizeV2",
+}
+
+
+def is_public_rpc(method_name: str) -> bool:
+    """Determine if an RPC method is accessible without a session token."""
+    if method_name in PUBLIC_RPC_METHODS:
+        return True
+    return any(method_name.startswith(prefix) for prefix in PUBLIC_RPC_PREFIXES)
+
+
 class TakashoAsyncInterceptor(ServerInterceptor):
     """Async gRPC interceptor injecting Takasho and Envoy headers into metadata."""
 
@@ -40,6 +55,44 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                 server_timestamp = str(int(time.time()))
                 date_header = formatdate(timeval=None, localtime=False, usegmt=True)
 
+                await context.send_initial_metadata(
+                    (
+                        ("x-takasho-debug-adjustment-timestamp", server_timestamp),
+                        ("x-takasho-requested-timestamp", server_timestamp),
+                        ("date", date_header),
+                        ("server", "envoy"),
+                    )
+                )
+
+                if not is_public_rpc(method_name):
+                    session_token: str | None = None
+                    if context.invocation_metadata():
+                        for meta_key, meta_val in context.invocation_metadata():
+                            if str(meta_key).lower() == "x-takasho-session-token":
+                                session_token = str(meta_val)
+                                break
+                    player_id: str | None = None
+                    if session_token:
+                        player_id = await resolve_session_player_id(session_token)
+                    if not session_token or not player_id:
+                        logger.warning(
+                            "🔒 [Auth Reject Auto-Mock] Unauthenticated access to %s (session_token=%s)",
+                            method_name,
+                            session_token,
+                        )
+                        context.set_trailing_metadata(
+                            (
+                                ("x-envoy-upstream-service-time", "0"),
+                                ("x-takasho-respond-timestamp", str(int(time.time()))),
+                                ("x-takasho-server-version", "v1.16.3"),
+                            )
+                        )
+                        await context.abort(
+                            grpc.StatusCode.UNAUTHENTICATED,
+                            "Invalid or expired session token",
+                        )
+                        return b""
+
                 try:
                     unpacked = default_packer.unpack(raw_request)
                     logger.info(
@@ -52,15 +105,6 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     logger.info(
                         "🎮 [gRPC REQ Auto-Mock] ---> %s (raw %d B)", method_name, len(raw_request)
                     )
-
-                await context.send_initial_metadata(
-                    (
-                        ("x-takasho-debug-adjustment-timestamp", server_timestamp),
-                        ("x-takasho-requested-timestamp", server_timestamp),
-                        ("date", date_header),
-                        ("server", "envoy"),
-                    )
-                )
 
                 elapsed_ms = (time.perf_counter_ns() - start_ns) // 1_000_000
                 context.set_trailing_metadata(
@@ -121,9 +165,32 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                 if session_token:
                     player_id = await resolve_session_player_id(session_token)
 
+                if not is_public_rpc(method_name):
+                    if not session_token or not player_id:
+                        logger.warning(
+                            "🔒 [Auth Reject] Unauthenticated access to %s (session_token=%s, player_id=%s)",
+                            method_name,
+                            session_token,
+                            player_id,
+                        )
+                        context.set_trailing_metadata(
+                            (
+                                ("x-envoy-upstream-service-time", "0"),
+                                ("x-takasho-respond-timestamp", str(int(time.time()))),
+                                ("x-takasho-server-version", "v1.16.3"),
+                            )
+                        )
+                        await context.abort(
+                            grpc.StatusCode.UNAUTHENTICATED,
+                            "Invalid or expired session token",
+                        )
+                        return None
+
                 tokens = set_current_player(player_id, session_token)
                 try:
                     response = await original_behavior(request, context)
+                except (grpc.aio.AbortError, grpc.RpcError):
+                    raise
                 except Exception as exc:
                     logger.error(
                         "💥 [gRPC Error] %s failed with exception: %s",

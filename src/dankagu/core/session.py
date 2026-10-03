@@ -132,9 +132,14 @@ async def invalidate_session(session_token: str) -> None:
     try:
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            await session.execute(
-                delete(Session).where(Session.session_token == session_token)
-            )
+            await session.execute(delete(Session).where(Session.session_token == session_token))
             await session.commit()
     except Exception as exc:
         logger.error("Failed to delete session from DB: %s", exc)
+
+
+def invalidate_player_sessions(player_id: str) -> None:
+    """Evict all cached in-memory session tokens for the given player."""
+    stale = [tok for tok, (p_id, _, _) in _session_cache.items() if p_id == player_id]
+    for tok in stale:
+        _session_cache.pop(tok, None)

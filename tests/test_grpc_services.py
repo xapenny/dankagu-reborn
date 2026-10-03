@@ -25,6 +25,11 @@ class MockContext:
     def set_trailing_metadata(self, metadata: tuple[tuple[str, str], ...]) -> None:
         self.trailing_metadata.extend(metadata)
 
+    async def abort(self, code: object, details: str = "") -> None:
+        import grpc
+
+        raise grpc.RpcError(f"Aborted: {code} - {details}")
+
 
 @pytest.mark.asyncio
 async def test_ondemand_master_get_entries() -> None:
@@ -61,52 +66,59 @@ async def test_system_authorize() -> None:
 
 @pytest.mark.asyncio
 async def test_player_storage_roundtrip() -> None:
+    from dankagu.core.session import reset_current_player, set_current_player
+
     service = PlayerStorageService()
     context = MockContext()
+    pid = "player-101"
 
-    # 1. SetEntries
-    set_req = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
-        entries=[
-            Entry(
-                player_id="player-101",
-                key="DeckStatus--0",
-                value=b"\x01\x02\x03\x04",
-            ),
-            Entry(
-                player_id="player-101",
-                key="DeckStatus--1",
-                value=b"\x05\x06\x07\x08",
-            ),
-        ],
-        next_revision="rev-2",
-    )
-    set_res = await service.SetEntriesV2(set_req, context)  # type: ignore[arg-type]
-    assert set_res.revision == "rev-2"
-    assert len(set_res.entries) == 2
+    tokens = set_current_player(pid)
+    try:
+        # 1. SetEntries
+        set_req = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
+            entries=[
+                Entry(
+                    player_id=pid,
+                    key="DeckStatus--0",
+                    value=b"\x01\x02\x03\x04",
+                ),
+                Entry(
+                    player_id=pid,
+                    key="DeckStatus--1",
+                    value=b"\x05\x06\x07\x08",
+                ),
+            ],
+            next_revision="rev-2",
+        )
+        set_res = await service.SetEntriesV2(set_req, context)  # type: ignore[arg-type]
+        assert set_res.revision == "rev-2"
+        assert len(set_res.entries) == 2
 
-    # 2. GetEntries with FORWARD matching
-    get_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
-        criteria=[
-            Criterion(
-                key="DeckStatus--",
-                matching_type=Criterion.MatchingType.FORWARD,
-            )
-        ]
-    )
-    get_res = await service.GetEntriesV2(get_req, context)  # type: ignore[arg-type]
-    retrieved_keys = [e.key for e in get_res.entries]
-    assert "DeckStatus--0" in retrieved_keys
-    assert "DeckStatus--1" in retrieved_keys
+        # 2. GetEntries with FORWARD matching
+        get_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
+            criteria=[
+                Criterion(
+                    key="DeckStatus--",
+                    matching_type=Criterion.MatchingType.FORWARD,
+                )
+            ]
+        )
+        get_res = await service.GetEntriesV2(get_req, context)  # type: ignore[arg-type]
+        retrieved_keys = [e.key for e in get_res.entries]
+        assert "DeckStatus--0" in retrieved_keys
+        assert "DeckStatus--1" in retrieved_keys
 
-    # 3. GetEntries with EXACT matching
-    get_exact_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
-        criteria=[
-            Criterion(
-                key="DeckStatus--0",
-                matching_type=Criterion.MatchingType.EXACT,
-            )
-        ]
-    )
-    get_exact_res = await service.GetEntriesV2(get_exact_req, context)  # type: ignore[arg-type]
-    assert len(get_exact_res.entries) == 1
-    assert get_exact_res.entries[0].value == b"\x01\x02\x03\x04"
+        # 3. GetEntries with EXACT matching
+        get_exact_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
+            criteria=[
+                Criterion(
+                    key="DeckStatus--0",
+                    matching_type=Criterion.MatchingType.EXACT,
+                )
+            ]
+        )
+        get_exact_res = await service.GetEntriesV2(get_exact_req, context)  # type: ignore[arg-type]
+        assert len(get_exact_res.entries) == 1
+        assert get_exact_res.entries[0].value == b"\x01\x02\x03\x04"
+    finally:
+        reset_current_player(tokens)

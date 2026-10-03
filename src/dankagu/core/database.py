@@ -80,9 +80,6 @@ async def init_db() -> None:
             "consented_tos_version VARCHAR(32) DEFAULT ''",
         ]:
             try:
-                await conn.execute(
-                    text(f"ALTER TABLE players ADD COLUMN IF NOT EXISTS {col_def};")
-                )
+                await conn.execute(text(f"ALTER TABLE players ADD COLUMN IF NOT EXISTS {col_def};"))
             except Exception:
                 pass
-

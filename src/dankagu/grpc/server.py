@@ -23,6 +23,7 @@ from dankagu.services.player_storage import register_player_storage_servicer
 from dankagu.services.push_notification import register_push_notification_servicer
 from dankagu.services.ranking import register_ranking_servicers
 from dankagu.services.reconstruction_spot import register_reconstruction_spot_servicer
+from dankagu.services.restoration import register_restoration_servicer
 from dankagu.services.step_up_loot_box import register_step_up_loot_box_servicer
 from dankagu.services.subscription import register_subscription_servicers
 from dankagu.services.system import register_system_servicer
@@ -51,6 +52,7 @@ def create_grpc_server() -> grpc.aio.Server:
     register_baas_product_servicer(server)
     register_player_key_value_store_servicer(server)
     register_player_event_log_servicer(server)
+    register_restoration_servicer(server)
 
     # Game Domain (Fes) Services
     register_login_bonus_servicer(server)

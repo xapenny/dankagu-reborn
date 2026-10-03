@@ -49,6 +49,9 @@ class MockContext:
     def set_trailing_metadata(self, metadata: tuple[tuple[str, str], ...]) -> None:
         pass
 
+    async def abort(self, code: Any, details: str = "") -> None:
+        raise grpc.RpcError(f"Aborted: {code} - {details}")
+
 
 @pytest.mark.asyncio
 async def test_multi_device_registration_issues_distinct_players() -> None:
@@ -195,7 +198,9 @@ async def test_get_other_player_entries_v2() -> None:
     try:
         other_req = player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Request(
             player_ids=[target_pid],
-            criteria=[Criterion(key="PublicProfile--", matching_type=Criterion.MatchingType.FORWARD)],
+            criteria=[
+                Criterion(key="PublicProfile--", matching_type=Criterion.MatchingType.FORWARD)
+            ],
         )
         other_res = await player_storage.GetOtherPlayerEntriesV2(other_req, context)  # type: ignore[arg-type]
         assert len(other_res.entries) == 1
@@ -250,3 +255,71 @@ async def test_grpc_interceptor_session_token_binding() -> None:
 
     # Outside handler, context is reset
     assert get_current_player_id() is None
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_request_rejected_by_interceptor() -> None:
+    """An authenticated RPC requested without a session token must be aborted with UNAUTHENTICATED."""
+    interceptor = TakashoAsyncInterceptor()
+
+    async def dummy_method_handler(request: Any, context: grpc.aio.ServicerContext) -> str:
+        return "ok"
+
+    handler = grpc.unary_unary_rpc_method_handler(dummy_method_handler)
+
+    class DummyCallDetails:
+        method = "/takasho.schema.common_featureset.player_api.PlayerStorage/GetEntriesV2"
+
+    async def continuation(details: grpc.HandlerCallDetails) -> Any:
+        return handler
+
+    intercepted = await interceptor.intercept_service(continuation, DummyCallDetails())  # type: ignore[arg-type]
+
+    # Invoke WITHOUT session token metadata -> must raise RpcError
+    context_no_token = MockContext(metadata=[])
+    with pytest.raises(grpc.RpcError) as exc_info:
+        await intercepted.unary_unary(b"", context_no_token)
+
+    assert "StatusCode.UNAUTHENTICATED" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_invalid_session_token_rejected_by_interceptor() -> None:
+    """An authenticated RPC requested with a non-existent or expired session token must be aborted."""
+    interceptor = TakashoAsyncInterceptor()
+
+    async def dummy_method_handler(request: Any, context: grpc.aio.ServicerContext) -> str:
+        return "ok"
+
+    handler = grpc.unary_unary_rpc_method_handler(dummy_method_handler)
+
+    class DummyCallDetails:
+        method = "/takasho.schema.common_featureset.player_api.Wallet/GetBalancesV2"
+
+    async def continuation(details: grpc.HandlerCallDetails) -> Any:
+        return handler
+
+    intercepted = await interceptor.intercept_service(continuation, DummyCallDetails())  # type: ignore[arg-type]
+
+    # Invoke with forged/deleted session token
+    fake_token = str(uuid.uuid4())
+    context_bad_token = MockContext(metadata=[("x-takasho-session-token", fake_token)])
+    with pytest.raises(grpc.RpcError) as exc_info:
+        await intercepted.unary_unary(b"", context_bad_token)
+
+    assert "StatusCode.UNAUTHENTICATED" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_player_storage_without_session_aborts() -> None:
+    """Direct invocation of PlayerStorageService without an active session context must abort."""
+    service = PlayerStorageService()
+    context = MockContext()
+
+    req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
+        criteria=[Criterion(key="CardStatus--", matching_type=Criterion.MatchingType.FORWARD)]
+    )
+    with pytest.raises(grpc.RpcError) as exc_info:
+        await service.GetEntriesV2(req, context)  # type: ignore[arg-type]
+
+    assert "StatusCode.UNAUTHENTICATED" in str(exc_info.value)

@@ -24,6 +24,37 @@ from dankagu.models.storage import PlayerStorageEntry
 logger = logging.getLogger("dankagu.services.player_storage")
 
 
+PERSONAL_STORAGE_PREFIXES = (
+    "CardStatus--",
+    "CardEntityStatusCollection--",
+    "PlayMusicRecord--",
+    "SpotStatus--",
+    "SpotObjectStatus--",
+    "SpotRepairStatus--",
+    "SpotRepairObjectStatus--",
+    "SpotVisitStatus--",
+    "SpotRepairTutorialStatus--",
+    "HakoniwaStatus--",
+    "HeroineStatus--",
+    "CharacterStatus--",
+    "Formation--",
+    "DeckStatus--",
+    "MySpotItemStatus--",
+    "ItemStockStatus--",
+    "GrowthItemStock--",
+    "TweetStatus--",
+    "NakayosiCloudPairtEntityStatusCollection--",
+    "PremiumCardStatus--",
+    "EpisodeEntityStatusCollection--",
+    "PlaySkipStatus--",
+    "PlayerStatus--",
+    "PlayerBase--",
+    "PlayerPublicStatus--",
+    "PlayerSetting--",
+    "SaveHash--",
+)
+
+
 class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
     """Handles GetEntriesV2 and SetEntriesV2 for game state persistence."""
 
@@ -41,6 +72,9 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                         bytes.fromhex(hex_data)
                     )
                     for e in ps.entries:
+                        # Skip personal player progression keys from universal template
+                        if e.key.startswith(PERSONAL_STORAGE_PREFIXES):
+                            continue
                         self.template_entries[e.key] = e.value
                 except Exception as e:
                     logger.error("Failed to parse %s: %s", p.name, e)
@@ -66,7 +100,8 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         )
 
         logger.info(
-            "💾 Loaded %d baseline template PlayerStorage entries", len(self.template_entries)
+            "💾 Loaded %d baseline template PlayerStorage entries",
+            len(self.template_entries),
         )
 
     async def GetEntriesV2(
@@ -75,6 +110,10 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageGetEntriesV2.Response:
         current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return player_storage_pb2.PlayerStorageGetEntriesV2.Response()
+
         await StorageRevisionManager.initialize()
         response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
         response.revision = StorageRevisionManager.get_revision(current_pid)
@@ -82,14 +121,13 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            stmt = select(PlayerStorageEntry)
-            if current_pid:
-                stmt = stmt.where(PlayerStorageEntry.player_id == current_pid)
+            stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id == current_pid)
             result = await session.execute(stmt)
             db_entries = result.scalars().all()
             db_entry_map = {e.key: e for e in db_entries}
 
         served_keys: set[str] = set()
+        fallback_templates = self.template_entries
 
         for criterion in request.criteria:
             if criterion.matching_type == Criterion.MatchingType.EXACT:
@@ -97,17 +135,17 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 if k in db_entry_map:
                     e = db_entry_map[k]
                     proto = response.entries.add()
-                    proto.player_id = current_pid or e.player_id
+                    proto.player_id = current_pid
                     proto.key = e.key
                     proto.value = e.value
                     proto.created_at = e.created_at
                     proto.updated_at = e.updated_at
                     served_keys.add(k)
-                elif k in self.template_entries and k not in served_keys:
+                elif k in fallback_templates and k not in served_keys:
                     proto = response.entries.add()
-                    proto.player_id = current_pid or "default-player"
+                    proto.player_id = current_pid
                     proto.key = k
-                    proto.value = self.template_entries[k]
+                    proto.value = fallback_templates[k]
                     proto.created_at = now
                     proto.updated_at = now
                     served_keys.add(k)
@@ -117,18 +155,18 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 for k, e in db_entry_map.items():
                     if k.startswith(prefix) and k not in served_keys:
                         proto = response.entries.add()
-                        proto.player_id = current_pid or e.player_id
+                        proto.player_id = current_pid
                         proto.key = e.key
                         proto.value = e.value
                         proto.created_at = e.created_at
                         proto.updated_at = e.updated_at
                         served_keys.add(k)
 
-                # 2. Template fallback for missing keys
-                for k, val in self.template_entries.items():
+                # 2. Template fallback for missing universal system keys
+                for k, val in fallback_templates.items():
                     if k.startswith(prefix) and k not in served_keys:
                         proto = response.entries.add()
-                        proto.player_id = current_pid or "default-player"
+                        proto.player_id = current_pid
                         proto.key = k
                         proto.value = val
                         proto.created_at = now
@@ -142,14 +180,17 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         request: player_storage_pb2.PlayerStorageSetEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageSetEntriesV2.Response:
-        now = int(time.time())
         current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return player_storage_pb2.PlayerStorageSetEntriesV2.Response()
+
+        now = int(time.time())
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             for proto_entry in request.entries:
-                p_id = proto_entry.player_id or current_pid or "default-player"
                 stmt = pg_insert(PlayerStorageEntry).values(
-                    player_id=p_id,
+                    player_id=current_pid,
                     key=proto_entry.key,
                     value=proto_entry.value,
                     created_at=proto_entry.created_at or now,
@@ -168,18 +209,14 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         response = player_storage_pb2.PlayerStorageSetEntriesV2.Response()
         for proto_entry in request.entries:
             resp_entry = response.entries.add()
-            resp_entry.player_id = proto_entry.player_id or current_pid or "default-player"
+            resp_entry.player_id = current_pid
             resp_entry.key = proto_entry.key
             resp_entry.value = proto_entry.value
             resp_entry.created_at = proto_entry.created_at or now
             resp_entry.updated_at = now
-        p_id = (
-            request.entries[0].player_id
-            if request.entries and request.entries[0].player_id
-            else current_pid
-        )
+
         response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=p_id
+            request.next_revision, player_id=current_pid
         )
         return response
 

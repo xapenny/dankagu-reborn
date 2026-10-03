@@ -33,6 +33,29 @@ VENDOR_DIR = PROJECT_ROOT / "vendor-protos"
 UPSTREAM_REPO = "https://github.com/RainbowUnicorn7297/dankagu-local.git"
 UPSTREAM_SUBDIR = "protos"
 
+SUPPLEMENTAL_PROTOS: dict[str, str] = {
+    "takasho/schema/common_featureset/player_api/restoration.proto": """syntax = "proto3";
+
+package takasho.schema.common_featureset.player_api;
+
+message RestorationValidateBannedWordsV1 {
+  message Request {
+    repeated string language_codes = 1;
+    string word = 2;
+  }
+
+  message Response {
+    bool contains_banned_word = 1;
+    string word = 2;
+  }
+}
+
+service Restoration {
+  rpc ValidateBannedWordsV1(RestorationValidateBannedWordsV1.Request) returns (RestorationValidateBannedWordsV1.Response) {}
+}
+""",
+}
+
 
 def fetch_protos() -> int:
     """Sparse-clone the upstream repository and copy its ``protos/`` tree here."""
@@ -73,6 +96,12 @@ def fetch_protos() -> int:
 
 def compile_all_protos() -> int:
     """Compile every ``.proto`` under ``protos/`` and rewrite imports."""
+    for rel_path_str, proto_code in SUPPLEMENTAL_PROTOS.items():
+        supp_path = PROTOS_DIR / rel_path_str
+        supp_path.parent.mkdir(parents=True, exist_ok=True)
+        if not supp_path.exists():
+            supp_path.write_text(proto_code, encoding="utf-8")
+
     proto_files = sorted(PROTOS_DIR.rglob("*.proto")) if PROTOS_DIR.is_dir() else []
     if not proto_files:
         print(

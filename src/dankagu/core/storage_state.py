@@ -68,14 +68,17 @@ class StorageRevisionManager:
         if not next_revision:
             return cls.get_revision(player_id)
         cls.set_revision(next_revision, player_id=player_id)
-        try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                stmt = update(Player).values(storage_revision=str(next_revision))
-                if player_id and player_id != "default-player":
-                    stmt = stmt.where(Player.id == player_id)
-                await session.execute(stmt)
-                await session.commit()
-        except Exception as e:
-            logger.warning("Could not persist storage revision to DB: %s", e)
+        if player_id:
+            try:
+                session_factory = get_sessionmaker()
+                async with session_factory() as session:
+                    stmt = (
+                        update(Player)
+                        .where(Player.id == player_id)
+                        .values(storage_revision=str(next_revision))
+                    )
+                    await session.execute(stmt)
+                    await session.commit()
+            except Exception as e:
+                logger.warning("Could not persist storage revision to DB: %s", e)
         return cls.get_revision(player_id)

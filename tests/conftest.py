@@ -6,6 +6,7 @@ real player database.
 """
 
 import os
+from collections.abc import AsyncGenerator
 
 import asyncpg
 import pytest
@@ -22,8 +23,8 @@ if "DANKAGU_TEST_PG_URL" in os.environ:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def initialize_test_database(request: pytest.FixtureRequest) -> None:
-    """Ensure database tables exist before running any test."""
+async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGenerator[None, None]:
+    """Ensure database tables exist before test, and clean up test data afterwards."""
     reset_engine()
     clean_url = settings.db_url.replace("postgresql+asyncpg://", "postgresql://")
     try:
@@ -35,3 +36,31 @@ async def initialize_test_database(request: pytest.FixtureRequest) -> None:
         skip_keywords = ["persistence", "authorize", "token", "transfer", "storage"]
         if any(kw in request.node.nodeid.lower() for kw in skip_keywords):
             pytest.skip(f"PostgreSQL database not reachable at {settings.db_url}: {e!r}")
+
+    existing_player_ids: set[str] = set()
+    try:
+        conn = await asyncpg.connect(clean_url, timeout=2.0)
+        rows = await conn.fetch("SELECT id FROM players;")
+        existing_player_ids = {r["id"] for r in rows}
+        await conn.close()
+    except Exception:
+        pass
+
+    yield
+
+    # Clean up ONLY test players and related records created during this test
+    try:
+        conn = await asyncpg.connect(clean_url, timeout=2.0)
+        rows = await conn.fetch("SELECT id FROM players;")
+        new_ids = [r["id"] for r in rows if r["id"] not in existing_player_ids]
+        if new_ids:
+            await conn.execute("DELETE FROM account_transfers WHERE player_id = ANY($1);", new_ids)
+            await conn.execute(
+                "DELETE FROM player_storage_entries WHERE player_id = ANY($1);", new_ids
+            )
+            await conn.execute("DELETE FROM wallet_balances WHERE player_id = ANY($1);", new_ids)
+            await conn.execute("DELETE FROM sessions WHERE player_id = ANY($1);", new_ids)
+            await conn.execute("DELETE FROM players WHERE id = ANY($1);", new_ids)
+        await conn.close()
+    except Exception:
+        pass

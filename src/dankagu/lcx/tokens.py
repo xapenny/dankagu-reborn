@@ -105,4 +105,3 @@ def decode_token_user_id(token: str) -> str | None:
         if isinstance(session, dict) and "userId" in session and session["userId"]:
             return str(session["userId"])
     return None
-
