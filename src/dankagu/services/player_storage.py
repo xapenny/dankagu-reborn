@@ -19,6 +19,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 from dankagu.grpc.generated.takasho.schema.common_featureset.resource.player_storage.v2_pb2 import (
     Criterion,
 )
+from dankagu.models.player import Player
 from dankagu.models.storage import PlayerStorageEntry
 
 logger = logging.getLogger("dankagu.services.player_storage")
@@ -80,7 +81,9 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     logger.error("Failed to parse %s: %s", p.name, e)
 
         # Baseline entries used when no operator-supplied template covers them
-        self.template_entries.setdefault("PlayerBootStatus--1", b"\010\001 \016(\001")
+        self.template_entries.setdefault(
+            "PlayerBootStatus--1", b"\x08\x01\x18\x01 \x0e(\xff\xff\xff\xff\x07"
+        )
         self.template_entries.setdefault(
             "JoinClubStatus--0", b"\020\363\234\252\210\006\030\363\234\252\210\006 \001"
         )
@@ -115,16 +118,22 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             return player_storage_pb2.PlayerStorageGetEntriesV2.Response()
 
         await StorageRevisionManager.initialize()
-        response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
-        response.revision = StorageRevisionManager.get_revision(current_pid)
-        now = int(time.time())
-
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            if current_pid not in StorageRevisionManager._player_revisions:
+                player = await session.get(Player, current_pid)
+                if player and player.storage_revision:
+                    StorageRevisionManager.set_revision(
+                        player.storage_revision, player_id=current_pid
+                    )
             stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id == current_pid)
             result = await session.execute(stmt)
             db_entries = result.scalars().all()
             db_entry_map = {e.key: e for e in db_entries}
+
+        response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
+        response.revision = StorageRevisionManager.get_revision(current_pid)
+        now = int(time.time())
 
         served_keys: set[str] = set()
         fallback_templates = self.template_entries

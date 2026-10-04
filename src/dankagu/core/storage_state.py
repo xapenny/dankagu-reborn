@@ -19,30 +19,37 @@ class StorageRevisionManager:
 
     @classmethod
     async def initialize(cls) -> None:
-        """Load the latest storage_revision from the database."""
+        """Load storage revisions from the database."""
         if cls._initialized:
             return
         try:
             session_factory = get_sessionmaker()
             async with session_factory() as session:
+                stmt = select(Player.id, Player.storage_revision)
+                res = await session.execute(stmt)
+                for pid, rev in res.all():
+                    if rev:
+                        cls._player_revisions[pid] = str(rev)
                 result = await session.execute(
                     select(Player.storage_revision).order_by(Player.last_login_at.desc()).limit(1)
                 )
                 rev = result.scalar_one_or_none()
                 if rev:
                     cls._current_revision = str(rev)
-                    logger.info(
-                        "🔄 [StorageRevision] Initialized from DB: %s", cls._current_revision
-                    )
+                logger.info(
+                    "🔄 [StorageRevision] Initialized %d player revisions from DB (global: %s)",
+                    len(cls._player_revisions),
+                    cls._current_revision,
+                )
             cls._initialized = True
         except Exception as e:
             logger.warning("Could not initialize storage revision from DB: %s", e)
 
     @classmethod
     def get_revision(cls, player_id: str | None = None) -> str:
-        """Get the storage revision for a player, falling back to global revision."""
-        if player_id and player_id in cls._player_revisions:
-            return cls._player_revisions[player_id]
+        """Get the storage revision for a player, falling back to initial revision '1'."""
+        if player_id:
+            return cls._player_revisions.get(player_id, "1")
         return cls._current_revision
 
     @classmethod

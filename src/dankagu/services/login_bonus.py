@@ -51,6 +51,8 @@ class LoginBonusService(login_bonus_pb2_grpc.LoginBonusServicer):
         context: grpc.aio.ServicerContext,
     ) -> login_bonus_pb2.LoginBonusGetAvailableV1.Response:
         logger.info("🎁 [LoginBonus] GetAvailableLoginBonusV1")
+        if self.available_response:
+            return self.available_response
         return login_bonus_pb2.LoginBonusGetAvailableV1.Response()
 
     async def CountUpProgressV1(
@@ -59,6 +61,8 @@ class LoginBonusService(login_bonus_pb2_grpc.LoginBonusServicer):
         context: grpc.aio.ServicerContext,
     ) -> login_bonus_pb2.LoginBonusCountUpProgressV1.Response:
         logger.info("🎁 [LoginBonus] CountUpProgressV1")
+        if self.countup_response:
+            return self.countup_response
         return login_bonus_pb2.LoginBonusCountUpProgressV1.Response()
 
 

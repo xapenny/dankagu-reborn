@@ -48,7 +48,7 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
                 b'{"CloseAt":"4102444800","Enable":2,"ID":2,"Key":"PPVer","OpenAt":"0","Value":"1"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":3,"Key":"TosBaseUrl","OpenAt":"0","Value":"{AssetBase}/static/tos"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":4,"Key":"PPBaseUrl","OpenAt":"0","Value":"{AssetBase}/static/pp"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":5,"Key":"AccountLinkApealTime","OpenAt":"0","Value":"25920"},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":5,"Key":"AccountLinkApealTime","OpenAt":"0","Value":"2147483647"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1001,"Key":"AdmobTester","OpenAt":"0","Value":""},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1002,"Key":"AdmobTestDevice","OpenAt":"0","Value":""},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1003,"Key":"AdmobAlwaysTestDevice","OpenAt":"0","Value":"0"},'
