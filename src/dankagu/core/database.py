@@ -68,6 +68,8 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Initialize database tables and run lightweight migrations."""
+    import dankagu.models  # noqa: F401 Ensure all ORM models are registered
+
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -83,3 +85,9 @@ async def init_db() -> None:
                 await conn.execute(text(f"ALTER TABLE players ADD COLUMN IF NOT EXISTS {col_def};"))
             except Exception:
                 pass
+
+    from dankagu.core.gacha_seed import seed_gacha_data_if_empty
+
+    session_factory = get_sessionmaker()
+    async with session_factory() as session:
+        await seed_gacha_data_if_empty(session)

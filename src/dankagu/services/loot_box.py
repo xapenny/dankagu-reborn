@@ -8,46 +8,105 @@ import uuid
 
 import grpc
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from dankagu.config import settings
+from dankagu.core.database import get_sessionmaker
+from dankagu.core.economy import (
+    InsufficientFundsError,
+    deduct_player_key_value,
+    deduct_stones,
+    get_or_create_wallet,
+    get_player_key_value,
+    persist_cards_to_storage,
+)
+from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     loot_box_pb2,
     loot_box_pb2_grpc,
 )
+from dankagu.models.gacha import GachaBanner, GachaCard
 
 logger = logging.getLogger("dankagu.services.loot_box")
 
-# Gacha IDs whose banners & logos exist in manifest 3760 and on disk
-VALID_GACHA_IDS = {1, 3, 159, 160, 161, 165, 169, 173, 4001, 90010}
+# Fallback gacha IDs if database cache has not yet initialized
+VALID_GACHA_IDS = {1, 3, 159, 160, 161, 163, 167, 171, 4087, 80001}
 
-# Load card pool
-_CARD_POOL_PATH = settings.data_dir / "card_pool.json"
+# In-memory card pool and banner caches loaded directly from database
 _CARDS_BY_RARITY: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
-if _CARD_POOL_PATH.exists():
-    try:
-        raw_pool = json.loads(_CARD_POOL_PATH.read_text(encoding="utf-8"))
-        _CARDS_BY_RARITY = {int(k): v for k, v in raw_pool.items()}
-        logger.info(
-            "🃏 Loaded card pool: %d SSR, %d SR, %d R, %d N cards",
-            len(_CARDS_BY_RARITY.get(4, [])),
-            len(_CARDS_BY_RARITY.get(3, [])),
-            len(_CARDS_BY_RARITY.get(2, [])),
-            len(_CARDS_BY_RARITY.get(1, [])),
-        )
-    except Exception as exc:
-        logger.error("Failed to load card pool: %s", exc)
+_BY_ELEMENT: dict[int, dict[int, list[int]]] = {1: {}, 2: {}, 3: {}}
+_BANNERS: dict[int, GachaBanner] = {}
+_CARDS_BY_ID: dict[int, GachaCard] = {}
+_GACHA_CACHE_INITIALIZED = False
 
 
-def _roll_card(is_guaranteed_sr: bool = False) -> int:
-    """Roll a card with authentic gacha rates.
+async def load_gacha_cache_from_db(session: AsyncSession) -> None:
+    """Load card pool and banner configurations from database into memory."""
+    global _CARDS_BY_RARITY, _BY_ELEMENT, _BANNERS, _CARDS_BY_ID, _GACHA_CACHE_INITIALIZED
+
+    cards_stmt = select(GachaCard).where(GachaCard.enabled == True)
+    cards = (await session.execute(cards_stmt)).scalars().all()
+
+    banners_stmt = select(GachaBanner).where(GachaBanner.enabled == True)
+    banners = (await session.execute(banners_stmt)).scalars().all()
+
+    by_rarity: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
+    by_elem: dict[int, dict[int, list[int]]] = {1: {}, 2: {}, 3: {}}
+    cards_map: dict[int, GachaCard] = {}
+    banners_map: dict[int, GachaBanner] = {}
+
+    for c in cards:
+        cards_map[c.id] = c
+        by_rarity.setdefault(c.rarity, []).append(c.id)
+        if c.element in (1, 2, 3):
+            by_elem.setdefault(c.element, {}).setdefault(c.rarity, []).append(c.id)
+
+    for b in banners:
+        banners_map[b.id] = b
+
+    _CARDS_BY_RARITY = by_rarity
+    _BY_ELEMENT = by_elem
+    _CARDS_BY_ID = cards_map
+    _BANNERS = banners_map
+    _GACHA_CACHE_INITIALIZED = True
+
+    logger.info(
+        "🃏 Loaded gacha cache from database: %d SSR, %d SR, %d R, %d N cards across %d banners",
+        len(_CARDS_BY_RARITY.get(4, [])),
+        len(_CARDS_BY_RARITY.get(3, [])),
+        len(_CARDS_BY_RARITY.get(2, [])),
+        len(_CARDS_BY_RARITY.get(1, [])),
+        len(_BANNERS),
+    )
+
+
+async def ensure_gacha_cache_loaded(session: AsyncSession) -> None:
+    """Ensure database-backed gacha card pool cache is loaded."""
+    if not _GACHA_CACHE_INITIALIZED or not _CARDS_BY_ID:
+        await load_gacha_cache_from_db(session)
+
+
+def _roll_card(
+    gacha_id: int, is_guaranteed_sr: bool = False, is_guaranteed_ssr: bool = False
+) -> int:
+    """Roll a card with authentic gacha rates and banner-specific pools.
 
     Rates:
       Normal pull: SSR=4%, SR=16%, R=80%
-      Guaranteed pull (10th pull): SSR=4%, SR=96%
+      Guaranteed SR (10th pull): SSR=4%, SR=96%
+      Guaranteed SSR: SSR=100%
     """
-    if is_guaranteed_sr:
-        r = random.random()
-        rarity = 4 if r < 0.04 else 3
+    banner = _BANNERS.get(gacha_id)
+    elem_filter = banner.element if banner else 0
+    pickups = banner.pickups if banner else []
+
+    # 1. Determine rarity
+    if is_guaranteed_ssr:
+        rarity = 4
+    elif is_guaranteed_sr:
+        rarity = 4 if random.random() < 0.04 else 3
     else:
         r = random.random()
         if r < 0.04:
@@ -57,53 +116,66 @@ def _roll_card(is_guaranteed_sr: bool = False) -> int:
         else:
             rarity = 2
 
-    pool = _CARDS_BY_RARITY.get(rarity) or _CARDS_BY_RARITY.get(2) or [100001]
-    return random.choice(pool)
+    # 2. Candidate pool for this rarity (respecting element restriction if banner is elemental)
+    if elem_filter in (1, 2, 3) and elem_filter in _BY_ELEMENT:
+        elem_dict = _BY_ELEMENT[elem_filter]
+        candidate_pool = elem_dict.get(rarity, [])
+    else:
+        candidate_pool = _CARDS_BY_RARITY.get(rarity, [])
+
+    if not candidate_pool:
+        candidate_pool = _CARDS_BY_RARITY.get(2, [100001])
+
+    # 3. Check for pickup cards in this rarity
+    rarity_pickups = [
+        int(cid)
+        for cid in pickups
+        if _CARDS_BY_ID.get(int(cid)) and _CARDS_BY_ID[int(cid)].rarity == rarity
+    ]
+
+    # 4. Rate-up application for pickups (70% for SSR pickup, 50% for SR pickup)
+    if rarity_pickups:
+        rate_up_prob = 0.70 if rarity == 4 else 0.50
+        if random.random() < rate_up_prob:
+            return random.choice(rarity_pickups)
+
+    # 5. Non-pickup roll from candidate pool
+    non_pickups = [cid for cid in candidate_pool if cid not in rarity_pickups]
+    if non_pickups:
+        return random.choice(non_pickups)
+    return random.choice(candidate_pool)
 
 
 class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
     """Servicer for LootBox V3 gacha banners."""
 
     def __init__(self) -> None:
-        self.cached_available: loot_box_pb2.LootBoxV3GetAvailableV1.Response | None = None
+        self.all_template_products: list[object] = []
         self._load_loot_boxes()
 
     def _load_loot_boxes(self) -> None:
-        hex_file = settings.hexdata_cf_dir / "loot_box.hex"
-        if not hex_file.exists():
-            return
+        hex_files = [
+            settings.hexdata_cf_dir / "loot_box.hex",
+            settings.hexdata_cf_dir
+            / "loot_box.eyJNYXhSZXN1bHRzIjoxMDAsIlBhZ2UiOjIsIk9wdGlvbnMiOiIifQ==.hex",
+        ]
 
-        try:
-            hex_data = hex_file.read_text(encoding="utf-8").strip()
-            orig_resp = loot_box_pb2.LootBoxV3GetAvailableV1.Response.FromString(
-                bytes.fromhex(hex_data)
-            )
+        for hf in hex_files:
+            if not hf.exists():
+                continue
+            try:
+                hex_data = hf.read_text(encoding="utf-8").strip()
+                resp = loot_box_pb2.LootBoxV3GetAvailableV1.Response.FromString(
+                    bytes.fromhex(hex_data)
+                )
+                self.all_template_products.extend(resp.loot_box_products)
+            except Exception as e:
+                logger.error("Failed to parse %s: %s", hf.name, e)
 
-            # Filter products to only include banners with existing assets
-            filtered = loot_box_pb2.LootBoxV3GetAvailableV1.Response()
-            for prod in orig_resp.loot_box_products:
-                pid = prod.loot_product.loot_box_product_id
-                parts = pid.split("_")
-                gid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-                if gid in VALID_GACHA_IDS:
-                    p = filtered.loot_box_products.add()
-                    p.CopyFrom(prod)
-                    # Extend open/close dates to year 2100 so all banners are active
-                    p.loot_product.opened_at = 1592373600
-                    p.loot_product.closed_at = 4102498799
-                    if pid == "G_1_10_TT_L":
-                        p.purchased_count = 0
-
-            # Do not set next_page_token to prevent client pagination issues
-            filtered.next_page_token = ""
-            self.cached_available = filtered
-            logger.info(
-                "🎁 Loaded %d gacha products across valid banners %s",
-                len(self.cached_available.loot_box_products),
-                sorted(VALID_GACHA_IDS),
-            )
-        except Exception as e:
-            logger.error("Failed to parse loot_box.hex: %s", e)
+        logger.info(
+            "🎁 Loaded %d gacha products from hex templates",
+            len(self.all_template_products),
+        )
 
     async def GetAvailableV1(
         self,
@@ -111,45 +183,151 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         context: grpc.aio.ServicerContext,
     ) -> loot_box_pb2.LootBoxV3GetAvailableV1.Response:
         token = request.page_token or ""
-        logger.info("🎁 [LootBox] GetAvailableV1 (page_token=%s)", token[:20] if token else "root")
+        logger.info(
+            "🎁 [LootBox] GetAvailableV1 (page_token=%s)",
+            token[:20] if token else "root",
+        )
         if token:
-            # All valid products are delivered on the root page
             return loot_box_pb2.LootBoxV3GetAvailableV1.Response()
 
-        if self.cached_available:
-            return self.cached_available
-        return loot_box_pb2.LootBoxV3GetAvailableV1.Response()
+        # Ensure database gacha cache is loaded
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            await ensure_gacha_cache_loaded(session)
+
+        # Active banners from database
+        active_banner_ids = set(_BANNERS.keys()) if _BANNERS else VALID_GACHA_IDS
+
+        # Deliver all products belonging to active banners
+        response = loot_box_pb2.LootBoxV3GetAvailableV1.Response()
+        seen_pids = set()
+        for prod in self.all_template_products:
+            pid = prod.loot_product.loot_box_product_id  # type: ignore[attr-defined]
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            parts = pid.split("_")
+            gid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if gid in active_banner_ids:
+                p = response.loot_box_products.add()
+                p.CopyFrom(prod)  # type: ignore[arg-type]
+                p.loot_product.opened_at = 1592373600
+                p.loot_product.closed_at = 4102498799
+                p.purchased_count = 0
+
+        response.next_page_token = ""
+        return response
 
     async def PurchaseV1(
         self,
         request: loot_box_pb2.LootBoxV3PurchaseV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> loot_box_pb2.LootBoxV3PurchaseV1.Response:
+        current_pid = get_current_player_id()
+        if not current_pid:
+            logger.warning("🎁 [LootBox] PurchaseV1 called without player session context")
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return loot_box_pb2.LootBoxV3PurchaseV1.Response()
+
         pid = request.loot_box_product_id
-        is_ten_pull = "_10_" in pid
-        pull_count = 10 if is_ten_pull else 1
+        parts = pid.split("_")
+        gacha_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 159
+        is_ten_pull = "_10_" in pid or request.purchase_num == 10
+        pull_count = request.purchase_num if request.purchase_num > 0 else (10 if is_ten_pull else 1)
+        is_pt = (
+            "_PT_" in pid
+            or request.resource_type == loot_box_pb2.LootBoxV3PurchaseV1.Request.PLAYER_KEY_VALUE
+        )
+        is_free_or_ticket = "_GT" in pid or "_AN_" in pid or "ticket" in pid.lower()
+        is_vc = ("_VC_" in pid) or ("_TT_" in pid) or (not is_pt and not is_free_or_ticket)
+        stone_cost = (1500 if (is_ten_pull or pull_count == 10) else 150) if is_vc else 0
+        point_cost = (5 * pull_count) if is_pt else 0
+        now = int(time.time())
+
         logger.info(
-            "🎁 [LootBox] PurchaseV1 product=%s (count=%d, tx=%s)",
+            "🎁 [LootBox] PurchaseV1 player=%s product=%s (gacha=%d, count=%d, stone_cost=%d, pt_cost=%d, tx=%s)",
+            current_pid,
             pid,
+            gacha_id,
             pull_count,
+            stone_cost,
+            point_cost,
             request.transaction_id,
         )
 
+        point_remaining: int | None = None
+        # Atomic currency handling and card persistence
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            await ensure_gacha_cache_loaded(session)
+
+            if stone_cost > 0:
+                try:
+                    free_remaining, paid_remaining = await deduct_stones(
+                        session, current_pid, stone_cost
+                    )
+                except InsufficientFundsError as err:
+                    logger.warning("🎁 [LootBox] Insufficient funds for %s: %s", current_pid, err)
+                    await context.abort(
+                        grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient virtual currencies"
+                    )
+                    return loot_box_pb2.LootBoxV3PurchaseV1.Response()
+            else:
+                wallet = await get_or_create_wallet(session, current_pid)
+                free_remaining, paid_remaining = wallet.free_stones, wallet.paid_stones
+
+            if point_cost > 0:
+                try:
+                    point_remaining = await deduct_player_key_value(
+                        session, current_pid, "point", point_cost, default=8612
+                    )
+                except InsufficientFundsError as err:
+                    logger.warning("🎁 [LootBox] Insufficient points for %s: %s", current_pid, err)
+                    await context.abort(
+                        grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient dream points"
+                    )
+                    return loot_box_pb2.LootBoxV3PurchaseV1.Response()
+            else:
+                point_remaining = await get_player_key_value(
+                    session, current_pid, "point", default=8612
+                )
+
+            banner = await session.get(GachaBanner, gacha_id)
+            has_guaranteed_ssr = (
+                (banner.guaranteed_ssr if banner else False)
+                or gacha_id in (3, 163, 167, 171)
+                or "SSR" in pid
+                or "ssrGachaTicket" in pid
+            )
+
+            drawn_cards: list[int] = []
+            for i in range(pull_count):
+                is_last = i == pull_count - 1
+                is_guaranteed_ssr = (
+                    (is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr)
+                    or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
+                )
+                is_guaranteed_sr = (
+                    is_last and (is_ten_pull or pull_count == 10) and not is_guaranteed_ssr
+                )
+                card_id = _roll_card(
+                    gacha_id,
+                    is_guaranteed_sr=is_guaranteed_sr,
+                    is_guaranteed_ssr=is_guaranteed_ssr,
+                )
+                drawn_cards.append(card_id)
+
+            await persist_cards_to_storage(session, current_pid, drawn_cards, now)
+            await session.commit()
+
         response = loot_box_pb2.LootBoxV3PurchaseV1.Response()
         response.transaction_id = request.transaction_id
-        now = int(time.time())
 
         # Generate prizes
         prizes = response.loot_box_content_set_prizes.add()
         prizes.loot_box_content_set_id = f"P_{pid}"
 
-        drawn_cards: list[int] = []
-        for i in range(pull_count):
-            # 10th card in a 10-pull has SR or SSR guaranteed
-            is_guaranteed = is_ten_pull and (i == pull_count - 1)
-            card_id = _roll_card(is_guaranteed_sr=is_guaranteed)
-            drawn_cards.append(card_id)
-
+        for i, card_id in enumerate(drawn_cards):
             item_payload = json.dumps(
                 {
                     "Prefix": "Card",
@@ -166,10 +344,10 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             c.value = item_payload
             c.weight = 1
 
-            # 2. player_inventories (Required by client's GachaProvider/ItemReceiver to display and receive cards)
+            # 2. player_inventories
             inv = response.player_inventories.add()
             inv.id = str(uuid.uuid4())
-            inv.player_id = "dankagu-reborn-user"
+            inv.player_id = current_pid
             inv.item_type = 0  # GameRuntime
             inv.schema_key = "ITEM"
             inv.value = item_payload
@@ -181,10 +359,10 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             inv.system_resource_num = 1
             inv.created_at = now
 
-        if is_ten_pull:
+        if (is_ten_pull or pull_count == 10) and is_vc:
             extra_inv = response.extra_player_inventories.add()
             extra_inv.id = str(uuid.uuid4())
-            extra_inv.player_id = "dankagu-reborn-user"
+            extra_inv.player_id = current_pid
             extra_inv.item_type = 0
             extra_inv.schema_key = "ITEM"
             extra_inv.value = json.dumps(
@@ -202,18 +380,30 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             extra_inv.system_resource_num = 10
             extra_inv.created_at = now
 
-        logger.info("🎉 [LootBox] Drew %d cards: %s", pull_count, drawn_cards)
+        logger.info(
+            "🎉 [LootBox] Player %s drew %d cards from gacha %d: %s (remaining free=%d, paid=%d, pt=%s)",
+            current_pid,
+            pull_count,
+            gacha_id,
+            drawn_cards,
+            free_remaining,
+            paid_remaining,
+            point_remaining,
+        )
 
-        # Update wallet balance
-        stone_cost = 1500 if is_ten_pull else 150
-        # Provide plenty of virtual currencies
+        # Update wallet balance in response
         vc_free = response.wallet.virtual_currencies.add()
         vc_free.virtual_currency_name = "FREE_STONE"
-        vc_free.amount = max(0, 99999 - stone_cost)
+        vc_free.amount = free_remaining
 
         vc_paid = response.wallet.virtual_currencies.add()
         vc_paid.virtual_currency_name = "PAID_STONE"
-        vc_paid.amount = 10000
+        vc_paid.amount = paid_remaining
+
+        if point_remaining is not None:
+            pkv = response.wallet.player_key_values.add()
+            pkv.key = "point"
+            pkv.amount = point_remaining
 
         return response
 

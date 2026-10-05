@@ -24,6 +24,7 @@ from dankagu.core.transfer import (
     verify_transfer_password,
 )
 from dankagu.lcx.tokens import decode_token_user_id, generate_lcx_tokens
+from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.player import Player
 from dankagu.models.session import Session
 from dankagu.models.storage import PlayerStorageEntry
@@ -441,6 +442,7 @@ async def post_deactivate_user(
     await db.execute(delete(Session).where(Session.player_id == pid))
     await db.execute(delete(AccountTransfer).where(AccountTransfer.player_id == pid))
     await db.execute(delete(WalletBalance).where(WalletBalance.player_id == pid))
+    await db.execute(delete(PlayerInventoryItem).where(PlayerInventoryItem.player_id == pid))
     await db.execute(delete(Player).where(Player.id == pid))
     await db.commit()
     invalidate_player_sessions(pid)

@@ -50,9 +50,9 @@ class LoginBonusService(login_bonus_pb2_grpc.LoginBonusServicer):
         request: login_bonus_pb2.LoginBonusGetAvailableV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> login_bonus_pb2.LoginBonusGetAvailableV1.Response:
-        logger.info("🎁 [LoginBonus] GetAvailableLoginBonusV1")
-        if self.available_response:
-            return self.available_response
+        logger.info(
+            "🎁 [LoginBonus] GetAvailableLoginBonusV1 (returning empty to prevent claim freeze)"
+        )
         return login_bonus_pb2.LoginBonusGetAvailableV1.Response()
 
     async def CountUpProgressV1(
@@ -60,9 +60,7 @@ class LoginBonusService(login_bonus_pb2_grpc.LoginBonusServicer):
         request: login_bonus_pb2.LoginBonusCountUpProgressV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> login_bonus_pb2.LoginBonusCountUpProgressV1.Response:
-        logger.info("🎁 [LoginBonus] CountUpProgressV1")
-        if self.countup_response:
-            return self.countup_response
+        logger.info("🎁 [LoginBonus] CountUpProgressV1 (returning empty to prevent claim freeze)")
         return login_bonus_pb2.LoginBonusCountUpProgressV1.Response()
 
 

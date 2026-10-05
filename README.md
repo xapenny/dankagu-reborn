@@ -233,8 +233,6 @@ dankagu-reborn/
 ├── uv.lock                    # Locked dependency graph
 ├── certs/                     # YOUR generated TLS material (not distributed)
 ├── data/                      # Runtime data (mostly not distributed)
-│   ├── dankagu.db             #   Local SQLite player/state database
-│   ├── arg_m_master_dec.db    #   Master database, decoded (supply your own)
 │   ├── assets/                #   Indexed AssetBundles and generated manifests
 │   ├── hexdata/               #   Response templates (supply your own)
 │   ├── manifest/              #   Asset manifest catalogs
@@ -320,7 +318,6 @@ These are intentionally not distributed and are git-ignored:
   `login_bonus`, `reconstruction_spot`, `ondemand_master`). Without them those
   servicers return empty responses; `wallet.py` and `player_storage.py`
   additionally carry small hard-coded fallbacks.
-- **`data/arg_m_master_dec.db`** — the master database in decoded form.
 - **`data/assets/`, `data/manifest/`** — game assets and manifest catalogs.
 
 ---

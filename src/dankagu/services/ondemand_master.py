@@ -29,7 +29,30 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
                     bytes.fromhex(gacha_hex_path.read_text(encoding="utf-8").strip())
                 )
                 for e in gacha_resp.entries:
-                    self._gacha_entries.setdefault(e.key, []).append(e.value)
+                    try:
+                        import json
+                        d = json.loads(e.value.decode("utf-8", errors="ignore"))
+                        # Map finale banner IDs to textures that exist in manifest 3760
+                        if e.key == "Gacha-163":
+                            d["GachaBannerID"] = 165
+                        elif e.key == "Gacha-167":
+                            d["GachaBannerID"] = 169
+                        elif e.key == "Gacha-171":
+                            d["GachaBannerID"] = 173
+                        elif e.key == "Gacha-3":
+                            d["StartDashHours"] = 999999
+                        val_bytes = json.dumps(d, ensure_ascii=False).encode("utf-8")
+                        self._gacha_entries.setdefault(e.key, []).append(val_bytes)
+                    except Exception:
+                        self._gacha_entries.setdefault(e.key, []).append(e.value)
+
+                # Add alias keys if client requests them
+                if "Gacha-163" in self._gacha_entries:
+                    self._gacha_entries["Gacha-165"] = self._gacha_entries["Gacha-163"]
+                if "Gacha-167" in self._gacha_entries:
+                    self._gacha_entries["Gacha-169"] = self._gacha_entries["Gacha-167"]
+                if "Gacha-171" in self._gacha_entries:
+                    self._gacha_entries["Gacha-173"] = self._gacha_entries["Gacha-171"]
             except Exception:
                 pass
 

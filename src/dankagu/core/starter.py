@@ -1,13 +1,16 @@
 """Starter player data seeding for cold-start onboarding."""
 
+import json
 import logging
 import time
+import uuid
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.storage_state import StorageRevisionManager
+from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.player import Player
 from dankagu.models.storage import PlayerStorageEntry
 from dankagu.models.wallet import WalletBalance
@@ -52,8 +55,8 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
     if wallet_res.scalars().first() is None:
         wallet = WalletBalance(
             player_id=player.id,
-            free_stones=50000,
-            paid_stones=10000,
+            free_stones=60000,
+            paid_stones=30000,
             updated_at=now,
         )
         session.add(wallet)
@@ -71,6 +74,31 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
             index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
         )
         await session.execute(stmt)
+
+    # 3. Seed Starter Welcome Gift in Mailbox
+    inv_res = await session.execute(
+        select(PlayerInventoryItem).where(PlayerInventoryItem.player_id == player.id)
+    )
+    if inv_res.scalars().first() is None:
+        welcome_gift = PlayerInventoryItem(
+            id=str(uuid.uuid4()),
+            player_id=player.id,
+            item_type=0,
+            schema_key="ITEM",
+            value=json.dumps(
+                {"Prefix": "VirtualCurrency", "Value": "FREE_STONE", "Count": 2500}
+            ).encode("utf-8"),
+            route=1,
+            message="ダンカグ Reborn へようこそ！事前登録＆リリース記念報酬",
+            search_label="Stone",
+            opened_at=now,
+            expired_at=4102498799,
+            system_resource_name="FREE_STONE",
+            system_resource_num=2500,
+            is_claimed=False,
+            created_at=now,
+        )
+        session.add(welcome_gift)
 
     StorageRevisionManager.set_revision("1", player_id=player.id)
     logger.info("🌱 Seeded starter data for player %s (%s)", player.id, player.user_id)

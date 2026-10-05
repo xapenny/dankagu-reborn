@@ -59,6 +59,7 @@ async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGener
                 "DELETE FROM player_storage_entries WHERE player_id = ANY($1);", new_ids
             )
             await conn.execute("DELETE FROM wallet_balances WHERE player_id = ANY($1);", new_ids)
+            await conn.execute("DELETE FROM player_inventories WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM sessions WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM players WHERE id = ANY($1);", new_ids)
         await conn.close()

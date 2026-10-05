@@ -39,15 +39,15 @@ reference/
 *.ipa
 *.apk
 *.adbk
-data/dankagu.db
+# Database & runtime data
+*.db
+data/*.db
 data/assets/*/
 data/assets-cdn/
 data/manifest/*.json
-# Decrypted master database extracted from the client.
-data/arg_m_master_dec.db
-# Operator-supplied response templates. Not distributed; provide your own.
-# See the README section on data you must supply.
 data/hexdata/*/
+# Game metadata (never commit game metadata)
+data/metadata/
 
 # TLS material is generated locally, never distributed. Run:
 #   python -m dankagu.core.certs
