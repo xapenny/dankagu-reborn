@@ -167,6 +167,7 @@ def encode_card_status(
     if exp > 0:
         res.extend(_encode_varint(6, exp))
     res.extend(_encode_varint(8, status))
+    res.extend(_encode_varint(10, 1))
     res.extend(_encode_varint(11, duplicate))
     return bytes(res)
 

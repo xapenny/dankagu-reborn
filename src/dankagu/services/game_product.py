@@ -29,37 +29,64 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
 
     def __init__(self) -> None:
         self.pages: dict[str, game_product_pb2.GameProductGetAvailableV1.Response] = {}
-        self._load_products()
 
-    def _load_products(self) -> None:
-        products_dir = settings.hexdata_cf_dir
-        if not products_dir.exists():
+    async def _ensure_loaded(self) -> None:
+        if self.pages:
             return
 
-        for hex_file in products_dir.glob("game_product*.hex"):
-            try:
-                hex_data = hex_file.read_text(encoding="utf-8").strip()
-                resp = game_product_pb2.GameProductGetAvailableV1.Response.FromString(
-                    bytes.fromhex(hex_data)
-                )
-                if hex_file.name == "game_product.hex":
-                    token = ""
-                else:
-                    # Format: game_product.<page_token>.hex
-                    token = hex_file.name.removeprefix("game_product.").removesuffix(".hex")
-                self.pages[token] = resp
-            except Exception as e:
-                logger.error("Failed to parse %s: %s", hex_file.name, e)
+        import base64
+        import json
+        from google.protobuf import json_format
+        from sqlalchemy import select
 
-        logger.info(
-            "🛍️ Loaded %d pages of game products (root page has %d items)",
-            len(self.pages),
-            len(
-                self.pages.get(
-                    "", game_product_pb2.GameProductGetAvailableV1.Response()
-                ).game_products
-            ),
-        )
+        from dankagu.models.master import MasterGameProduct
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(select(MasterGameProduct))
+                rows = result.scalars().all()
+                raw_list = [r.data for r in rows]
+
+            chunk_size = 100
+            chunks = [raw_list[i : i + chunk_size] for i in range(0, len(raw_list), chunk_size)]
+            for page_idx, chunk in enumerate(chunks, start=1):
+                resp = game_product_pb2.GameProductGetAvailableV1.Response()
+                for item in chunk:
+                    prod = resp.game_products.add()
+                    json_format.ParseDict(item, prod, ignore_unknown_fields=True)
+
+                if page_idx < len(chunks):
+                    next_obj = {"MaxResults": 100, "Page": page_idx + 1, "Options": ""}
+                    resp.next_page_token = base64.b64encode(
+                        json.dumps(next_obj, separators=(",", ":")).encode("utf-8")
+                    ).decode("utf-8")
+                else:
+                    resp.next_page_token = ""
+
+                cur_token = (
+                    ""
+                    if page_idx == 1
+                    else base64.b64encode(
+                        json.dumps(
+                            {"MaxResults": 100, "Page": page_idx, "Options": ""},
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).decode("utf-8")
+                )
+                self.pages[cur_token] = resp
+
+            logger.info(
+                "🛍️ Loaded %d pages of game products from PostgreSQL (root has %d items)",
+                len(self.pages),
+                len(
+                    self.pages.get(
+                        "", game_product_pb2.GameProductGetAvailableV1.Response()
+                    ).game_products
+                ),
+            )
+        except Exception as e:
+            logger.error("Failed to load game products from database: %s", e)
 
     def _find_product(self, product_id: str) -> ProtoGameProduct | None:
         """Find a game product by its ID across all cached pages."""
@@ -82,6 +109,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         request: game_product_pb2.GameProductGetAvailableV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> game_product_pb2.GameProductGetAvailableV1.Response:
+        await self._ensure_loaded()
         token = request.page_token or ""
         logger.info(
             "🛍️ [GameProduct] GetAvailableV1 (page_token=%s)", token[:20] if token else "root"
@@ -95,6 +123,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         request: game_product_pb2.GameProductPurchaseV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> game_product_pb2.GameProductPurchaseV1.Response:
+        await self._ensure_loaded()
         current_pid = get_current_player_id()
         if not current_pid:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
@@ -142,6 +171,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         request: game_product_pb2.GameProductPurchaseV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> game_product_pb2.GameProductPurchaseV2.Response:
+        await self._ensure_loaded()
         current_pid = get_current_player_id()
         if not current_pid:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")

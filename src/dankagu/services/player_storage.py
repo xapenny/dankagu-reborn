@@ -61,24 +61,31 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
 
     def __init__(self) -> None:
         self.template_entries: dict[str, bytes] = {}
-        self._load_templates()
+        self._templates_loaded = False
 
-    def _load_templates(self) -> None:
-        storage_dir = settings.hexdata_cf_dir
-        if storage_dir.exists():
-            for p in sorted(storage_dir.glob("player_storage*.hex")):
-                try:
-                    hex_data = p.read_text(encoding="utf-8").strip()
-                    ps = player_storage_pb2.PlayerStorageGetEntriesV2.Response.FromString(
-                        bytes.fromhex(hex_data)
-                    )
-                    for e in ps.entries:
-                        # Skip personal player progression keys from universal template
-                        if e.key.startswith(PERSONAL_STORAGE_PREFIXES):
-                            continue
-                        self.template_entries[e.key] = e.value
-                except Exception as e:
-                    logger.error("Failed to parse %s: %s", p.name, e)
+    async def _ensure_templates_loaded(self) -> None:
+        if self._templates_loaded:
+            return
+
+        from sqlalchemy import select
+
+        from dankagu.models.master import MasterDefaultStorage
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(select(MasterDefaultStorage))
+                rows = result.scalars().all()
+                for r in rows:
+                    if r.key.startswith(PERSONAL_STORAGE_PREFIXES):
+                        continue
+                    self.template_entries[r.key] = r.value
+                logger.info(
+                    "💾 Loaded %d shared storage templates from PostgreSQL",
+                    len(self.template_entries),
+                )
+        except Exception as e:
+            logger.error("Failed to load default storage templates from database: %s", e)
 
         # Baseline entries used when no operator-supplied template covers them
         self.template_entries.setdefault(
@@ -101,17 +108,22 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             "GpxInfoStatus-V1-1",
             b'\010\001\022*\010\250\214=\022\003\001\001\001\032\014\333\324\212\002\273\212\370\001\241\250\266\002"\014\333\324\212\002\320\376\361\001\241\250\266\002(\314\373\262\006\022*\010\220\224=\022\003\001\001\001\032\014\373\303\342\001\371\257\307\001\376\203\245\002"\014\373\303\342\001\371\257\307\001\376\203\245\002(\362\367\316\005\022$\010\370\233=\022\003\001\001\001\032\014\356\314\223\002\347\216\232\002\332\230\326\002"\006\000\000\240\320\303\002(\265\377\347\006\022*\010\340\243=\022\003\001\001\001\032\014\307\265\365\001\364\272\354\002\374\337\343\001"\014\262\374\362\001\364\272\354\002\374\337\343\001(\242\227\303\006\022\'\010\310\253=\022\003\001\001\001\032\014\212\376\240\002\261\276\307\002\210\227\315\002"\t\212\376\240\002\200\367\303\002\000(\273\357\252\007(\0050\0018\004@\310\253=H\264\272\223\232\006P\001X\001b$fa6306e0-3343-4016-bf2a-d24b6aa077bdh\357R',
         )
-
-        logger.info(
-            "💾 Loaded %d baseline template PlayerStorage entries",
-            len(self.template_entries),
+        self.template_entries.setdefault(
+            "ExpeditionMissionRecordEntityCollecttion--1",
+            bytes.fromhex("0801122408914e10001800200028f3a0a7d60630f3a0a7d6063a0200004205000000000048015000"),
         )
+        self.template_entries.setdefault(
+            "ExpeditionManageStatus--1",
+            bytes.fromhex("080110914e18f3a0a7d60620f3a0a7d606"),
+        )
+        self._templates_loaded = True
 
     async def GetEntriesV2(
         self,
         request: player_storage_pb2.PlayerStorageGetEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_storage_pb2.PlayerStorageGetEntriesV2.Response:
+        await self._ensure_templates_loaded()
         current_pid = get_current_player_id()
         if not current_pid:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
@@ -197,6 +209,12 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         now = int(time.time())
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            # Check for tutorial step 10 to ensure starter building materials exist
+            has_tut_10 = any(
+                proto_entry.key == "PlayerBase--1" and b"\x78\x0a" in proto_entry.value
+                for proto_entry in request.entries
+            )
+
             for proto_entry in request.entries:
                 stmt = pg_insert(PlayerStorageEntry).values(
                     player_id=current_pid,
@@ -213,6 +231,28 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     },
                 )
                 await session.execute(stmt)
+
+            # Auto-grant expedition dropped building materials if passing tutorial
+            if has_tut_10:
+                for mat_key, mat_val in [
+                    ("ItemStockStatus--1000", bytes.fromhex("08e807108827")),  # 5000 wood
+                    ("ItemStockStatus--2000", bytes.fromhex("08d00f108827")),  # 5000 stone
+                ]:
+                    mat_stmt = (
+                        pg_insert(PlayerStorageEntry)
+                        .values(
+                            player_id=current_pid,
+                            key=mat_key,
+                            value=mat_val,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        .on_conflict_do_nothing(
+                            index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
+                        )
+                    )
+                    await session.execute(mat_stmt)
+
             await session.commit()
 
         response = player_storage_pb2.PlayerStorageSetEntriesV2.Response()

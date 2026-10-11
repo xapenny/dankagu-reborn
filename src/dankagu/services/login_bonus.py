@@ -20,30 +20,45 @@ class LoginBonusService(login_bonus_pb2_grpc.LoginBonusServicer):
     def __init__(self) -> None:
         self.available_response: login_bonus_pb2.LoginBonusGetAvailableV1.Response | None = None
         self.countup_response: login_bonus_pb2.LoginBonusCountUpProgressV1.Response | None = None
-        self._load_hexes()
 
-    def _load_hexes(self) -> None:
-        f_avail = settings.hexdata_fes_dir / "login_bonus.GetAvailableV1.hex"
-        if f_avail.exists():
-            try:
-                self.available_response = (
-                    login_bonus_pb2.LoginBonusGetAvailableV1.Response.FromString(
-                        bytes.fromhex(f_avail.read_text(encoding="utf-8").strip())
-                    )
-                )
-            except Exception as e:
-                logger.error("Failed to parse login_bonus.GetAvailableV1.hex: %s", e)
+    async def _ensure_loaded(self) -> None:
+        if self.available_response is not None:
+            return
 
-        f_countup = settings.hexdata_fes_dir / "login_bonus.CountUpProgressV1.hex"
-        if f_countup.exists():
-            try:
-                self.countup_response = (
-                    login_bonus_pb2.LoginBonusCountUpProgressV1.Response.FromString(
-                        bytes.fromhex(f_countup.read_text(encoding="utf-8").strip())
-                    )
+        from google.protobuf import json_format
+        from sqlalchemy import select
+
+        from dankagu.core.database import get_sessionmaker
+        from dankagu.models.master import MasterSystemTemplate
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(MasterSystemTemplate).where(MasterSystemTemplate.key == "login_bonus")
                 )
-            except Exception as e:
-                logger.error("Failed to parse login_bonus.CountUpProgressV1.hex: %s", e)
+                tmpl = result.scalar_one_or_none()
+                if tmpl and tmpl.data:
+                    if "available" in tmpl.data:
+                        self.available_response = (
+                            login_bonus_pb2.LoginBonusGetAvailableV1.Response()
+                        )
+                        json_format.ParseDict(
+                            tmpl.data["available"],
+                            self.available_response,
+                            ignore_unknown_fields=True,
+                        )
+                    if "countup" in tmpl.data:
+                        self.countup_response = (
+                            login_bonus_pb2.LoginBonusCountUpProgressV1.Response()
+                        )
+                        json_format.ParseDict(
+                            tmpl.data["countup"],
+                            self.countup_response,
+                            ignore_unknown_fields=True,
+                        )
+        except Exception as e:
+            logger.error("Failed to load login bonus template from database: %s", e)
 
     async def GetAvailableLoginBonusV1(
         self,

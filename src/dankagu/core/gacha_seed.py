@@ -14,6 +14,7 @@ logger = logging.getLogger("dankagu.core.gacha_seed")
 
 
 DEFAULT_BANNERS = [
+    {"id": 1, "name": "Tutorial", "element": 0, "guaranteed_ssr": True, "pickups": [], "enabled": True},
     {"id": 3, "name": "Start Dash", "element": 0, "guaranteed_ssr": True, "pickups": [], "enabled": True},
     {"id": 159, "name": "Standard 1", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},
     {"id": 160, "name": "Standard 2", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},

@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import add_stones, get_or_create_wallet
+from dankagu.core.growth import add_growth_items
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
@@ -206,6 +207,23 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
                     if stones_to_add > 0:
                         await add_stones(session, current_pid, free_amount=stones_to_add)
+
+                    # Check for growth items
+                    growth_item_ids: list[int] = []
+                    growth_count = item.system_resource_num or 500
+                    try:
+                        parsed = json.loads(item.value.decode("utf-8"))
+                        if parsed.get("Prefix") == "GrowthItem":
+                            if "Items" in parsed:
+                                growth_item_ids = parsed["Items"]
+                            elif "Item" in parsed:
+                                growth_item_ids = [parsed["Item"]]
+                            growth_count = parsed.get("Count", growth_count)
+                    except Exception:
+                        pass
+
+                    if growth_item_ids:
+                        await add_growth_items(session, current_pid, growth_item_ids, count=growth_count)
 
                     item.is_claimed = True
                     item.received_at = now

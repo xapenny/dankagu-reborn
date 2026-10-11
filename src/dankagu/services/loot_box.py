@@ -19,7 +19,6 @@ from dankagu.core.economy import (
     deduct_stones,
     get_or_create_wallet,
     get_player_key_value,
-    persist_cards_to_storage,
 )
 from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
@@ -151,37 +150,39 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
 
     def __init__(self) -> None:
         self.all_template_products: list[object] = []
-        self._load_loot_boxes()
 
-    def _load_loot_boxes(self) -> None:
-        hex_files = [
-            settings.hexdata_cf_dir / "loot_box.hex",
-            settings.hexdata_cf_dir
-            / "loot_box.eyJNYXhSZXN1bHRzIjoxMDAsIlBhZ2UiOjIsIk9wdGlvbnMiOiIifQ==.hex",
-        ]
+    async def _ensure_loaded(self) -> None:
+        if self.all_template_products:
+            return
 
-        for hf in hex_files:
-            if not hf.exists():
-                continue
-            try:
-                hex_data = hf.read_text(encoding="utf-8").strip()
-                resp = loot_box_pb2.LootBoxV3GetAvailableV1.Response.FromString(
-                    bytes.fromhex(hex_data)
+        from google.protobuf import json_format
+        from sqlalchemy import select
+
+        from dankagu.models.master import MasterLootBoxProduct
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(select(MasterLootBoxProduct))
+                rows = result.scalars().all()
+                for r in rows:
+                    resp = loot_box_pb2.LootBoxV3GetAvailableV1.Response()
+                    p = resp.loot_box_products.add()
+                    json_format.ParseDict(r.data, p, ignore_unknown_fields=True)
+                    self.all_template_products.append(p)
+                logger.info(
+                    "🎁 Loaded %d gacha products from PostgreSQL",
+                    len(self.all_template_products),
                 )
-                self.all_template_products.extend(resp.loot_box_products)
-            except Exception as e:
-                logger.error("Failed to parse %s: %s", hf.name, e)
-
-        logger.info(
-            "🎁 Loaded %d gacha products from hex templates",
-            len(self.all_template_products),
-        )
+        except Exception as e:
+            logger.error("Failed to load loot box products from database: %s", e)
 
     async def GetAvailableV1(
         self,
         request: loot_box_pb2.LootBoxV3GetAvailableV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> loot_box_pb2.LootBoxV3GetAvailableV1.Response:
+        await self._ensure_loaded()
         token = request.page_token or ""
         logger.info(
             "🎁 [LootBox] GetAvailableV1 (page_token=%s)",
@@ -195,8 +196,8 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         async with session_factory() as session:
             await ensure_gacha_cache_loaded(session)
 
-        # Active banners from database
-        active_banner_ids = set(_BANNERS.keys()) if _BANNERS else VALID_GACHA_IDS
+        # Active banners from database (ensure 1 is always included for tutorial)
+        active_banner_ids = (set(_BANNERS.keys()) | {1}) if _BANNERS else VALID_GACHA_IDS
 
         # Deliver all products belonging to active banners
         response = loot_box_pb2.LootBoxV3GetAvailableV1.Response()
@@ -295,7 +296,7 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             banner = await session.get(GachaBanner, gacha_id)
             has_guaranteed_ssr = (
                 (banner.guaranteed_ssr if banner else False)
-                or gacha_id in (3, 163, 167, 171)
+                or gacha_id in (1, 3, 163, 167, 171)
                 or "SSR" in pid
                 or "ssrGachaTicket" in pid
             )
@@ -317,7 +318,6 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                 )
                 drawn_cards.append(card_id)
 
-            await persist_cards_to_storage(session, current_pid, drawn_cards, now)
             await session.commit()
 
         response = loot_box_pb2.LootBoxV3PurchaseV1.Response()
