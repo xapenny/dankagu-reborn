@@ -14,37 +14,48 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
     """Servicer for OndemandMaster RPCs."""
 
     def __init__(self) -> None:
+        manifest_meta = (
+            settings.data_dir / "metadata" / "AssetUploadV2+v2_1_0_any+g262.json"
+        )
         self._manifest_path = (
-            settings.hexdata_cf_dir / "ondemand_master.AssetUploadV2+v2_1_0_any+g262.json"
+            manifest_meta
+            if manifest_meta.exists()
+            else settings.hexdata_cf_dir / "ondemand_master.AssetUploadV2+v2_1_0_any+g262.json"
         )
         self._cached_manifest: bytes = b""
         if self._manifest_path.exists():
             self._cached_manifest = self._manifest_path.read_bytes()
 
         self._gacha_entries: dict[str, list[bytes]] = {}
-        gacha_hex_path = settings.hexdata_cf_dir / "ondemand_master.gacha.hex"
-        if gacha_hex_path.exists():
-            try:
-                gacha_resp = ondemand_master_pb2.OndemandMasterGetEntriesV2.Response.FromString(
-                    bytes.fromhex(gacha_hex_path.read_text(encoding="utf-8").strip())
-                )
-                for e in gacha_resp.entries:
-                    try:
-                        import json
-                        d = json.loads(e.value.decode("utf-8", errors="ignore"))
-                        # Map finale banner IDs to textures that exist in manifest 3760
-                        if e.key == "Gacha-163":
-                            d["GachaBannerID"] = 165
-                        elif e.key == "Gacha-167":
-                            d["GachaBannerID"] = 169
-                        elif e.key == "Gacha-171":
-                            d["GachaBannerID"] = 173
-                        elif e.key == "Gacha-3":
-                            d["StartDashHours"] = 999999
-                        val_bytes = json.dumps(d, ensure_ascii=False).encode("utf-8")
-                        self._gacha_entries.setdefault(e.key, []).append(val_bytes)
-                    except Exception:
-                        self._gacha_entries.setdefault(e.key, []).append(e.value)
+
+    async def _ensure_loaded(self) -> None:
+        if self._gacha_entries:
+            return
+
+        import json
+        from sqlalchemy import select
+
+        from dankagu.core.database import get_sessionmaker
+        from dankagu.models.master import MasterOndemandEntry
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(select(MasterOndemandEntry))
+                rows = result.scalars().all()
+                for r in rows:
+                    k = r.key
+                    d = dict(r.value)
+                    if k == "Gacha-163":
+                        d["GachaBannerID"] = 165
+                    elif k == "Gacha-167":
+                        d["GachaBannerID"] = 169
+                    elif k == "Gacha-171":
+                        d["GachaBannerID"] = 173
+                    elif k == "Gacha-3":
+                        d["StartDashHours"] = 999999
+                    val_bytes = json.dumps(d, ensure_ascii=False).encode("utf-8")
+                    self._gacha_entries.setdefault(k, []).append(val_bytes)
 
                 # Add alias keys if client requests them
                 if "Gacha-163" in self._gacha_entries:
@@ -53,14 +64,15 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
                     self._gacha_entries["Gacha-169"] = self._gacha_entries["Gacha-167"]
                 if "Gacha-171" in self._gacha_entries:
                     self._gacha_entries["Gacha-173"] = self._gacha_entries["Gacha-171"]
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     async def GetEntriesV1(
         self,
         request: ondemand_master_pb2.OndemandMasterGetEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> ondemand_master_pb2.OndemandMasterGetEntriesV2.Response:
+        await self._ensure_loaded()
         response = ondemand_master_pb2.OndemandMasterGetEntriesV2.Response()
 
         if "ODMGeneric_Boot" in request.keys:

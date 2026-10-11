@@ -73,6 +73,12 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Ensure sequence for short_id exists on PostgreSQL
+        try:
+            await conn.execute(text("CREATE SEQUENCE IF NOT EXISTS player_short_id_seq START WITH 1;"))
+        except Exception:
+            pass
+
         # Ensure new player columns exist if running on an existing DB instance
         for col_def in [
             "short_id VARCHAR(16)",
@@ -86,8 +92,17 @@ async def init_db() -> None:
             except Exception:
                 pass
 
+        try:
+            await conn.execute(
+                text("ALTER TABLE master_announcements ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT FALSE;")
+            )
+        except Exception:
+            pass
+
     from dankagu.core.gacha_seed import seed_gacha_data_if_empty
+    from dankagu.core.master_seed import seed_master_data_if_empty
 
     session_factory = get_sessionmaker()
     async with session_factory() as session:
         await seed_gacha_data_if_empty(session)
+        await seed_master_data_if_empty(session)

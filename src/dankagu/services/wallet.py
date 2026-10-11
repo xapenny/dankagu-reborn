@@ -23,22 +23,33 @@ class WalletService(wallet_pb2_grpc.WalletServicer):
 
     def __init__(self) -> None:
         self.cached_response: wallet_pb2.WalletGetBalancesV2.Response | None = None
-        self._load_template()
 
-    def _load_template(self) -> None:
-        wallet_hex_path = settings.hexdata_cf_dir / "wallet.hex"
-        if wallet_hex_path.exists():
-            try:
-                hex_data = wallet_hex_path.read_text(encoding="utf-8").strip()
-                self.cached_response = wallet_pb2.WalletGetBalancesV2.Response.FromString(
-                    bytes.fromhex(hex_data)
+    async def _ensure_loaded(self) -> None:
+        if self.cached_response is not None:
+            return
+
+        from google.protobuf import json_format
+        from sqlalchemy import select
+
+        from dankagu.models.master import MasterSystemTemplate
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(MasterSystemTemplate).where(MasterSystemTemplate.key == "wallet")
                 )
-                logger.info(
-                    "💰 Loaded wallet template with %d player key values",
-                    len(self.cached_response.total.player_key_values),
-                )
-            except Exception as e:
-                logger.error("Failed to parse wallet.hex: %s", e)
+                tmpl = result.scalar_one_or_none()
+                if tmpl and tmpl.data:
+                    resp = wallet_pb2.WalletGetBalancesV2.Response()
+                    json_format.ParseDict(tmpl.data, resp, ignore_unknown_fields=True)
+                    self.cached_response = resp
+                    logger.info(
+                        "💰 Loaded wallet template with %d player key values from PostgreSQL",
+                        len(self.cached_response.total.player_key_values),
+                    )
+        except Exception as e:
+            logger.error("Failed to load wallet template from database: %s", e)
 
         if self.cached_response is None:
             self.cached_response = wallet_pb2.WalletGetBalancesV2.Response()
@@ -98,6 +109,7 @@ class WalletService(wallet_pb2_grpc.WalletServicer):
         request: wallet_pb2.WalletGetBalancesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> wallet_pb2.WalletGetBalancesV2.Response:
+        await self._ensure_loaded()
         current_pid = get_current_player_id()
         logger.info(
             "💰 [Wallet] GetBalancesV2 for player=%s (expired_at=%s)",
@@ -117,6 +129,7 @@ class WalletService(wallet_pb2_grpc.WalletServicer):
         request: wallet_pb2.WalletGetBalancesV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> wallet_pb2.WalletGetBalancesV1.Response:
+        await self._ensure_loaded()
         current_pid = get_current_player_id()
         logger.info("💰 [Wallet] GetBalancesV1 for player=%s", current_pid)
         response = wallet_pb2.WalletGetBalancesV1.Response()
