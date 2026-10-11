@@ -15,10 +15,56 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     system_pb2,
     system_pb2_grpc,
 )
+from dankagu.grpc.generated.takasho.schema.common_featureset.resource.player_inventory.v1_pb2 import (
+    ItemType,
+    Route,
+)
 from dankagu.lcx.tokens import decode_token_user_id
-from dankagu.models.player import Player
+from dankagu.models.inventory import PlayerInventoryItem
+from dankagu.models.player import Player, allocate_short_id
 
 logger = logging.getLogger("dankagu.services.system")
+
+
+def get_jst_game_day(epoch_seconds: int) -> int:
+    """Calculate the integer day index under JST (UTC+9) 04:00 daily boundary.
+
+    Shift: +9 hours (JST) - 4 hours (daily reset at 04:00 JST) = +5 hours (18,000s).
+    """
+    return (epoch_seconds + 5 * 3600) // 86400
+
+
+from dankagu.core.growth import create_daily_reward_mail_items
+
+
+def process_player_login(session, player: Player, now: int) -> bool:
+    """Update player login time and advance total_login_days if crossing 04:00 JST.
+
+    Returns True if a new daily login was recorded and rewarded.
+    """
+    day_last = get_jst_game_day(player.last_login_at)
+    day_now = get_jst_game_day(now)
+    is_new_day = day_now > day_last
+    if is_new_day:
+        player.total_login_days += 1
+        # Grant 20,000 Free Stones and 500 of each growth material (EXP, limit break, skill)
+        mail_items = create_daily_reward_mail_items(
+            player_id=player.id,
+            total_login_days=player.total_login_days,
+            stone_amount=20000,
+            material_count=500,
+        )
+        for item in mail_items:
+            session.add(item)
+
+        logger.info(
+            "🎁 Player %s logged in on new JST game day (total_login_days=%d, %d daily reward mails queued)",
+            player.id,
+            player.total_login_days,
+            len(mail_items),
+        )
+    player.last_login_at = now
+    return is_new_day
 
 
 class SystemService(system_pb2_grpc.SystemServicer):
@@ -61,9 +107,11 @@ class SystemService(system_pb2_grpc.SystemServicer):
             if player is None:
                 new_user_id = user_id or str(uuid.uuid4())
                 new_dev = device_account or str(uuid.uuid4())
+                short_id = await allocate_short_id(session)
                 player = Player(
                     user_id=new_user_id,
                     device_account=new_dev,
+                    short_id=short_id,
                     registered_at=now,
                     last_login_at=now,
                     total_login_days=1,
@@ -76,7 +124,7 @@ class SystemService(system_pb2_grpc.SystemServicer):
                 await session.commit()
                 await session.refresh(player)
             else:
-                player.last_login_at = now
+                process_player_login(session, player, now)
                 if device_account and not player.device_account:
                     player.device_account = device_account
                 await session.commit()
@@ -123,8 +171,9 @@ class SystemService(system_pb2_grpc.SystemServicer):
         # Normal active status
         status_entry = response.player_statuses.add()
         status_entry.status = 1
-        status_entry.effective_from = 0
-        status_entry.effective_to = 4102444800
+        status_entry.description = "NORMAL"
+        status_entry.expired_at = 4102444800
+        status_entry.has_expired_at = False
 
         total_login_days = 1
         session_factory = get_sessionmaker()
@@ -151,7 +200,7 @@ class SystemService(system_pb2_grpc.SystemServicer):
         async with session_factory() as session:
             player = await session.get(Player, current_pid)
             if player:
-                player.last_login_at = now
+                process_player_login(session, player, now)
                 await session.commit()
 
         response = system_pb2.SystemRecordLoginHistoryV1.Response()

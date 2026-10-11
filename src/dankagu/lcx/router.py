@@ -25,7 +25,7 @@ from dankagu.core.transfer import (
 )
 from dankagu.lcx.tokens import decode_token_user_id, generate_lcx_tokens
 from dankagu.models.inventory import PlayerInventoryItem
-from dankagu.models.player import Player
+from dankagu.models.player import Player, allocate_short_id
 from dankagu.models.session import Session
 from dankagu.models.storage import PlayerStorageEntry
 from dankagu.models.transfer import AccountTransfer
@@ -144,7 +144,13 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
 
     if player is None:
         uid = user_id or str(uuid.uuid4())
-        player = Player(user_id=uid, device_account=device_account, registered_at=now)
+        short_id = await allocate_short_id(db)
+        player = Player(
+            user_id=uid,
+            device_account=device_account,
+            short_id=short_id,
+            registered_at=now,
+        )
         db.add(player)
         await db.flush()
         await seed_starter_player(db, player)
