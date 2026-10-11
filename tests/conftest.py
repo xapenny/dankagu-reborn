@@ -18,8 +18,16 @@ os.environ.setdefault("DANKAGU_JWT_SECRET", "test-suite-jwt-secret-not-for-produ
 from dankagu.config import settings
 from dankagu.core.database import init_db, reset_engine
 
+# Ensure test suite always uses 'dankagu_test' instead of production 'dankagu'
 if "DANKAGU_TEST_PG_URL" in os.environ:
     settings.db_url = os.environ["DANKAGU_TEST_PG_URL"]
+else:
+    if "/dankagu" in settings.db_url:
+        settings.db_url = settings.db_url.rsplit("/dankagu", 1)[0] + "/dankagu_test"
+    else:
+        settings.db_url = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu_test"
+
+os.environ.setdefault("DANKAGU_TEST_PG_URL", settings.db_url)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -60,6 +68,7 @@ async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGener
             )
             await conn.execute("DELETE FROM wallet_balances WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM player_inventories WHERE player_id = ANY($1);", new_ids)
+            await conn.execute("DELETE FROM song_leaderboards WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM sessions WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM players WHERE id = ANY($1);", new_ids)
         await conn.close()

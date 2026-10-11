@@ -1,9 +1,13 @@
 """Takasho Ranking servicers (RegularRanking, ScoreRanking)."""
 
 import logging
+import time
 
 import grpc
+from sqlalchemy import func, select
 
+from dankagu.core.database import get_sessionmaker
+from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     regular_ranking_pb2,
@@ -11,6 +15,8 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     score_ranking_pb2,
     score_ranking_pb2_grpc,
 )
+from dankagu.models.player import Player
+from dankagu.models.ranking import SongLeaderboard
 
 logger = logging.getLogger("dankagu.services.ranking")
 
@@ -23,15 +29,65 @@ class RegularRankingService(regular_ranking_pb2_grpc.RegularRankingServicer):
         request: regular_ranking_pb2.RegularRankingRegisterV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> regular_ranking_pb2.RegularRankingRegisterV1.Response:
+        player_id = get_current_player_id() or "dankagu-reborn-user"
+        now = int(time.time())
         logger.info(
-            "🏅 [RegularRanking] RegisterV1 (key=%s, score=%d)", request.ranking_key, request.score
+            "🏅 [RegularRanking] RegisterV1 (player=%s, key=%s, score=%d)",
+            player_id,
+            request.ranking_key,
+            request.score,
         )
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            # 1. Fetch player nickname
+            player = await session.get(Player, player_id)
+            nick_name = (player.nickname or player.name) if player else "DanKagu"
+
+            # 2. Check existing score
+            stmt = select(SongLeaderboard).where(
+                SongLeaderboard.ranking_key == request.ranking_key,
+                SongLeaderboard.player_id == player_id,
+            )
+            res = await session.execute(stmt)
+            entry = res.scalars().first()
+
+            if entry is None:
+                entry = SongLeaderboard(
+                    ranking_key=request.ranking_key,
+                    player_id=player_id,
+                    score=request.score,
+                    updated_at=now,
+                )
+                session.add(entry)
+                score_val = request.score
+            else:
+                if request.score > entry.score:
+                    entry.score = request.score
+                    entry.updated_at = now
+                score_val = entry.score
+
+            await session.commit()
+
+            # 3. Calculate rank
+            rank_stmt = (
+                select(func.count())
+                .select_from(SongLeaderboard)
+                .where(
+                    SongLeaderboard.ranking_key == request.ranking_key,
+                    SongLeaderboard.score > score_val,
+                )
+            )
+            higher_count = (await session.execute(rank_stmt)).scalar() or 0
+            rank = higher_count + 1
+
         response = regular_ranking_pb2.RegularRankingRegisterV1.Response()
         player_ranking = response.player_ranking
         player_ranking.ranking_key = request.ranking_key
-        player_ranking.player_id = "dankagu-reborn-user"
-        player_ranking.nick_name = "DanKagu"
-        player_ranking.score = request.score
+        player_ranking.player_id = player_id
+        player_ranking.nick_name = nick_name
+        player_ranking.rank = rank
+        player_ranking.score = score_val
         return response
 
     async def GetTopRankingV1(
@@ -39,8 +95,40 @@ class RegularRankingService(regular_ranking_pb2_grpc.RegularRankingServicer):
         request: regular_ranking_pb2.RegularRankingGetTopRankingV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> regular_ranking_pb2.RegularRankingGetTopRankingV1.Response:
-        logger.info("🏅 [RegularRanking] GetTopRankingV1 (key=%s)", request.ranking_key)
-        return regular_ranking_pb2.RegularRankingGetTopRankingV1.Response()
+        logger.info(
+            "🏅 [RegularRanking] GetTopRankingV1 (key=%s, start=%d, count=%d)",
+            request.ranking_key,
+            request.start,
+            request.count,
+        )
+        response = regular_ranking_pb2.RegularRankingGetTopRankingV1.Response()
+
+        start = max(1, request.start)
+        count = request.count if request.count > 0 else 100
+        offset = start - 1
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            stmt = (
+                select(SongLeaderboard, Player.nickname, Player.name)
+                .outerjoin(Player, SongLeaderboard.player_id == Player.id)
+                .where(SongLeaderboard.ranking_key == request.ranking_key)
+                .order_by(SongLeaderboard.score.desc(), SongLeaderboard.updated_at.asc())
+                .offset(offset)
+                .limit(count)
+            )
+            res = await session.execute(stmt)
+            rows = res.all()
+
+        for i, (leaderboard, p_nickname, p_name) in enumerate(rows):
+            item = response.player_rankings.add()
+            item.ranking_key = leaderboard.ranking_key
+            item.player_id = leaderboard.player_id
+            item.nick_name = p_nickname or p_name or "DanKagu"
+            item.rank = start + i
+            item.score = leaderboard.score
+
+        return response
 
 
 class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
@@ -76,11 +164,14 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         context: grpc.aio.ServicerContext,
     ) -> score_ranking_pb2.ScoreRankingGetGrandPrixRankV1.Response:
         logger.info("🏅 [ScoreRanking] GetGrandPrixRankV1")
+        current_pid = get_current_player_id() or "dankagu-reborn-user"
         response = score_ranking_pb2.ScoreRankingGetGrandPrixRankV1.Response()
-        info = response.player_grand_prix_rank_infos.add()
-        info.player_id = "dankagu-reborn-user"
-        info.rank = 1
-        info.point = 100000
+        target_pids = list(request.player_ids) or [current_pid]
+        for pid in target_pids:
+            info = response.player_grand_prix_rank_infos.add()
+            info.player_id = pid
+            info.rank = 1
+            info.point = 100000
         return response
 
     async def GetClassGroupRankV1(
@@ -89,11 +180,14 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         context: grpc.aio.ServicerContext,
     ) -> score_ranking_pb2.ScoreRankingGetClassGroupRankV1.Response:
         logger.info("🏅 [ScoreRanking] GetClassGroupRankV1")
+        current_pid = get_current_player_id() or "dankagu-reborn-user"
         response = score_ranking_pb2.ScoreRankingGetClassGroupRankV1.Response()
-        info = response.player_class_group_rank_infos.add()
-        info.player_id = "dankagu-reborn-user"
-        info.rank = 1
-        info.score = 10000000
+        target_pids = list(request.player_ids) or [current_pid]
+        for pid in target_pids:
+            info = response.player_class_group_rank_infos.add()
+            info.player_id = pid
+            info.rank = 1
+            info.score = 10000000
         return response
 
     async def GetClassV1(
@@ -102,12 +196,15 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         context: grpc.aio.ServicerContext,
     ) -> score_ranking_pb2.ScoreRankingGetClassV1.Response:
         logger.info("🏅 [ScoreRanking] GetClassV1")
+        current_pid = get_current_player_id() or "dankagu-reborn-user"
         response = score_ranking_pb2.ScoreRankingGetClassV1.Response()
-        pclass = response.player_classes.add()
-        pclass.player_id = "dankagu-reborn-user"
-        pclass.class_id = "1"
-        pclass.score = 10000000
-        pclass.group_id = "d5c0c1906e8e91ec6e027edfecb9eca9"
+        target_pids = list(request.player_ids) or [current_pid]
+        for pid in target_pids:
+            pclass = response.player_classes.add()
+            pclass.player_id = pid
+            pclass.class_id = "1"
+            pclass.score = 10000000
+            pclass.group_id = "d5c0c1906e8e91ec6e027edfecb9eca9"
         return response
 
     async def ReceiveClassPrizeV1(
