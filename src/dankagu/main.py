@@ -34,7 +34,10 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     handlers=[console_handler, file_handler],
 )
-logger = logging.getLogger("dankagu")
+logger = logging.getLogger("dankagu.startup")
+# Startup / lifecycle messages (banner, listening ports, cert generation) are
+# always shown, even when DANKAGU_LOG_LEVEL is WARNING or ERROR.
+logger.setLevel(logging.INFO)
 
 
 def ensure_certificates() -> None:
