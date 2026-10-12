@@ -342,24 +342,34 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     )
     assert status_res2.total_login_days == 2
 
-    # Verify mailbox received 4 login bonus mails (stones + 3 growth sets)
+    # Verify mailbox received 41 daily cultivation support mails
     box_res2 = await inv_service.GetInventoriesV1(
         player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(), ctx
     )
-    new_login_gifts = [g for g in box_res2.inventories if "通算ログイン2日目" in g.message]
-    assert len(new_login_gifts) == 4
+    new_login_gifts = [g for g in box_res2.inventories if "【Reborn 育成支援・2日目】" in g.message]
+    assert len(new_login_gifts) == 41
 
-    stone_gift = next(g for g in new_login_gifts if g.system_resource_name == "FREE_STONE")
-    assert stone_gift.system_resource_num == 20000
-
-    exp_gift = next(g for g in new_login_gifts if g.system_resource_name == "GROWTH_EXP")
+    exp_gift = next(g for g in new_login_gifts if g.system_resource_name == "Growth_30005")
     assert exp_gift.system_resource_num == 500
 
-    limit_gift = next(g for g in new_login_gifts if g.system_resource_name == "GROWTH_LIMIT_BREAK")
-    assert limit_gift.system_resource_num == 500
+    ticket_gift = next(g for g in new_login_gifts if g.system_resource_name == "GenericItem_60021")
+    assert ticket_gift.system_resource_num == 300
 
-    skill_gift = next(g for g in new_login_gifts if g.system_resource_name == "GROWTH_SKILL")
-    assert skill_gift.system_resource_num == 500
+    hakoniwa_gift = next(
+        g for g in new_login_gifts if g.system_resource_name == "HakoniwaMaterial_50001"
+    )
+    assert hakoniwa_gift.system_resource_num == 200
+
+    boost_gift = next(g for g in new_login_gifts if g.system_resource_name == "BoostHeal_40002")
+    assert boost_gift.system_resource_num == 10
+
+    fragment_gift = next(
+        g for g in new_login_gifts if g.system_resource_name == "HeroineFragment_20000"
+    )
+    assert fragment_gift.system_resource_num == 200
+
+    coin_gift = next(g for g in new_login_gifts if g.system_resource_name == "Coin_10001")
+    assert coin_gift.system_resource_num == 1000000
 
     # Claim all daily rewards
     claim_req = player_inventory_pb2.PlayerInventoryReceiveV1.Request(
@@ -367,13 +377,9 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     )
     await inv_service.ReceiveV1(claim_req, ctx)
 
-    # Verify wallet received +20,000 free stones
-    wal_res = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
-    vc_map = {vc.virtual_currency_name: vc.amount for vc in wal_res.total.virtual_currencies}
-    assert vc_map["FREE_STONE"] >= 20000
-
-    # Verify storage has growth materials persisted
+    # Verify storage has growth (500), hakoniwa (200), boost heal (10), and universal heroine fragment (200) persisted
     from dankagu.core.growth import decode_growth_item
+
     async with session_factory() as session:
         exp_entry = await session.execute(
             select(PlayerStorageEntry).where(
@@ -396,3 +402,26 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
         assert row_b is not None
         _, count_b = decode_growth_item(row_b.value)
         assert count_b == 500
+
+        hako_entry = await session.execute(
+            select(PlayerStorageEntry).where(
+                PlayerStorageEntry.player_id == sample_player.id,
+                PlayerStorageEntry.key == "ItemStockStatus--14050001",
+            )
+        )
+        row_h = hako_entry.scalars().first()
+        assert row_h is not None
+        _, count_h = decode_growth_item(row_h.value)
+        assert count_h == 200
+
+        frag_entry = await session.execute(
+            select(PlayerStorageEntry).where(
+                PlayerStorageEntry.player_id == sample_player.id,
+                PlayerStorageEntry.key == "ItemStockStatus--11020000",
+            )
+        )
+        row_f = frag_entry.scalars().first()
+        assert row_f is not None
+        _, count_f = decode_growth_item(row_f.value)
+        assert count_f == 200
+

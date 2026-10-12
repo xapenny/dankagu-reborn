@@ -46,6 +46,7 @@ data/assets/*/
 data/assets-cdn/
 data/manifest/*.json
 data/hexdata/*/
+data/photos/
 # Game metadata (never commit game metadata)
 data/metadata/
 

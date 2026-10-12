@@ -41,6 +41,7 @@ PERSONAL_STORAGE_PREFIXES = (
     "Formation--",
     "DeckStatus--",
     "MySpotItemStatus--",
+    "MySpotStatus--",
     "ItemStockStatus--",
     "GrowthItemStock--",
     "TweetStatus--",
@@ -52,6 +53,19 @@ PERSONAL_STORAGE_PREFIXES = (
     "PlayerBase--",
     "PlayerPublicStatus--",
     "PlayerSetting--",
+    "ExpeditionManageStatus--",
+    "ExpeditionMissionRecordEntityCollecttion--",
+    "PlayerExpeditionChallengeStatusCollection--",
+    "MissionStatusCollection-",
+    "MissionCounterStatusCollection--",
+    "MissionBeginnerStatus--",
+    "MissionControlStatus--",
+    "ShopPurchaseStatusCollection--",
+    "ShopNewStatusCollection--",
+    "UnlockEntityStatusCollection--",
+    "DanmakuPassSeasonStatus-",
+    "EventEmblemRankingStatusCollection--",
+    "EventRaidAttackStatus--",
     "SaveHash--",
 )
 
@@ -110,11 +124,11 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         )
         self.template_entries.setdefault(
             "ExpeditionMissionRecordEntityCollecttion--1",
-            bytes.fromhex("0801122408914e10001800200028f3a0a7d60630f3a0a7d6063a0200004205000000000048015000"),
+            bytes.fromhex("0801121c08914e100018002000280030003a0200004205000000000048015000"),
         )
         self.template_entries.setdefault(
             "ExpeditionManageStatus--1",
-            bytes.fromhex("080110914e18f3a0a7d60620f3a0a7d606"),
+            bytes.fromhex("080110914e18002000"),
         )
         self._templates_loaded = True
 

@@ -17,50 +17,26 @@ from dankagu.models.wallet import WalletBalance
 
 logger = logging.getLogger("dankagu.core.starter")
 
-# Protobuf binaries for starter player state
+# Protobuf binaries for pure fresh-account starter state
 STARTER_STORAGE_ENTRIES = {
-    # PlayerBootStatus--1: Initial tutorial/onboarding state with future appeal timestamp
+    # PlayerBootStatus--1: Initial onboarding state with future account-linkage appeal timestamp
     "PlayerBootStatus--1": b"\x08\x01\x18\x01 \x0e(\xff\xff\xff\xff\x07",
-    # Formation--1: Initial starter deck
-    "Formation--1": bytes.fromhex(
-        "0801121289809083f3b0fdf30481809083f4d8d7be041a2d8080908397ecf3a4038280908385eff89c0480809083a5f1efbe0481809083defcd4e004808090838bc3f78b032202456d38f59dea9906"
-    ),
-    # Reimu Hakurei starter card
-    "CardStatus--366496678282526728": bytes.fromhex(
-        "088880908398d9838b0510a48d0618b9e2859906208fc0df9906400150015801"
-    ),
-    # Marisa Kirisame starter card
-    "CardStatus--366497051944681478": bytes.fromhex(
-        "088680908388e4838b0510a88d061890e385990620bae5859906400150015801"
-    ),
-    # Remilia Scarlet starter card
-    "CardStatus--366496678282526729": bytes.fromhex(
-        "088980908398d9838b0510aa8d0618b9e2859906208fc0df9906400150015801"
-    ),
     # HakoniwaStatus--1: Hakurei Shrine initial stage (ID=1, PartyPt=0)
     "HakoniwaStatus--1": bytes.fromhex("08011000"),
-    # DailyBonusStatus--1: Seeded login bonus status (ID=1, Count=5) to prevent client crash on missing EOL banner
-    "DailyBonusStatus--1": bytes.fromhex("0801100518ef9caa880620c0f3989a06"),
-    # PlayerStatus--1: Seeded player status with Exp=100 (Level 2+) to unlock Feature 11 (Travel / おでかけ)
-    "PlayerStatus--1": bytes.fromhex(
-        "080118bba5a7d6062064280a30f3a0a7d60648c84c50c874600168880170048001f3a0a7d606"
-    ),
-    # ExpeditionMissionRecordEntityCollecttion--1: Initial expedition mission record with Mission 10001 (tutorial mission)
+    # DailyBonusStatus--1: Clean login bonus status (ID=1, Count=1, CreatedAt=0, LastUpdate=0)
+    "DailyBonusStatus--1": bytes.fromhex("0801100118002000"),
+    # PlayerStatus--1: Pure initial status (ID=1, Exp=0, Stamina=10, LevelTemp=1)
+    "PlayerStatus--1": bytes.fromhex("08012000280a6001"),
+    # ExpeditionMissionRecordEntityCollecttion--1: Initial expedition record with tutorial Mission 10001 (CreatedAt=0, LastUpdate=0)
     "ExpeditionMissionRecordEntityCollecttion--1": bytes.fromhex(
-        "0801122408914e10001800200028f3a0a7d60630f3a0a7d6063a0200004205000000000048015000"
+        "0801121c08914e100018002000280030003a0200004205000000000048015000"
     ),
     # ExpeditionManageStatus--1: Expedition manager status initialized with tutorial Mission 10001
-    "ExpeditionManageStatus--1": bytes.fromhex(
-        "080110914e18f3a0a7d60620f3a0a7d606"
-    ),
-    # ItemStockStatus--1000: Starter wood (count=5000) for Gensokyo Hakurei Shrine reconstruction
-    "ItemStockStatus--1000": bytes.fromhex("08e807108827"),
-    # ItemStockStatus--2000: Starter stone (count=5000) for Gensokyo Hakurei Shrine reconstruction
-    "ItemStockStatus--2000": bytes.fromhex("08d00f108827"),
-    # PlayerSetting--1: Seeded player settings with lastActiveEventViewTime and lastNewMusicAnnouncementViewTime
-    # set to future timestamps to prevent boot announcement spam of blank event banners on fresh accounts.
+    "ExpeditionManageStatus--1": bytes.fromhex("080110914e18002000"),
+    # PlayerSetting--1: Pure initial player settings with starter N card [100082, 0, 0, 0, 0]
+    # and future announcement timestamps (4102498799) to suppress blank EOL event popups.
     "PlayerSetting--1": bytes.fromhex(
-        "080110ef9caa880618f49ce8d5062001420ffa8e06d28e068c8e06ca8e06c88e06520501010101015a050100000001600a68e0c6899a0670e080ff99067a0601efd39ca40f8001efd39ca40f8801efd39ca40f90010e9801c5a2aa8806a001d199f98806a80101c00101"
+        "08014207b28d0600000000520500000000005a050000000000600a7a0601efd39ca40f8001efd39ca40f8801efd39ca40f90010e"
     ),
 }
 
@@ -96,22 +72,24 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
         )
         await session.execute(stmt)
 
-    # 3. Seed Starter Welcome Gift in Mailbox
+    # 3. Seed Starter Welcome Gift and Day 1 Daily Cultivation Materials in Mailbox
     inv_res = await session.execute(
         select(PlayerInventoryItem).where(PlayerInventoryItem.player_id == player.id)
     )
     if inv_res.scalars().first() is None:
+        from dankagu.core.growth import create_daily_reward_mail_items
+
         welcome_gift = PlayerInventoryItem(
             id=str(uuid.uuid4()),
             player_id=player.id,
-            item_type=0,
-            schema_key="ITEM",
+            item_type=1,
+            schema_key="VC",
             value=json.dumps(
-                {"Prefix": "VirtualCurrency", "Value": "FREE_STONE", "Count": 2500}
+                {"Prefix": "VC", "Value": 90002, "Count": 2500}
             ).encode("utf-8"),
             route=1,
             message="ダンカグ Reborn へようこそ！事前登録＆リリース記念報酬",
-            search_label="Stone",
+            search_label="VC",
             opened_at=now,
             expired_at=4102498799,
             system_resource_name="FREE_STONE",
@@ -121,5 +99,12 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
         )
         session.add(welcome_gift)
 
+        for item in create_daily_reward_mail_items(
+            player_id=player.id,
+            total_login_days=1,
+        ):
+            session.add(item)
+
     StorageRevisionManager.set_revision("1", player_id=player.id)
     logger.info("🌱 Seeded starter data for player %s (%s)", player.id, player.user_id)
+
