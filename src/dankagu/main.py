@@ -75,6 +75,22 @@ def _missing_san_names(cert_path: Path) -> list[str]:
     return [n for n in settings.cert_dns_names if not covered(n)]
 
 
+def create_portal_app() -> FastAPI:
+    """Build the plain-HTTP portal & asset CDN application.
+
+    Serves the setup portal, the CA certificate, the asset routes and
+    ``/status``. The same ``asset_router`` is also mounted on the LCX apps, so
+    the asset endpoints keep working over HTTPS when this listener is disabled.
+    """
+    http_app = FastAPI(
+        title="Danmaku Kagura HTTP Portal & Asset CDN",
+        description="Web portal for one-click CA certificate installation and game asset streaming",
+        docs_url="/docs",
+    )
+    http_app.include_router(asset_router)
+    return http_app
+
+
 async def run_servers() -> None:
     """Launch the LCX (443 & 9443), gRPC, and asset/portal servers concurrently."""
     # 0. Set custom asyncio loop exception handler to suppress spurious Windows IOCP 10054 callback noise
@@ -113,22 +129,29 @@ async def run_servers() -> None:
     await grpc_server.start()
     logger.info("✅ [Takasho gRPC] Active on port %d", settings.grpc_port)
 
-    # 3. HTTP Certificate Portal & Asset CDN (Port 8080, Plain HTTP)
-    http_app = FastAPI(
-        title="Danmaku Kagura HTTP Portal & Asset CDN",
-        description="Web portal for one-click CA certificate installation and game asset streaming",
-        docs_url="/docs",
-    )
-    http_app.include_router(asset_router)
-
-    http_config = uvicorn.Config(
-        http_app,
-        host=settings.host,
-        port=settings.asset_port,
-        log_level=settings.log_level.lower(),
-    )
-    http_server = uvicorn.Server(http_config)
-    logger.info("✅ [HTTP Portal & Cert Delivery] http://%s:%d/", lan_ip, settings.asset_port)
+    # 3. HTTP Certificate Portal & Asset CDN (Port 8080, Plain HTTP).
+    #    Optional: DANKAGU_ASSET_SERVER_ENABLED=false leaves the port unbound.
+    http_servers: list[uvicorn.Server] = []
+    if settings.asset_server_enabled:
+        http_config = uvicorn.Config(
+            create_portal_app(),
+            host=settings.host,
+            port=settings.asset_port,
+            log_level=settings.log_level.lower(),
+        )
+        http_servers.append(uvicorn.Server(http_config))
+        logger.info("✅ [HTTP Portal & Cert Delivery] http://%s:%d/", lan_ip, settings.asset_port)
+    else:
+        logger.info(
+            "⏸️  [HTTP Portal & Cert Delivery] Disabled via DANKAGU_ASSET_SERVER_ENABLED=false "
+            "- port %d is not bound.",
+            settings.asset_port,
+        )
+        logger.warning(
+            "   Assets remain available over HTTPS on port %d; the CA must be installed on "
+            "each device by other means, since plain-HTTP delivery is off.",
+            settings.lcx_port,
+        )
 
     # 4. LCX Authentication REST API (Port 443 for iOS, Port 9443 for Android)
     lcx_app = create_lcx_app()
@@ -167,11 +190,14 @@ async def run_servers() -> None:
     logger.info("✅ [LCX Auth Android (HTTPS)] https://%s:%d", settings.host, settings.lcx_port)
 
     logger.info("==================================================================")
-    logger.info(
-        "👉 Step 1: Open a browser on your phone: http://%s:%d/ to install the CA",
-        lan_ip,
-        settings.asset_port,
-    )
+    if settings.asset_server_enabled:
+        logger.info(
+            "👉 Step 1: Open a browser on your phone: http://%s:%d/ to install the CA",
+            lan_ip,
+            settings.asset_port,
+        )
+    else:
+        logger.info("👉 Step 1: Install certs/ca.crt on your device manually (portal disabled)")
     logger.info(
         "👉 Step 2: Point the client at %s (LCX https://%s:%d, gRPC %s:%d)",
         settings.public_host or lan_ip,
@@ -185,7 +211,7 @@ async def run_servers() -> None:
 
     try:
         await asyncio.gather(
-            http_server.serve(),
+            *(server.serve() for server in http_servers),
             lcx_ios_server.serve(),
             lcx_server.serve(),
         )

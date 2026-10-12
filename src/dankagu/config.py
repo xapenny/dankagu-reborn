@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     grpc_port: int = 50051
     grpc_tls_port: int = 50052
     asset_port: int = 8080
+    #: Master switch for the plain-HTTP portal & asset CDN listener
+    #: (``DANKAGU_ASSET_SERVER_ENABLED``). When false, ``asset_port`` is not
+    #: bound at all. The asset routes stay reachable over HTTPS on the LCX
+    #: listeners, which mount the same router; only the plain-HTTP certificate
+    #: bootstrap and the ``/status`` shortcut on that port go away.
+    asset_server_enabled: bool = True
 
     # Public identity / certificates
     #: Hostname used for absolute URLs served to the client (announcement
@@ -121,14 +127,19 @@ class Settings(BaseSettings):
         """Base URL used for absolute links served to the client.
 
         Prefers ``public_base_url``, then ``public_host`` (served over HTTPS on
-        the LCX port), and finally the LAN IP on the asset port.
+        the LCX port), and finally the LAN IP: on the asset port when the
+        plain-HTTP listener is enabled, otherwise on the LCX HTTPS port, whose
+        app mounts the same asset router.
         """
         if self.public_base_url:
             return self.public_base_url.rstrip("/")
         if self.public_host:
             return f"https://{self.public_host}"
         host = self.lan_ip or "127.0.0.1"
-        return f"http://{host}:{self.asset_port}"
+        if self.asset_server_enabled:
+            return f"http://{host}:{self.asset_port}"
+        port = "" if self.lcx_port == 443 else f":{self.lcx_port}"
+        return f"https://{host}{port}"
 
     @property
     def cert_dns_names(self) -> list[str]:
