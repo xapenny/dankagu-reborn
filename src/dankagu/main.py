@@ -31,7 +31,7 @@ file_handler = logging.FileHandler("server.log", encoding="utf-8", mode="a")
 file_handler.setFormatter(log_formatter)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     handlers=[console_handler, file_handler],
 )
 logger = logging.getLogger("dankagu")
@@ -125,7 +125,7 @@ async def run_servers() -> None:
         http_app,
         host=settings.host,
         port=settings.asset_port,
-        log_level="info",
+        log_level=settings.log_level.lower(),
     )
     http_server = uvicorn.Server(http_config)
     logger.info("✅ [HTTP Portal & Cert Delivery] http://%s:%d/", lan_ip, settings.asset_port)
@@ -143,7 +143,7 @@ async def run_servers() -> None:
         port=settings.lcx_ios_port,
         ssl_certfile=ssl_certfile if Path(ssl_certfile).exists() else None,
         ssl_keyfile=ssl_keyfile if Path(ssl_keyfile).exists() else None,
-        log_level="info",
+        log_level=settings.log_level.lower(),
         # The client keeps its TLS connections open for the whole session and reuses
         # them. Uvicorn's default 5 s keep-alive closes an idle connection, and the
         # client then waits on the dead socket - observed as multi-minute freezes at
@@ -160,7 +160,7 @@ async def run_servers() -> None:
         port=settings.lcx_port,
         ssl_certfile=ssl_certfile if Path(ssl_certfile).exists() else None,
         ssl_keyfile=ssl_keyfile if Path(ssl_keyfile).exists() else None,
-        log_level="info",
+        log_level=settings.log_level.lower(),
         timeout_keep_alive=600,
     )
     lcx_server = uvicorn.Server(lcx_config)

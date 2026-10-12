@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # (login_bonus, reconstruction_spot).
     hexdata_fes_dir: Path = Field(default=_PROJECT_ROOT / "data" / "hexdata" / "fes" / "player_api")
 
+    #: Root log level (``DANKAGU_LOG_LEVEL``): DEBUG, INFO, WARNING or ERROR.
+    log_level: str = "INFO"
+
     # Host & ports
     host: str = "0.0.0.0"
     lan_ip: str | None = None
