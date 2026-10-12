@@ -1,6 +1,10 @@
 # ダンカグ Reborn — Backend Preservation Server
 
 <p align="center">
+  <img src="docs/logo.png" alt="ダンカグ Reborn (Dankagu Reborn) logo" width="520">
+</p>
+
+<p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12%2B-blue.svg" alt="Python 3.12+"></a>
   <a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json" alt="uv"></a>
   <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg" alt="FastAPI"></a>
@@ -238,6 +242,8 @@ dankagu-reborn/
 │   ├── manifest/              #   Asset manifest catalogs
 │   ├── static/index.html      #   Consent page served to the client WebView
 │   └── ver/jp/tos.txt         #   Terms-of-service version marker
+├── docs/
+│   └── logo.png               #   Project logo used by this README
 ├── protos/                    # Third-party schemas, filled by --fetch (not distributed)
 ├── scripts/
 │   └── compile_protos.py      #   Fetch + compile schemas, rewrite imports
