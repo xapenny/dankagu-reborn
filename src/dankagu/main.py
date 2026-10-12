@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from dankagu.assets.generator import generate_all_manifest_assets
-from dankagu.assets.server import router as asset_router
+from dankagu.assets.server import game_router, ops_router
 from dankagu.config import settings
 from dankagu.core.certs import generate_certificates
 from dankagu.core.database import init_db
@@ -81,17 +81,31 @@ def _missing_san_names(cert_path: Path) -> list[str]:
 def create_portal_app() -> FastAPI:
     """Build the plain-HTTP portal & asset CDN application.
 
-    Serves the setup portal, the CA certificate, the asset routes and
-    ``/status``. The same ``asset_router`` is also mounted on the LCX apps, so
-    the asset endpoints keep working over HTTPS when this listener is disabled.
+    The only listener that serves the operator routes (setup portal, CA/server
+    certificates, ``/status``) alongside the game's asset routes. Kept plaintext
+    because a device has to reach it *before* it trusts this server's
+    certificate.
     """
     http_app = FastAPI(
         title="Danmaku Kagura HTTP Portal & Asset CDN",
         description="Web portal for one-click CA certificate installation and game asset streaming",
         docs_url="/docs",
     )
-    http_app.include_router(asset_router)
+    http_app.include_router(game_router)
+    http_app.include_router(ops_router)
     return http_app
+
+
+def create_public_https_app() -> FastAPI:
+    """Build the app served on the public HTTPS listeners (ports 443 / 9443).
+
+    LCX authentication plus the game's asset routes, because the client fetches
+    AssetBundles over HTTPS once ``DANKAGU_PUBLIC_HOST`` is set. The operator
+    routes are deliberately absent: they belong to the plain-HTTP listener.
+    """
+    lcx_app = create_lcx_app()
+    lcx_app.include_router(game_router)
+    return lcx_app
 
 
 async def run_servers() -> None:
@@ -157,8 +171,7 @@ async def run_servers() -> None:
         )
 
     # 4. LCX Authentication REST API (Port 443 for iOS, Port 9443 for Android)
-    lcx_app = create_lcx_app()
-    lcx_app.include_router(asset_router)
+    lcx_app = create_public_https_app()
 
     ssl_certfile = str(settings.certs_dir / "server.crt")
     ssl_keyfile = str(settings.certs_dir / "server.key")

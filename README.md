@@ -86,7 +86,7 @@ listener:
 
 | Listener | Default port | Protocol | Purpose |
 |---|---|---|---|
-| Asset CDN & portal | `8080` | HTTP | Asset streaming, CA delivery, `/status` |
+| Asset CDN & portal | `8080` | HTTP | Asset streaming, and the whole operator surface (portal, CA, `/status`, API docs) |
 | LCX | `443` | HTTPS | REST authentication |
 | LCX (alternate) | `9443` | HTTPS | Same app, unprivileged port |
 | Takasho gRPC | `50051` | gRPC (plaintext) | Game RPCs |
@@ -96,6 +96,21 @@ Both gRPC listeners expose the identical set of servicers; the plaintext one exi
 because TLS is not mandatory for every deployment. The portal deliberately stays
 plaintext: a device must be able to reach it *before* it trusts the server
 certificate.
+
+The HTTP routes are split by audience, so the public HTTPS ports carry only what
+the game needs:
+
+| Router | Routes | Mounted on |
+|---|---|---|
+| `game_router` | `/assets`, `/ver`, `/static`, `/photos` | 8080, 443 and 9443 |
+| `ops_router` | `/`, `/ca.crt`, `/cert`, `/server.crt`, `/status` | 8080 only |
+
+The asset routes are on the HTTPS listeners because the client fetches
+AssetBundles over HTTPS once `DANKAGU_PUBLIC_HOST` is set. The operator routes are
+not: nothing in the client calls them, so they exist only on the plain-HTTP
+listener — which is also why `DANKAGU_ASSET_SERVER_ENABLED=false` removes them
+outright. The interactive API docs follow the same rule and are served only by
+the 8080 app.
 
 ---
 

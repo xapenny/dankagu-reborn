@@ -12,7 +12,11 @@ from dankagu.core.net import detect_local_ip
 
 logger = logging.getLogger("dankagu.assets.server")
 
-router = APIRouter(tags=["Assets & Portal"])
+#: Routes the game client calls: AssetBundles, master databases, the ToS/PP text
+game_router = APIRouter(tags=["Assets"])
+
+#: Routes only the operator uses: the setup portal, the CA/server certificates
+ops_router = APIRouter(tags=["Operations"])
 
 MIME_MAP = {
     ".db": "application/x-sqlite3",
@@ -305,7 +309,7 @@ def find_asset_file(path_str: str) -> Path | None:
     return asset_resolver.resolve_fallback(cleaned)
 
 
-@router.get("/", response_class=HTMLResponse)
+@ops_router.get("/", response_class=HTMLResponse)
 async def get_portal_index() -> HTMLResponse:
     """Deliver a user-friendly web portal with one-click certificate installation."""
     lan_ip = settings.lan_ip or detect_local_ip()
@@ -319,8 +323,8 @@ async def get_portal_index() -> HTMLResponse:
     return HTMLResponse(content=html_content)
 
 
-@router.get("/ca.crt")
-@router.get("/cert")
+@ops_router.get("/ca.crt")
+@ops_router.get("/cert")
 async def download_ca_certificate() -> Response:
     """Serve DanKagu Root CA certificate for iOS/Android device installation.
 
@@ -343,7 +347,7 @@ async def download_ca_certificate() -> Response:
     )
 
 
-@router.get("/server.crt")
+@ops_router.get("/server.crt")
 async def download_server_certificate() -> Response:
     """Serve server TLS certificate."""
     cert_path = settings.certs_dir / "server.crt"
@@ -363,7 +367,7 @@ async def download_server_certificate() -> Response:
     )
 
 
-@router.get("/status")
+@ops_router.get("/status")
 async def get_server_status() -> JSONResponse:
     """API endpoint providing current server operational status."""
     lan_ip = settings.lan_ip or detect_local_ip()
@@ -390,9 +394,9 @@ async def get_server_status() -> JSONResponse:
     )
 
 
-@router.get("/assets/{asset_path:path}")
-@router.get("/ver/{asset_path:path}")
-@router.get("/static/{asset_path:path}")
+@game_router.get("/assets/{asset_path:path}")
+@game_router.get("/ver/{asset_path:path}")
+@game_router.get("/static/{asset_path:path}")
 async def get_asset(asset_path: str, request: Request) -> Response:
     """Serve an asset by hash path, with fallbacks for boot-critical files."""
     clean_path = asset_path.split("?")[0].lstrip("/\\")
@@ -467,8 +471,8 @@ async def get_asset(asset_path: str, request: Request) -> Response:
     )
 
 
-@router.put("/photos/{photo_filename}")
-@router.post("/photos/{photo_filename}")
+@game_router.put("/photos/{photo_filename}")
+@game_router.post("/photos/{photo_filename}")
 async def upload_photo_file(photo_filename: str, request: Request) -> Response:
     """Accept uploaded album photo or thumbnail binary from client."""
     safe_name = Path(photo_filename).name
@@ -481,7 +485,7 @@ async def upload_photo_file(photo_filename: str, request: Request) -> Response:
     return Response(status_code=status.HTTP_200_OK)
 
 
-@router.get("/photos/{photo_filename}")
+@game_router.get("/photos/{photo_filename}")
 async def get_photo_file(photo_filename: str) -> Response:
     """Serve uploaded album photo or thumbnail, or a valid PNG placeholder if not on disk."""
     safe_name = Path(photo_filename).name
