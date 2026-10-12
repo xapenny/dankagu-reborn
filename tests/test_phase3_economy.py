@@ -222,10 +222,12 @@ async def test_lootbox_purchase_flow(sample_player: Player) -> None:
     storage_servicer = PlayerStorageService()
     set_req = player_storage_pb2.PlayerStorageSetEntriesV2.Request()
     set_req.next_revision = "3"
+    written_keys: set[str] = set()
     for i, _inv in enumerate(resp.player_inventories):
         e = set_req.entries.add()
         e.key = f"CardStatus--9161027867904573{i:02d}"
         e.value = b"\x08\x01\x10\x64"
+        written_keys.add(e.key)
     await storage_servicer.SetEntriesV2(set_req, ctx)
 
     async with session_factory() as session:
@@ -235,7 +237,11 @@ async def test_lootbox_purchase_flow(sample_player: Player) -> None:
         )
         res = await session.execute(stmt)
         card_entries = res.scalars().all()
-        assert len(card_entries) >= 13
+        # Everything the client just sent must have been persisted. (This used to
+        # reach the asserted count only via 3 starter CardStatus entries that the
+        # starter seeding no longer writes, so the bound is derived from the
+        # payload instead of a magic number.)
+        assert written_keys <= {e.key for e in card_entries}
 
 
 @pytest.mark.asyncio
@@ -274,12 +280,13 @@ async def test_player_inventory_gift_box_flow(sample_player: Player) -> None:
     servicer = PlayerInventoryService()
     ctx = DummyContext()
 
-    # 1. Starter seeding gave 1 welcome gift (2500 Free Stones)
+    # 1. Starter seeding gave a welcome gift worth 2,500 Free Stones. The starter
+    #    mailbox also holds the Day-1 cultivation materials, so pick the gift by
+    #    resource name instead of assuming it is the first entry.
     req_get = player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request()
     resp_get = await servicer.GetInventoriesV1(req_get, ctx)
     assert len(resp_get.inventories) >= 1
-    welcome_gift = resp_get.inventories[0]
-    assert welcome_gift.system_resource_name == "FREE_STONE"
+    welcome_gift = next(g for g in resp_get.inventories if g.system_resource_name == "FREE_STONE")
     assert welcome_gift.system_resource_num == 2500
 
     # 2. GetInventoriesAndCountV1 check
@@ -298,15 +305,15 @@ async def test_player_inventory_gift_box_flow(sample_player: Player) -> None:
     assert vc_map["FREE_STONE"] == 62500
     assert resp_rcv.revision == "5"
 
-    # 5. GetInventoriesV1 is now empty
-    resp_empty = await servicer.GetInventoriesV1(req_get, ctx)
-    assert len(resp_empty.inventories) == 0
+    # 5. The claimed gift is gone from the mailbox; the other starter mail stays.
+    resp_after = await servicer.GetInventoriesV1(req_get, ctx)
+    assert welcome_gift.id not in {i.id for i in resp_after.inventories}
 
     # 6. GetReceivedInventoriesV1 shows the claimed gift
     req_hist = player_inventory_pb2.PlayerInventoryGetReceivedInventoriesV1.Request()
     resp_hist = await servicer.GetReceivedInventoriesV1(req_hist, ctx)
     assert len(resp_hist.received_inventories) >= 1
-    assert resp_hist.received_inventories[0].id == welcome_gift.id
+    assert welcome_gift.id in {i.id for i in resp_hist.received_inventories}
 
 
 @pytest.mark.asyncio

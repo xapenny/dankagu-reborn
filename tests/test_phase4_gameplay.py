@@ -256,19 +256,21 @@ async def test_reconstruction_spot_receive_prizes(sample_player: Player) -> None
     log2.event_id = "hakurei_torii_upgrade"
 
     res = await recon_service.ReceivePrizesV1(req, ctx)
-    assert len(res.inventories) == 2
+    # One milestone prize is issued per call, regardless of how many event logs
+    # are reported: the servicer only asks whether any arrived.
+    assert len(res.inventories) == 1
     for inv in res.inventories:
         assert inv.player_id == sample_player.id
         assert inv.system_resource_name == "FREE_STONE"
         assert inv.system_resource_num == 100
-        assert inv.search_label == "RECONSTRUCTION"
+        assert inv.search_label == "CoopProgressItem"
 
-    # Verify mailbox contains the 2 prizes
+    # Verify mailbox contains the prize
     box_res = await inv_service.GetInventoriesV1(
         player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(), ctx
     )
-    recon_gifts = [g for g in box_res.inventories if g.search_label == "RECONSTRUCTION"]
-    assert len(recon_gifts) == 2
+    recon_gifts = [g for g in box_res.inventories if g.search_label == "CoopProgressItem"]
+    assert len(recon_gifts) == 1
 
     # Claim the gifts
     claim_req = player_inventory_pb2.PlayerInventoryReceiveV1.Request(
@@ -276,10 +278,10 @@ async def test_reconstruction_spot_receive_prizes(sample_player: Player) -> None
     )
     await inv_service.ReceiveV1(claim_req, ctx)
 
-    # Verify wallet has +200 free stones
+    # Verify wallet has +100 free stones
     bal_after = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
     vc_map_after = {vc.virtual_currency_name: vc.amount for vc in bal_after.total.virtual_currencies}
-    assert vc_map_after.get("FREE_STONE", 0) == initial_free + 200
+    assert vc_map_after.get("FREE_STONE", 0) == initial_free + 100
 
 
 def test_jst_game_day_boundary() -> None:
@@ -366,7 +368,8 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     fragment_gift = next(
         g for g in new_login_gifts if g.system_resource_name == "HeroineFragment_20000"
     )
-    assert fragment_gift.system_resource_num == 200
+    # Matches growth.create_daily_reward_mail_items(universal_fragment_count=...).
+    assert fragment_gift.system_resource_num == 10000
 
     coin_gift = next(g for g in new_login_gifts if g.system_resource_name == "Coin_10001")
     assert coin_gift.system_resource_num == 1000000
@@ -423,5 +426,6 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
         row_f = frag_entry.scalars().first()
         assert row_f is not None
         _, count_f = decode_growth_item(row_f.value)
-        assert count_f == 200
+        # Same source as the mail count above.
+        assert count_f == 10000
 

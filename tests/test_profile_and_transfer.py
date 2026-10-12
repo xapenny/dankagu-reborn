@@ -199,18 +199,20 @@ async def test_starter_seed_isolation_prevents_2022_compendium_leak() -> None:
         )
         card_res = await storage_service.GetEntriesV2(card_req, context)  # type: ignore[arg-type]
 
-        # Must have only starter cards (3 cards: Reimu, Marisa, Remilia), NOT 590 cards!
+        # Compendium-leak guard: a fresh account must not inherit the 2022 card
+        # collection. Starter cards now ship inside PlayerSetting--1's N-card
+        # list, so there are no per-card CardStatus entries at all.
         card_keys = [e.key for e in card_res.entries]
-        assert len(card_keys) == 3
-        assert any("366496678282526728" in k for k in card_keys)
+        assert card_keys == []
 
-        # Check starter Formation--1 exists
-        deck_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
-            criteria=[Criterion(key="Formation--1", matching_type=Criterion.MatchingType.EXACT)]
+        # ...and the starter N card must be present in the initial settings.
+        setting_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
+            criteria=[Criterion(key="PlayerSetting--1", matching_type=Criterion.MatchingType.EXACT)]
         )
-        deck_res = await storage_service.GetEntriesV2(deck_req, context)  # type: ignore[arg-type]
-        assert len(deck_res.entries) == 1
-        assert deck_res.entries[0].key == "Formation--1"
+        setting_res = await storage_service.GetEntriesV2(setting_req, context)  # type: ignore[arg-type]
+        assert len(setting_res.entries) == 1
+        # Card 100082 is written as a protobuf varint inside that entry.
+        assert b"\xb2\x8d\x06" in setting_res.entries[0].value
 
         # Check PlayerBootStatus--1 exists
         boot_req = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
