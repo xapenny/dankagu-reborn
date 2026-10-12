@@ -4,7 +4,7 @@ import logging
 import time
 
 import grpc
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.config import settings
@@ -167,7 +167,10 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         for criterion in request.criteria:
             if criterion.matching_type == Criterion.MatchingType.EXACT:
                 k = criterion.key
-                if k in db_entry_map:
+                # An empty stored value means the client cleared this key. Never
+                # serve it: the game parses every returned value as its own
+                # message and aborts the boot on a zero-length payload.
+                if k in db_entry_map and db_entry_map[k].value:
                     e = db_entry_map[k]
                     proto = response.entries.add()
                     proto.player_id = current_pid
@@ -188,7 +191,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 prefix = criterion.key
                 # 1. DB entries first
                 for k, e in db_entry_map.items():
-                    if k.startswith(prefix) and k not in served_keys:
+                    if k.startswith(prefix) and k not in served_keys and e.value:
                         proto = response.entries.add()
                         proto.player_id = current_pid
                         proto.key = e.key
@@ -230,6 +233,18 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             )
 
             for proto_entry in request.entries:
+                # A SetEntriesV2 entry with no value is the client clearing that
+                # key (construction sites, inventory history, ...). Storing the
+                # empty blob poisons every later GetEntriesV2, so delete instead.
+                if not proto_entry.value:
+                    await session.execute(
+                        delete(PlayerStorageEntry).where(
+                            PlayerStorageEntry.player_id == current_pid,
+                            PlayerStorageEntry.key == proto_entry.key,
+                        )
+                    )
+                    continue
+
                 stmt = pg_insert(PlayerStorageEntry).values(
                     player_id=current_pid,
                     key=proto_entry.key,
@@ -306,7 +321,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 if criterion.matching_type == Criterion.MatchingType.EXACT:
                     k = criterion.key
                     pair = (pid, k)
-                    if pair in db_entry_map and pair not in served_pairs:
+                    if pair in db_entry_map and pair not in served_pairs and db_entry_map[pair].value:
                         e = db_entry_map[pair]
                         proto = response.entries.add()
                         proto.player_id = pid
@@ -319,7 +334,12 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     prefix = criterion.key
                     for (entry_pid, k), e in db_entry_map.items():
                         pair = (entry_pid, k)
-                        if entry_pid == pid and k.startswith(prefix) and pair not in served_pairs:
+                        if (
+                            entry_pid == pid
+                            and k.startswith(prefix)
+                            and pair not in served_pairs
+                            and e.value
+                        ):
                             proto = response.entries.add()
                             proto.player_id = pid
                             proto.key = e.key
