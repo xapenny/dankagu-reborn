@@ -43,6 +43,36 @@ def ensure_certificates() -> None:
     if not cert_path.exists() or not key_path.exists():
         logger.info("TLS certificates not found. Generating fresh certificates...")
         generate_certificates(settings.certs_dir)
+        return
+
+    missing = _missing_san_names(cert_path)
+    if missing:
+        logger.info(
+            "TLS certificate SAN is missing %s. Regenerating leaf (Root CA reused)...",
+            ", ".join(missing),
+        )
+        generate_certificates(settings.certs_dir)
+
+
+def _missing_san_names(cert_path: Path) -> list[str]:
+    """Return configured DNS names not covered by the leaf certificate's SAN."""
+    from cryptography import x509
+
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except Exception:
+        return ["<unreadable SAN>"]
+    present = {n.lower() for n in san.get_values_for_type(x509.DNSName)}
+
+    def covered(name: str) -> bool:
+        name = name.lower()
+        if name in present:
+            return True
+        _, _, rest = name.partition(".")
+        return bool(rest) and f"*.{rest}" in present
+
+    return [n for n in settings.cert_dns_names if not covered(n)]
 
 
 async def run_servers() -> None:

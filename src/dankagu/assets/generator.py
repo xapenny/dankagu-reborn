@@ -222,6 +222,20 @@ def generate_all_manifest_assets(force: bool = True) -> dict[str, Path]:
             "hash_path": "1/10/3760-2-425932c2f24919f8d8698f4dd76979cf21fd2676",
             "name": "arg_t_android_r_00003760",
         },
+        # Upload[0] DB (Category 1, OpenAt=1665817200)
+        {
+            "category": "4",
+            "salt": 2153,
+            "hash_path": "4/40/3760-2-796661f6d24cfcf9c7cf96c667b8208576e0b9f1",
+            "name": "arg_m_db_r_00003760_u0",
+        },
+        # Upload[0] iOS Main (Category 3, OpenAt=1665817200)
+        {
+            "category": "2",
+            "salt": 1237,
+            "hash_path": "2/20/3760-2-b2a9081f61a531b6d4f88c907c37f44ed6fa429e",
+            "name": "arg_m_ios_r_00003760_u0",
+        },
     ]
 
     generated: dict[str, Path] = {}

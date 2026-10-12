@@ -36,8 +36,14 @@ async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGener
     reset_engine()
     clean_url = settings.db_url.replace("postgresql+asyncpg://", "postgresql://")
     try:
-        conn = await asyncpg.connect(clean_url, timeout=2.0)
-        await conn.close()
+        try:
+            conn = await asyncpg.connect(clean_url, timeout=2.0)
+            await conn.close()
+        except asyncpg.InvalidCatalogNameError:
+            base_url = clean_url.rsplit("/", 1)[0] + "/postgres"
+            sys_conn = await asyncpg.connect(base_url, timeout=2.0)
+            await sys_conn.execute("CREATE DATABASE dankagu_test;")
+            await sys_conn.close()
         await init_db()
     except Exception as e:
         # If DB connection failed, skip tests that need database
@@ -69,6 +75,16 @@ async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGener
             await conn.execute("DELETE FROM wallet_balances WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM player_inventories WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM song_leaderboards WHERE player_id = ANY($1);", new_ids)
+            await conn.execute(
+                "DELETE FROM friend_relations WHERE follower_id = ANY($1) OR target_id = ANY($1);",
+                new_ids,
+            )
+            await conn.execute(
+                "DELETE FROM my_space_likes WHERE from_player_id = ANY($1) OR to_player_id = ANY($1);",
+                new_ids,
+            )
+            await conn.execute("DELETE FROM photo_likes WHERE player_id = ANY($1);", new_ids)
+            await conn.execute("DELETE FROM player_photos WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM sessions WHERE player_id = ANY($1);", new_ids)
             await conn.execute("DELETE FROM players WHERE id = ANY($1);", new_ids)
         await conn.close()

@@ -1,10 +1,12 @@
 """Takasho ReconstructionSpot servicer for shrine reconstruction."""
 
+import json
 import logging
 import time
 import uuid
 
 import grpc
+from sqlalchemy import select
 
 from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
@@ -93,35 +95,59 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
             event_count,
         )
         response = reconstruction_spot_pb2.ReconstructionSpotReceivePrizesV1.Response()
-        if not event_count:
-            return response
-
         now = int(time.time())
+
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            for log in request.player_event_logs:
-                logger.info(
-                    "⛩️ Processing prize for reconstruction event (cat=%s, id=%s)",
-                    log.event_category,
-                    log.event_id,
+            # Query existing CoopProgressItem inventory items
+            res = await session.execute(
+                select(PlayerInventoryItem).where(
+                    PlayerInventoryItem.player_id == current_pid,
+                    PlayerInventoryItem.search_label == "CoopProgressItem",
                 )
+            )
+            existing_prizes = res.scalars().all()
+            unclaimed = [p for p in existing_prizes if not p.is_claimed]
+
+            # Return any existing unclaimed prizes
+            if unclaimed:
+                for item in unclaimed:
+                    inv = response.inventories.add()
+                    inv.id = item.id
+                    inv.player_id = item.player_id
+                    inv.item_type = item.item_type
+                    inv.schema_key = item.schema_key
+                    inv.value = item.value
+                    inv.route = item.route
+                    inv.message = item.message
+                    inv.search_label = item.search_label
+                    inv.opened_at = item.opened_at
+                    inv.expired_at = item.expired_at
+                    inv.system_resource_name = item.system_resource_name
+                    inv.system_resource_num = item.system_resource_num
+                    inv.created_at = item.created_at
+                return response
+
+            # If no prize has ever been issued or event logs were reported, issue the milestone prize
+            if not existing_prizes or event_count > 0:
                 item = PlayerInventoryItem(
                     id=str(uuid.uuid4()),
                     player_id=current_pid,
                     item_type=int(ItemType.VIRTUAL_CURRENCY),
-                    schema_key="VIRTUAL_CURRENCY",
-                    value=b'{"Count": 100, "CurrencyId": 1}',
+                    schema_key="VC",
+                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode("utf-8"),
                     route=int(Route.ACHIEVEMENT),
                     message="博麗神社復興達成報酬",
-                    search_label="RECONSTRUCTION",
+                    search_label="CoopProgressItem",
                     opened_at=now,
-                    expired_at=now + 86400 * 30,
+                    expired_at=now + 86400 * 90,
                     system_resource_name="FREE_STONE",
                     system_resource_num=100,
                     is_claimed=False,
                     created_at=now,
                 )
                 session.add(item)
+                await session.commit()
 
                 inv = response.inventories.add()
                 inv.id = item.id
@@ -137,8 +163,6 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
                 inv.system_resource_name = item.system_resource_name
                 inv.system_resource_num = item.system_resource_num
                 inv.created_at = item.created_at
-
-            await session.commit()
 
         return response
 

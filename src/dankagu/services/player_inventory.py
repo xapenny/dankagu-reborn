@@ -5,14 +5,22 @@ import logging
 import time
 
 import grpc
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import add_stones, get_or_create_wallet
-from dankagu.core.growth import add_growth_items
+from dankagu.core.growth import (
+    PREFIX_NAME_TO_ID,
+    SKILL_ITEM_IDS,
+    add_generic_item_stocks,
+    add_growth_items,
+)
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
+from google.protobuf.internal.decoder import _DecodeVarint
+from google.protobuf.internal.encoder import _EncodeVarint
+
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_inventory_pb2,
@@ -22,6 +30,33 @@ from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.storage import PlayerStorageEntry
 
 logger = logging.getLogger("dankagu.services.player_inventory")
+
+
+def parse_player_status(data: bytes) -> dict[int, int]:
+    """Parse PlayerStatus protobuf binary into field_id -> varint dict."""
+    pos = 0
+    fields: dict[int, int] = {}
+    while pos < len(data):
+        tag, pos = _DecodeVarint(data, pos)
+        fn = tag >> 3
+        wt = tag & 7
+        if wt == 0:
+            val, pos = _DecodeVarint(data, pos)
+            fields[fn] = val
+        else:
+            break
+    return fields
+
+
+def encode_player_status(fields: dict[int, int]) -> bytes:
+    """Encode field_id -> varint dict into PlayerStatus protobuf binary."""
+    buf = bytearray()
+    for fn in sorted(fields.keys()):
+        val = fields[fn]
+        tag = (fn << 3) | 0
+        _EncodeVarint(buf.extend, tag)
+        _EncodeVarint(buf.extend, val)
+    return bytes(buf)
 
 
 class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
@@ -38,16 +73,31 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
         if not current_pid:
             return response
 
+        limit = 100
+        expired_before = 0
+        expired_after = 0
+        search_labels: list[str] = []
+        if request.HasField("criterion"):
+            if 0 < request.criterion.count <= 100:
+                limit = request.criterion.count
+            expired_before = request.criterion.expired_at_before
+            expired_after = request.criterion.expired_at_after
+            if request.criterion.search_labels:
+                search_labels = [s for s in request.criterion.search_labels if s]
+
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            stmt = (
-                select(PlayerInventoryItem)
-                .where(
-                    PlayerInventoryItem.player_id == current_pid,
-                    PlayerInventoryItem.is_claimed == False,  # noqa: E712
-                )
-                .order_by(PlayerInventoryItem.created_at.desc())
+            stmt = select(PlayerInventoryItem).where(
+                PlayerInventoryItem.player_id == current_pid,
+                PlayerInventoryItem.is_claimed == False,  # noqa: E712
             )
+            if search_labels and "NoFilter" not in search_labels:
+                stmt = stmt.where(PlayerInventoryItem.search_label.in_(search_labels))
+            if expired_before > 0:
+                stmt = stmt.where(PlayerInventoryItem.expired_at <= expired_before)
+            if expired_after > 0:
+                stmt = stmt.where(PlayerInventoryItem.expired_at >= expired_after)
+            stmt = stmt.order_by(PlayerInventoryItem.created_at.desc(), PlayerInventoryItem.id.asc()).limit(limit)
             res = await session.execute(stmt)
             items = res.scalars().all()
 
@@ -80,15 +130,39 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
         if not current_pid:
             return response
 
+        limit = 100
+        expired_before = 0
+        expired_after = 0
+        search_labels: list[str] = []
+        if request.HasField("criterion"):
+            if 0 < request.criterion.count <= 100:
+                limit = request.criterion.count
+            expired_before = request.criterion.expired_at_before
+            expired_after = request.criterion.expired_at_after
+            if request.criterion.search_labels:
+                search_labels = [s for s in request.criterion.search_labels if s]
+
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            base_filters = [
+                PlayerInventoryItem.player_id == current_pid,
+                PlayerInventoryItem.is_claimed == False,  # noqa: E712
+            ]
+            if search_labels and "NoFilter" not in search_labels:
+                base_filters.append(PlayerInventoryItem.search_label.in_(search_labels))
+            if expired_before > 0:
+                base_filters.append(PlayerInventoryItem.expired_at <= expired_before)
+            if expired_after > 0:
+                base_filters.append(PlayerInventoryItem.expired_at >= expired_after)
+
+            count_stmt = select(func.count()).select_from(PlayerInventoryItem).where(*base_filters)
+            total_count = int((await session.execute(count_stmt)).scalar() or 0)
+
             stmt = (
                 select(PlayerInventoryItem)
-                .where(
-                    PlayerInventoryItem.player_id == current_pid,
-                    PlayerInventoryItem.is_claimed == False,  # noqa: E712
-                )
-                .order_by(PlayerInventoryItem.created_at.desc())
+                .where(*base_filters)
+                .order_by(PlayerInventoryItem.created_at.desc(), PlayerInventoryItem.id.asc())
+                .limit(limit)
             )
             res = await session.execute(stmt)
             items = res.scalars().all()
@@ -109,7 +183,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
             inv.system_resource_num = item.system_resource_num
             inv.created_at = item.created_at
 
-        response.inventories_count = len(response.inventories)
+        response.inventories_count = total_count
         return response
 
     async def GetReceivedInventoriesV1(
@@ -177,58 +251,11 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         response = player_inventory_pb2.PlayerInventoryReceiveV1.Response()
         now = int(time.time())
+        client_entry_keys = {e.key for e in request.entries}
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            # 1. Claim items
-            if ids_to_claim:
-                stmt = select(PlayerInventoryItem).where(
-                    PlayerInventoryItem.player_id == current_pid,
-                    PlayerInventoryItem.id.in_(ids_to_claim),
-                    PlayerInventoryItem.is_claimed == False,  # noqa: E712
-                )
-                res = await session.execute(stmt)
-                items = res.scalars().all()
-
-                for item in items:
-                    stones_to_add = 0
-                    if item.system_resource_name in ("FREE_STONE", "VirtualCurrency"):
-                        stones_to_add = item.system_resource_num
-                    else:
-                        try:
-                            parsed = json.loads(item.value.decode("utf-8"))
-                            if (
-                                parsed.get("Prefix") in ("VirtualCurrency", "Stone")
-                                or parsed.get("Value") == "FREE_STONE"
-                            ):
-                                stones_to_add = int(parsed.get("Count", 0))
-                        except Exception:
-                            pass
-
-                    if stones_to_add > 0:
-                        await add_stones(session, current_pid, free_amount=stones_to_add)
-
-                    # Check for growth items
-                    growth_item_ids: list[int] = []
-                    growth_count = item.system_resource_num or 500
-                    try:
-                        parsed = json.loads(item.value.decode("utf-8"))
-                        if parsed.get("Prefix") == "GrowthItem":
-                            if "Items" in parsed:
-                                growth_item_ids = parsed["Items"]
-                            elif "Item" in parsed:
-                                growth_item_ids = [parsed["Item"]]
-                            growth_count = parsed.get("Count", growth_count)
-                    except Exception:
-                        pass
-
-                    if growth_item_ids:
-                        await add_growth_items(session, current_pid, growth_item_ids, count=growth_count)
-
-                    item.is_claimed = True
-                    item.received_at = now
-
-            # 2. Save any storage entries sent by client
+            # 1. Save any storage entries sent by client first (from client-side ItemReceiver)
             for proto_entry in request.entries:
                 upsert_stmt = pg_insert(PlayerStorageEntry).values(
                     player_id=current_pid,
@@ -252,6 +279,95 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                 resp_entry.value = proto_entry.value
                 resp_entry.created_at = proto_entry.created_at or now
                 resp_entry.updated_at = now
+
+            # 2. Claim items and apply server-side wallet / bonus storage updates
+            if ids_to_claim:
+                stmt = select(PlayerInventoryItem).where(
+                    PlayerInventoryItem.player_id == current_pid,
+                    PlayerInventoryItem.id.in_(ids_to_claim),
+                    PlayerInventoryItem.is_claimed == False,  # noqa: E712
+                )
+                res = await session.execute(stmt)
+                items = res.scalars().all()
+
+                for item in items:
+                    stones_to_add = 0
+                    parsed: dict = {}
+                    try:
+                        parsed = json.loads(item.value.decode("utf-8"))
+                    except Exception:
+                        parsed = {}
+
+                    prefix = str(parsed.get("Prefix", ""))
+                    val = parsed.get("Value")
+                    count = int(parsed.get("Count", item.system_resource_num or 200))
+
+                    if (
+                        item.system_resource_name in ("FREE_STONE", "VirtualCurrency")
+                        or prefix in ("VC", "VirtualCurrency", "Stone")
+                        or val == "FREE_STONE"
+                    ):
+                        stones_to_add = count
+
+                    if stones_to_add > 0:
+                        await add_stones(session, current_pid, free_amount=stones_to_add)
+
+                    # Server-side fallback for Growth items if client didn't send entries
+                    if prefix in ("Growth", "GrowthItem"):
+                        growth_ids: list[int] = []
+                        if isinstance(val, int) and val > 0:
+                            if f"GrowthItemStock--{val}" not in client_entry_keys:
+                                growth_ids = [val]
+                        elif "Items" in parsed:
+                            growth_ids = [
+                                int(x)
+                                for x in parsed["Items"]
+                                if f"GrowthItemStock--{x}" not in client_entry_keys
+                            ]
+                        if growth_ids:
+                            await add_growth_items(session, current_pid, growth_ids, count=count)
+
+                    # Server-side fallback for GenericItem / HakoniwaMaterial / BoostHeal / HeroineFragment
+                    elif prefix in PREFIX_NAME_TO_ID and isinstance(val, int) and val > 0:
+                        prefix_id = PREFIX_NAME_TO_ID[prefix]
+                        comp_id = prefix_id * 1_000_000 + val
+                        if f"ItemStockStatus--{comp_id}" not in client_entry_keys:
+                            await add_generic_item_stocks(
+                                session, current_pid, prefix_id, [val], count=count
+                            )
+
+                        # When claiming Kaleidoscope Shards (32005 / 32006), also top up full Kaleidoscopes (32003 / 32004) to 99
+                        if prefix == "GenericItem" and val in (32005, 32006):
+                            await add_growth_items(
+                                session, current_pid, SKILL_ITEM_IDS, count=99, max_cap=99
+                            )
+
+                    # Server-side fallback for Coin (HaveCoin in PlayerStatus--1)
+                    elif prefix == "Coin":
+                        if "PlayerStatus--1" not in client_entry_keys:
+                            ps_res = await session.execute(
+                                select(PlayerStorageEntry).where(
+                                    PlayerStorageEntry.player_id == current_pid,
+                                    PlayerStorageEntry.key == "PlayerStatus--1",
+                                )
+                            )
+                            ps_entry = ps_res.scalars().first()
+                            if ps_entry and ps_entry.value:
+                                fields = parse_player_status(ps_entry.value)
+                                fields[9] = min(fields.get(9, 0) + count, 999_999_999)
+                                new_val = encode_player_status(fields)
+                                ps_entry.value = new_val
+                                ps_entry.updated_at = now
+
+                                resp_entry = response.entries.add()
+                                resp_entry.player_id = current_pid
+                                resp_entry.key = "PlayerStatus--1"
+                                resp_entry.value = new_val
+                                resp_entry.created_at = ps_entry.created_at
+                                resp_entry.updated_at = now
+
+                    item.is_claimed = True
+                    item.received_at = now
 
             # 3. Fetch latest wallet
             wallet = await get_or_create_wallet(session, current_pid)

@@ -6,15 +6,19 @@ import grpc
 
 from dankagu.config import settings
 from dankagu.grpc.interceptors import TakashoAsyncInterceptor
+from dankagu.services.achievement import register_achievement_servicer
 from dankagu.services.announcement import register_announcement_servicer
 from dankagu.services.baas_product import register_baas_product_servicer
 from dankagu.services.club import register_club_servicers
+from dankagu.services.fes_player import register_fes_player_servicer
 from dankagu.services.friend import register_friend_servicer
 from dankagu.services.game_product import register_game_product_servicer
 from dankagu.services.game_status import register_game_status_servicer
 from dankagu.services.login_bonus import register_login_bonus_servicer
 from dankagu.services.loot_box import register_loot_box_servicer
+from dankagu.services.my_space import register_my_space_servicer
 from dankagu.services.ondemand_master import register_ondemand_master_servicer
+from dankagu.services.photo_album import register_photo_album_servicers
 from dankagu.services.player_event_log import register_player_event_log_servicer
 from dankagu.services.player_inventory import register_player_inventory_servicer
 from dankagu.services.player_key_value_store import register_player_key_value_store_servicer
@@ -53,11 +57,15 @@ def create_grpc_server() -> grpc.aio.Server:
     register_player_key_value_store_servicer(server)
     register_player_event_log_servicer(server)
     register_restoration_servicer(server)
+    register_achievement_servicer(server)
 
     # Game Domain (Fes) Services
     register_login_bonus_servicer(server)
     register_reconstruction_spot_servicer(server)
+    register_fes_player_servicer(server)
     register_friend_servicer(server)
+    register_my_space_servicer(server)
+    register_photo_album_servicers(server)
     register_club_servicers(server)
     register_ranking_servicers(server)
     register_subscription_servicers(server)

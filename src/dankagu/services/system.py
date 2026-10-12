@@ -8,6 +8,7 @@ import grpc
 from sqlalchemy import select
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.growth import create_daily_reward_mail_items
 from dankagu.core.session import create_session, get_current_player_id, set_current_player
 from dankagu.core.starter import seed_starter_player
 from dankagu.grpc.codec import takasho_unary_handler
@@ -15,12 +16,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     system_pb2,
     system_pb2_grpc,
 )
-from dankagu.grpc.generated.takasho.schema.common_featureset.resource.player_inventory.v1_pb2 import (
-    ItemType,
-    Route,
-)
 from dankagu.lcx.tokens import decode_token_user_id
-from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.player import Player, allocate_short_id
 
 logger = logging.getLogger("dankagu.services.system")
@@ -34,9 +30,6 @@ def get_jst_game_day(epoch_seconds: int) -> int:
     return (epoch_seconds + 5 * 3600) // 86400
 
 
-from dankagu.core.growth import create_daily_reward_mail_items
-
-
 def process_player_login(session, player: Player, now: int) -> bool:
     """Update player login time and advance total_login_days if crossing 04:00 JST.
 
@@ -47,12 +40,9 @@ def process_player_login(session, player: Player, now: int) -> bool:
     is_new_day = day_now > day_last
     if is_new_day:
         player.total_login_days += 1
-        # Grant 20,000 Free Stones and 500 of each growth material (EXP, limit break, skill)
         mail_items = create_daily_reward_mail_items(
             player_id=player.id,
             total_login_days=player.total_login_days,
-            stone_amount=20000,
-            material_count=500,
         )
         for item in mail_items:
             session.add(item)
