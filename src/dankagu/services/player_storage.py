@@ -7,7 +7,6 @@ import grpc
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
@@ -321,7 +320,11 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 if criterion.matching_type == Criterion.MatchingType.EXACT:
                     k = criterion.key
                     pair = (pid, k)
-                    if pair in db_entry_map and pair not in served_pairs and db_entry_map[pair].value:
+                    if (
+                        pair in db_entry_map
+                        and pair not in served_pairs
+                        and db_entry_map[pair].value
+                    ):
                         e = db_entry_map[pair]
                         proto = response.entries.add()
                         proto.player_id = pid

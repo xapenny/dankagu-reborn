@@ -223,9 +223,7 @@ async def test_phase5_myspace_and_photo_album_flow() -> None:
     # 1. Visitor draws a player and likes Creator's MySpace
     tokens_v = set_current_player(p2_id)
     try:
-        draw_resp = await myspace_svc.DrawPlayerV1(
-            my_space_pb2.MySpaceDrawPlayerV1.Request(), ctx
-        )
+        draw_resp = await myspace_svc.DrawPlayerV1(my_space_pb2.MySpaceDrawPlayerV1.Request(), ctx)
         assert draw_resp.player_id != ""
 
         status_before = await myspace_svc.GetPlayerLikeStatusV1(

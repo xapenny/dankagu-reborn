@@ -82,9 +82,7 @@ async def create_all_tables() -> None:
         # Not modelled by the ORM: AuthorizeV3 allocates 8-digit player short ids
         # from this sequence. The baseline migration creates it for databases that
         # are migrated instead of created.
-        await conn.execute(
-            text("CREATE SEQUENCE IF NOT EXISTS player_short_id_seq START WITH 1;")
-        )
+        await conn.execute(text("CREATE SEQUENCE IF NOT EXISTS player_short_id_seq START WITH 1;"))
 
 
 async def seed_runtime_data() -> None:

@@ -8,7 +8,6 @@ import uuid
 import grpc
 from sqlalchemy import select
 
-from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
@@ -135,7 +134,9 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
                     player_id=current_pid,
                     item_type=int(ItemType.VIRTUAL_CURRENCY),
                     schema_key="VC",
-                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode("utf-8"),
+                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode(
+                        "utf-8"
+                    ),
                     route=int(Route.ACHIEVEMENT),
                     message="博麗神社復興達成報酬",
                     search_label="CoopProgressItem",

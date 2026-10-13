@@ -84,9 +84,7 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
             player_id=player.id,
             item_type=1,
             schema_key="VC",
-            value=json.dumps(
-                {"Prefix": "VC", "Value": 90002, "Count": 2500}
-            ).encode("utf-8"),
+            value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 2500}).encode("utf-8"),
             route=1,
             message="ダンカグ Reborn へようこそ！事前登録＆リリース記念報酬",
             search_label="VC",
@@ -107,4 +105,3 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
 
     StorageRevisionManager.set_revision("1", player_id=player.id)
     logger.info("🌱 Seeded starter data for player %s (%s)", player.id, player.user_id)
-

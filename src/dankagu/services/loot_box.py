@@ -7,11 +7,9 @@ import time
 import uuid
 
 import grpc
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import (
     InsufficientFundsError,
@@ -45,10 +43,10 @@ async def load_gacha_cache_from_db(session: AsyncSession) -> None:
     """Load card pool and banner configurations from database into memory."""
     global _CARDS_BY_RARITY, _BY_ELEMENT, _BANNERS, _CARDS_BY_ID, _GACHA_CACHE_INITIALIZED
 
-    cards_stmt = select(GachaCard).where(GachaCard.enabled == True)
+    cards_stmt = select(GachaCard).where(GachaCard.enabled)
     cards = (await session.execute(cards_stmt)).scalars().all()
 
-    banners_stmt = select(GachaBanner).where(GachaBanner.enabled == True)
+    banners_stmt = select(GachaBanner).where(GachaBanner.enabled)
     banners = (await session.execute(banners_stmt)).scalars().all()
 
     by_rarity: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
@@ -234,7 +232,9 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         parts = pid.split("_")
         gacha_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 159
         is_ten_pull = "_10_" in pid or request.purchase_num == 10
-        pull_count = request.purchase_num if request.purchase_num > 0 else (10 if is_ten_pull else 1)
+        pull_count = (
+            request.purchase_num if request.purchase_num > 0 else (10 if is_ten_pull else 1)
+        )
         is_pt = (
             "_PT_" in pid
             or request.resource_type == loot_box_pb2.LootBoxV3PurchaseV1.Request.PLAYER_KEY_VALUE
@@ -305,9 +305,8 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             for i in range(pull_count):
                 is_last = i == pull_count - 1
                 is_guaranteed_ssr = (
-                    (is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr)
-                    or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
-                )
+                    is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr
+                ) or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
                 is_guaranteed_sr = (
                     is_last and (is_ten_pull or pull_count == 10) and not is_guaranteed_ssr
                 )

@@ -1,7 +1,6 @@
 """Economy management: atomic wallet operations and card storage persistence."""
 
 import logging
-import random
 import time
 
 from sqlalchemy import select
@@ -356,4 +355,3 @@ async def deduct_player_key_value(
         session.add(entry)
     logger.info("💸 Deducted %d %s from %s (%d -> %d)", amount, key, player_id, current, new_val)
     return new_val
-

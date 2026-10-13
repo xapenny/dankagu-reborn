@@ -82,7 +82,9 @@ class AchievementService(achievement_pb2_grpc.AchievementServicer):
                     player_id=current_pid,
                     item_type=int(ItemType.VIRTUAL_CURRENCY),
                     schema_key="VC",
-                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode("utf-8"),
+                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode(
+                        "utf-8"
+                    ),
                     route=int(Route.ACHIEVEMENT),
                     message=f"実績達成報酬 ({ach_id})",
                     search_label="VC",
@@ -170,7 +172,9 @@ class AchievementService(achievement_pb2_grpc.AchievementServicer):
                     player_id=current_pid,
                     item_type=int(ItemType.VIRTUAL_CURRENCY),
                     schema_key="VC",
-                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode("utf-8"),
+                    value=json.dumps({"Prefix": "VC", "Value": 90002, "Count": 100}).encode(
+                        "utf-8"
+                    ),
                     route=int(Route.ACHIEVEMENT),
                     message=f"実績達成報酬 ({ach_id})",
                     search_label="VC",

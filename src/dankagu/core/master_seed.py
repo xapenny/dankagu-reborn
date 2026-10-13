@@ -2,7 +2,6 @@
 
 import json
 import logging
-from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -43,12 +42,16 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
             p_data = json.loads(p_file.read_text(encoding="utf-8"))
             for p in p_data:
                 pid = str(p.get("game_product_id") or p.get("id", ""))
-                stmt = pg_insert(MasterGameProduct).values(
-                    id=pid,
-                    name=str(p.get("name", "")),
-                    category=int(p.get("category", 0)),
-                    data=p,
-                ).on_conflict_do_nothing(index_elements=[MasterGameProduct.id])
+                stmt = (
+                    pg_insert(MasterGameProduct)
+                    .values(
+                        id=pid,
+                        name=str(p.get("name", "")),
+                        category=int(p.get("category", 0)),
+                        data=p,
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterGameProduct.id])
+                )
                 await session.execute(stmt)
             counts["game_products"] = len(p_data)
             logger.info("🛍️ Seeded %d master game products", len(p_data))
@@ -63,13 +66,17 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
             a_data = json.loads(a_file.read_text(encoding="utf-8"))
             for a in a_data:
                 aid = str(a.get("announcement_id") or a.get("id", ""))
-                stmt = pg_insert(MasterAnnouncement).values(
-                    id=aid,
-                    title=str(a.get("title", "")),
-                    category=int(a.get("category", 0)),
-                    enabled=bool(a.get("enabled", False)),
-                    data=a,
-                ).on_conflict_do_nothing(index_elements=[MasterAnnouncement.id])
+                stmt = (
+                    pg_insert(MasterAnnouncement)
+                    .values(
+                        id=aid,
+                        title=str(a.get("title", "")),
+                        category=int(a.get("category", 0)),
+                        enabled=bool(a.get("enabled", False)),
+                        data=a,
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterAnnouncement.id])
+                )
                 await session.execute(stmt)
             counts["announcements"] = len(a_data)
             logger.info("📢 Seeded %d master announcements", len(a_data))
@@ -84,11 +91,15 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
             r_data = json.loads(r_file.read_text(encoding="utf-8"))
             for r in r_data:
                 rid = str(r.get("spot_id") or r.get("id", ""))
-                stmt = pg_insert(MasterReconstructionSpot).values(
-                    id=rid,
-                    name=str(r.get("name", "")),
-                    data=r,
-                ).on_conflict_do_nothing(index_elements=[MasterReconstructionSpot.id])
+                stmt = (
+                    pg_insert(MasterReconstructionSpot)
+                    .values(
+                        id=rid,
+                        name=str(r.get("name", "")),
+                        data=r,
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterReconstructionSpot.id])
+                )
                 await session.execute(stmt)
             counts["reconstruction_spots"] = len(r_data)
             logger.info("⛩️ Seeded %d master reconstruction spots", len(r_data))
@@ -102,15 +113,19 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
         try:
             m_data = json.loads(m_file.read_text(encoding="utf-8"))
             for m in m_data:
-                stmt = pg_insert(MasterMusic).values(
-                    id=int(m["id"]),
-                    name=str(m.get("name", "")),
-                    reading=str(m.get("reading", "")),
-                    composer=str(m.get("composer", "")),
-                    circle_id=int(m.get("circle_id", 0)),
-                    open_at=int(m.get("open_at", 0)),
-                    close_at=int(m.get("close_at", 0)),
-                ).on_conflict_do_nothing(index_elements=[MasterMusic.id])
+                stmt = (
+                    pg_insert(MasterMusic)
+                    .values(
+                        id=int(m["id"]),
+                        name=str(m.get("name", "")),
+                        reading=str(m.get("reading", "")),
+                        composer=str(m.get("composer", "")),
+                        circle_id=int(m.get("circle_id", 0)),
+                        open_at=int(m.get("open_at", 0)),
+                        close_at=int(m.get("close_at", 0)),
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterMusic.id])
+                )
                 await session.execute(stmt)
             counts["musics"] = len(m_data)
             logger.info("🎵 Seeded %d master musics", len(m_data))
@@ -124,13 +139,17 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
         try:
             s_data = json.loads(s_file.read_text(encoding="utf-8"))
             for s in s_data:
-                stmt = pg_insert(MasterScore).values(
-                    id=int(s["id"]),
-                    music_id=int(s.get("music_id", 0)),
-                    difficulty=int(s.get("difficulty", 1)),
-                    level=int(s.get("level", 1)),
-                    total_notes=int(s.get("total_notes", 0)),
-                ).on_conflict_do_nothing(index_elements=[MasterScore.id])
+                stmt = (
+                    pg_insert(MasterScore)
+                    .values(
+                        id=int(s["id"]),
+                        music_id=int(s.get("music_id", 0)),
+                        difficulty=int(s.get("difficulty", 1)),
+                        level=int(s.get("level", 1)),
+                        total_notes=int(s.get("total_notes", 0)),
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterScore.id])
+                )
                 await session.execute(stmt)
             counts["music_scores"] = len(s_data)
             logger.info("🎼 Seeded %d master music scores", len(s_data))
@@ -144,12 +163,16 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
         try:
             i_data = json.loads(i_file.read_text(encoding="utf-8"))
             for item in i_data:
-                stmt = pg_insert(MasterItem).values(
-                    id=int(item["id"]),
-                    category=str(item.get("category", "")),
-                    name=str(item.get("name", "")),
-                    description=str(item.get("description", "")),
-                ).on_conflict_do_nothing(index_elements=[MasterItem.id])
+                stmt = (
+                    pg_insert(MasterItem)
+                    .values(
+                        id=int(item["id"]),
+                        category=str(item.get("category", "")),
+                        name=str(item.get("name", "")),
+                        description=str(item.get("description", "")),
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterItem.id])
+                )
                 await session.execute(stmt)
             counts["items"] = len(i_data)
             logger.info("🎒 Seeded %d master items", len(i_data))
@@ -163,13 +186,17 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
         try:
             e_data = json.loads(e_file.read_text(encoding="utf-8"))
             for exp in e_data:
-                stmt = pg_insert(MasterExpedition).values(
-                    id=int(exp["id"]),
-                    name=str(exp.get("name", "")),
-                    duration_sec=int(exp.get("duration_sec", 0)),
-                    wood_drop=int(exp.get("wood_drop", 0)),
-                    stone_drop=int(exp.get("stone_drop", 0)),
-                ).on_conflict_do_nothing(index_elements=[MasterExpedition.id])
+                stmt = (
+                    pg_insert(MasterExpedition)
+                    .values(
+                        id=int(exp["id"]),
+                        name=str(exp.get("name", "")),
+                        duration_sec=int(exp.get("duration_sec", 0)),
+                        wood_drop=int(exp.get("wood_drop", 0)),
+                        stone_drop=int(exp.get("stone_drop", 0)),
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterExpedition.id])
+                )
                 await session.execute(stmt)
             counts["expeditions"] = len(e_data)
             logger.info("🧭 Seeded %d master expeditions", len(e_data))
@@ -189,10 +216,14 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
                     or p.get("id", "")
                 )
                 if pid:
-                    stmt = pg_insert(MasterLootBoxProduct).values(
-                        id=pid,
-                        data=p,
-                    ).on_conflict_do_nothing(index_elements=[MasterLootBoxProduct.id])
+                    stmt = (
+                        pg_insert(MasterLootBoxProduct)
+                        .values(
+                            id=pid,
+                            data=p,
+                        )
+                        .on_conflict_do_nothing(index_elements=[MasterLootBoxProduct.id])
+                    )
                     await session.execute(stmt)
             counts["loot_box_products"] = len(lb_data)
             logger.info("🎁 Seeded %d master loot box products", len(lb_data))
@@ -211,10 +242,14 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
                 if isinstance(v, str):
                     v = json.loads(v)
                 if k:
-                    stmt = pg_insert(MasterOndemandEntry).values(
-                        key=k,
-                        value=v,
-                    ).on_conflict_do_nothing(index_elements=[MasterOndemandEntry.key])
+                    stmt = (
+                        pg_insert(MasterOndemandEntry)
+                        .values(
+                            key=k,
+                            value=v,
+                        )
+                        .on_conflict_do_nothing(index_elements=[MasterOndemandEntry.key])
+                    )
                     await session.execute(stmt)
             counts["ondemand_entries"] = len(od_data)
             logger.info("🎟️ Seeded %d master ondemand gacha entries", len(od_data))
@@ -229,10 +264,14 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
             ds_data = json.loads(ds_file.read_text(encoding="utf-8"))
             for k, hex_val in ds_data.items():
                 val_bytes = bytes.fromhex(hex_val)
-                stmt = pg_insert(MasterDefaultStorage).values(
-                    key=k,
-                    value=val_bytes,
-                ).on_conflict_do_nothing(index_elements=[MasterDefaultStorage.key])
+                stmt = (
+                    pg_insert(MasterDefaultStorage)
+                    .values(
+                        key=k,
+                        value=val_bytes,
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterDefaultStorage.key])
+                )
                 await session.execute(stmt)
             counts["default_storage"] = len(ds_data)
             logger.info("💾 Seeded %d master default storage entries", len(ds_data))
@@ -246,10 +285,14 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
         if w_file.exists():
             try:
                 w_data = json.loads(w_file.read_text(encoding="utf-8"))
-                stmt = pg_insert(MasterSystemTemplate).values(
-                    key="wallet",
-                    data=w_data,
-                ).on_conflict_do_nothing(index_elements=[MasterSystemTemplate.key])
+                stmt = (
+                    pg_insert(MasterSystemTemplate)
+                    .values(
+                        key="wallet",
+                        data=w_data,
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterSystemTemplate.key])
+                )
                 await session.execute(stmt)
                 counts["system_wallet"] = 1
             except Exception as exc:
@@ -259,10 +302,14 @@ async def seed_master_data_if_empty(session: AsyncSession) -> dict[str, int]:
         if lb_file.exists():
             try:
                 lb_data = json.loads(lb_file.read_text(encoding="utf-8"))
-                stmt = pg_insert(MasterSystemTemplate).values(
-                    key="login_bonus",
-                    data=lb_data,
-                ).on_conflict_do_nothing(index_elements=[MasterSystemTemplate.key])
+                stmt = (
+                    pg_insert(MasterSystemTemplate)
+                    .values(
+                        key="login_bonus",
+                        data=lb_data,
+                    )
+                    .on_conflict_do_nothing(index_elements=[MasterSystemTemplate.key])
+                )
                 await session.execute(stmt)
                 counts["system_login_bonus"] = 1
             except Exception as exc:

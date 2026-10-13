@@ -115,7 +115,12 @@ async def resolve_players(
 
     lookup: dict[str, Player] = {}
     for player in players:
-        for key in (player.id, player.id.lower() if player.id else None, player.short_id, player.user_id):
+        for key in (
+            player.id,
+            player.id.lower() if player.id else None,
+            player.short_id,
+            player.user_id,
+        ):
             if key:
                 lookup.setdefault(key, player)
     return lookup
@@ -284,19 +289,27 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             my_refs = await _own_reference_ids(session, current_pid)
             # Who follows me, and whom I follow - both resolved to players.id.
             follower_rows = (
-                await session.execute(
-                    select(FriendRelation.follower_id).where(
-                        FriendRelation.target_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.follower_id).where(
+                            FriendRelation.target_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             following_rows = (
-                await session.execute(
-                    select(FriendRelation.target_id).where(
-                        FriendRelation.follower_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.target_id).where(
+                            FriendRelation.follower_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
 
             follower_pks = await _resolved_pks(session, follower_rows)
             following_pks = await _resolved_pks(session, following_rows)
@@ -342,19 +355,27 @@ class FriendService(friend_pb2_grpc.FriendServicer):
         async with session_factory() as session:
             my_refs = await _own_reference_ids(session, current_pid)
             following_rows = (
-                await session.execute(
-                    select(FriendRelation.target_id).where(
-                        FriendRelation.follower_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.target_id).where(
+                            FriendRelation.follower_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             followed_rows = (
-                await session.execute(
-                    select(FriendRelation.follower_id).where(
-                        FriendRelation.target_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.follower_id).where(
+                            FriendRelation.target_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
 
             following_pks = await _resolved_pks(session, following_rows)
             followed_pks = await _resolved_pks(session, followed_rows)
@@ -412,19 +433,27 @@ class FriendService(friend_pb2_grpc.FriendServicer):
                 return response
 
             following_rows = (
-                await session.execute(
-                    select(FriendRelation.target_id).where(
-                        FriendRelation.follower_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.target_id).where(
+                            FriendRelation.follower_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             followed_rows = (
-                await session.execute(
-                    select(FriendRelation.follower_id).where(
-                        FriendRelation.target_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.follower_id).where(
+                            FriendRelation.target_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
 
             following_pks = await _resolved_pks(session, following_rows)
             followed_pks = await _resolved_pks(session, followed_rows)
@@ -462,19 +491,27 @@ class FriendService(friend_pb2_grpc.FriendServicer):
         async with session_factory() as session:
             my_refs = await _own_reference_ids(session, current_pid)
             following_rows = (
-                await session.execute(
-                    select(FriendRelation.target_id).where(
-                        FriendRelation.follower_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.target_id).where(
+                            FriendRelation.follower_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             followed_rows = (
-                await session.execute(
-                    select(FriendRelation.follower_id).where(
-                        FriendRelation.target_id.in_(my_refs)
+                (
+                    await session.execute(
+                        select(FriendRelation.follower_id).where(
+                            FriendRelation.target_id.in_(my_refs)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             following_pks = await _resolved_pks(session, following_rows)
             followed_pks = await _resolved_pks(session, followed_rows)
 

@@ -79,26 +79,20 @@ class PlayerPhoto(Base):
     original_url: Mapped[str] = mapped_column(String(256), default="", nullable=False)
     thumbnail_url: Mapped[str] = mapped_column(String(256), default="", nullable=False)
     is_uploaded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    is_published: Mapped[bool] = mapped_column(
-        Boolean, default=False, index=True, nullable=False
-    )
+    is_published: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
     privacy_type: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     like_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     created_at: Mapped[int] = mapped_column(
         BigInteger, default=lambda: int(time.time()), index=True, nullable=False
     )
-    published_at: Mapped[int] = mapped_column(
-        BigInteger, default=0, index=True, nullable=False
-    )
+    published_at: Mapped[int] = mapped_column(BigInteger, default=0, index=True, nullable=False)
 
 
 class PhotoLikeRecord(Base):
     """Stores player likes on published photos."""
 
     __tablename__ = "photo_likes"
-    __table_args__ = (
-        UniqueConstraint("photo_id", "player_id", name="uq_photo_like_player"),
-    )
+    __table_args__ = (UniqueConstraint("photo_id", "player_id", name="uq_photo_like_player"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     photo_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)

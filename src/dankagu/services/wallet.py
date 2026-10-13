@@ -5,7 +5,6 @@ from typing import Any
 
 import grpc
 
-from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import get_or_create_wallet, get_player_key_value
 from dankagu.core.session import get_current_player_id

@@ -497,4 +497,3 @@ async def get_photo_file(photo_filename: str) -> Response:
 
     media_type, image_bytes = PLACEHOLDER_IMAGES[".png"]
     return Response(content=image_bytes, media_type=media_type)
-

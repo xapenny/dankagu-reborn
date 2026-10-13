@@ -1,6 +1,6 @@
 """Master database models for game catalogs, products, musics, items, and rules."""
 
-from sqlalchemy import BigInteger, Boolean, Integer, JSON, LargeBinary, String, Text
+from sqlalchemy import JSON, BigInteger, Boolean, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from dankagu.core.database import Base
