@@ -77,7 +77,7 @@ async def test_token_presented_from_another_device_is_rejected() -> None:
             json={"signInSessionToken": token},
         )
     assert other_device.status_code == 401
-    assert other_device.json()["detail"]["code"] == "LCX_INVALID_SESSION_DEVICE"
+    assert other_device.json()["code"] == "LCX_INVALID_SESSION_DEVICE"
 
 
 @pytest.mark.asyncio
@@ -241,7 +241,7 @@ async def test_pre_binding_token_is_refused_from_a_different_device() -> None:
         )
 
     assert res.status_code == 401
-    assert res.json()["detail"]["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
+    assert res.json()["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
 
 
 @pytest.mark.asyncio
@@ -260,7 +260,24 @@ async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> N
             json={"signInSessionToken": legacy_token},
         )
     assert res.status_code == 401
-    assert res.json()["detail"]["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
+    assert res.json()["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
+    # The SDK reads ``code`` at the top level; a nested ``detail`` envelope reached the
+    # client with nothing to show, so the dialog printed a bare 30000.
+    assert "detail" not in res.json()
+
+
+@pytest.mark.asyncio
+async def test_gcp_force_sign_in_path_is_served() -> None:
+    """The SDK calls force-sign-in under /gcp/; that path must not 404."""
+    async with _client() as client:
+        res = await client.post(
+            "/gcp/identity/force-sign-in",
+            headers={"deviceAccount": f"gcp-force-{uuid.uuid4()}"},
+            json={},
+        )
+    assert res.status_code == 200
+    for field in ("accessToken", "signInSessionToken", "user"):
+        assert res.json().get(field), f"missing {field}"
 
 
 @pytest.mark.asyncio

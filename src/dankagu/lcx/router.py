@@ -7,7 +7,7 @@ import time
 from typing import Annotated, Any
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
@@ -27,6 +27,7 @@ from dankagu.core.transfer import (
     hash_transfer_password,
     verify_transfer_password,
 )
+from dankagu.lcx.errors import LcxApiError
 from dankagu.lcx.tokens import (
     decode_token_payload,
     decode_token_user_id,
@@ -167,12 +168,10 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 bound_device,
                 request_device,
             )
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={
-                    "code": "LCX_INVALID_SESSION_DEVICE",
-                    "message": "Session token was issued to another device",
-                },
+            raise LcxApiError(
+                status.HTTP_401_UNAUTHORIZED,
+                "LCX_INVALID_SESSION_DEVICE",
+                "Session token was issued to another device",
             )
         if not bound_device and request_device and settings.require_device_bound_tokens:
             # A token minted before device binding existed records no device, so there
@@ -189,12 +188,10 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                     user_id,
                     "unknown" if owner is None else f"bound to {owner.device_account!r}",
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail={
-                        "code": "LCX_SESSION_NOT_BOUND_TO_DEVICE",
-                        "message": "Session token predates device binding; sign in again",
-                    },
+                raise LcxApiError(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "LCX_SESSION_NOT_BOUND_TO_DEVICE",
+                    "Session token predates device binding; sign in again",
                 )
             # The account is this device's: bind it now, so the tokens issued below
             # carry the binding and the strict check applies from the next refresh on.
@@ -245,12 +242,15 @@ def _request_device(request: Request) -> str | None:
 
 @router.post("/identity/sign-in")
 @router.post("/identity/force-sign-in")
+# The SDK calls the force-sign-in path under /gcp/ (see the client's own string
+# table); serving only the /identity/ one left the client's recovery call at 404.
+@router.post("/gcp/identity/force-sign-in")
 @router.post("/identity/pre-sign-in")
 @router.post("/identity/mock-sign-in")
 async def post_identity_session(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db_session)],
-) -> dict[str, Any]:
+) -> Any:
     """Execute initial sign-in or session establishment."""
     player = await _resolve_or_create_player(db, request)
     return _build_verified_token_response(player, _request_device(request))

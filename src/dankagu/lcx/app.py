@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from dankagu.core.database import init_db
 from dankagu.core.redaction import redact_text
+from dankagu.lcx.errors import LcxApiError, lcx_api_error_handler
 from dankagu.lcx.router import router as lcx_router
 
 logger = logging.getLogger("dankagu.http")
@@ -123,6 +124,7 @@ def create_lcx_app() -> FastAPI:
             )
         return new_response
 
+    app.add_exception_handler(LcxApiError, lcx_api_error_handler)
     app.include_router(lcx_router)
 
     return app
