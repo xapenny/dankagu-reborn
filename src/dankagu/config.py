@@ -96,6 +96,17 @@ class Settings(BaseSettings):
     # Database
     db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"
 
+    # Schema versioning (Alembic). See src/dankagu/db/README.md.
+    #: Apply pending migrations during startup, before any listener binds
+    #: (``DANKAGU_DB_AUTO_MIGRATE``). A database created before Alembic existed is
+    #: *stamped* with the baseline revision instead of being re-created, so
+    #: enabling this on a live server never rewrites existing player data. Set it
+    #: to false when the deployment script runs ``python -m dankagu.db.migrate``.
+    db_auto_migrate: bool = True
+    #: Seconds to wait for another instance to release the migration lock
+    #: (``DANKAGU_DB_MIGRATE_WAIT_SECONDS``) before startup fails.
+    db_migrate_wait_seconds: int = 300
+
     # Validators
     @field_validator("takasho_key_hex")
     @classmethod

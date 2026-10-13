@@ -14,8 +14,9 @@ from dankagu.assets.generator import generate_all_manifest_assets
 from dankagu.assets.server import game_router, ops_router
 from dankagu.config import settings
 from dankagu.core.certs import generate_certificates
-from dankagu.core.database import init_db
+from dankagu.core.database import seed_runtime_data
 from dankagu.core.net import detect_local_ip
+from dankagu.db.migrate import run_migrations
 from dankagu.grpc.server import create_grpc_server
 from dankagu.lcx.app import create_lcx_app
 
@@ -131,7 +132,19 @@ async def run_servers() -> None:
 
     # 1. Initialize Database & Certs & Manifest Assets
     settings.warn_on_insecure_defaults()
-    await init_db()
+    # Schema first (versioned, advisory-locked, legacy databases are stamped with
+    # the baseline revision instead of rebuilt), then idempotent data seeding.
+    # A migration failure aborts startup on purpose: serving traffic against a
+    # half-migrated schema corrupts state in ways that are far harder to repair.
+    if settings.db_auto_migrate:
+        migration = await run_migrations()
+        logger.info("🗄️  Schema migration: %s", migration.describe())
+    else:
+        logger.info(
+            "⏭️  DANKAGU_DB_AUTO_MIGRATE=false - schema migration skipped "
+            "(apply it with: python -m dankagu.db.migrate --upgrade)"
+        )
+    await seed_runtime_data()
     ensure_certificates()
     generate_all_manifest_assets()
 
