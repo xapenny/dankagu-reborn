@@ -35,8 +35,14 @@ from dankagu.models.player import Player, allocate_short_id
 
 logger = logging.getLogger("dankagu.core.identity")
 
-#: Identifiers that are shared by every install (or that this server used to hand
-#: out itself), so they can never identify a device.
+#: Identifiers that cannot identify a device, because every install reports the same
+#: value. ``dankagu-local-account-hash`` is the constant this project used to mint
+#: itself. Deployments add their own through ``DANKAGU_SHARED_DEVICE_IDS``: an Android
+#: build that cannot obtain a real device identity reports one shared value to every
+#: install (a live example turned up where all Android phones and the emulator sent the
+#: same identifier while iOS devices sent their own ``identifierForVendor``). Keying
+#: accounts on such a value hands the first player's account -- already onboarded, so
+#: the client asks for nothing -- to every later install.
 KNOWN_SHARED_DEVICE_IDS = frozenset({"dankagu-local-account-hash"})
 
 

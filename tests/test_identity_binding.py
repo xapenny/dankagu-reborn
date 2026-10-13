@@ -354,6 +354,51 @@ async def test_expired_token_from_another_device_is_refused() -> None:
     assert unbound.json()["code"] == "LCX_SESSION_EXPIRED"
 
 
+@pytest.mark.asyncio
+async def test_configured_shared_device_identifier_gives_each_install_its_own_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared identifier must not hand one account to every install.
+
+    An Android build that cannot obtain a real device identity reports the same value
+    to every install, so the second player lands in the first player's account and
+    never sees the registration flow. Operators list such values in
+    ``DANKAGU_SHARED_DEVICE_IDS``; the identifier is then ignored and each install
+    registers its own account.
+    """
+    shared = f"shared-device-{uuid.uuid4()}"
+    monkeypatch.setattr(settings, "shared_device_ids", shared, raising=False)
+
+    async with _client() as client:
+        first = await client.post("/identity/sign-in", headers={"deviceAccount": shared})
+        second = await client.post("/identity/sign-in", headers={"deviceAccount": shared})
+
+        first_user = first.json()["user"]["id"]
+        second_user = second.json()["user"]["id"]
+
+        # The identifier was not stored, so the installs are genuinely independent.
+        first_player = await _load_player(first_user)
+        second_player = await _load_player(second_user)
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert first_user != second_user
+    assert first_player is not None and first_player.device_account is None
+    assert second_player is not None and second_player.device_account is None
+
+
+@pytest.mark.asyncio
+async def test_a_real_device_identifier_still_reuses_its_account() -> None:
+    """iOS (and any client with a genuine id) keeps device-based recovery."""
+    device = f"real-device-{uuid.uuid4()}"
+
+    async with _client() as client:
+        first = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+        second = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["user"]["id"] == second.json()["user"]["id"]
+
+
 def test_sign_in_session_token_lasts_thirty_days() -> None:
     """The client-visible lifetime, which bounds how long a leaked token is useful."""
     assert settings.sign_in_session_ttl_seconds == 86400 * 30
