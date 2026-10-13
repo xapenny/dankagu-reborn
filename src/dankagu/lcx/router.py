@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.config import settings
 from dankagu.core.database import get_db_session
-from dankagu.core.identity import normalise_device_account, resolve_or_create_player
+from dankagu.core.identity import find_player, normalise_device_account, resolve_or_create_player
 from dankagu.core.session import (
     invalidate_player_sessions,
     invalidate_session,
@@ -175,22 +175,36 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 },
             )
         if not bound_device and request_device and settings.require_device_bound_tokens:
-            # A token minted before device binding existed records no device, so
-            # there is nothing to compare and a copied one keeps working from
-            # anywhere until it expires. Real clients always send a device
-            # identifier, so "no binding, but a device is known" means a stale token:
-            # reject it and let the player sign in once more.
-            logger.warning(
-                "🔒 [Auth] Rejected unbound token presented for device %r "
-                "(issued before device binding)",
+            # A token minted before device binding existed records no device, so there
+            # is nothing in the token itself to compare. Refusing it outright locked
+            # every existing install out of its own account (2026-10-13), so check the
+            # claim against the database instead: the account the token names must
+            # already belong to this device, or have no device yet (first claim). A
+            # token copied to another device still fails here.
+            owner, _matched = await find_player(db, user_id=user_id, device_account=None)
+            if owner is None or (owner.device_account and owner.device_account != request_device):
+                logger.warning(
+                    "🔒 [Auth] Rejected unbound token for device %r: account %s is %s",
+                    request_device,
+                    user_id,
+                    "unknown" if owner is None else f"bound to {owner.device_account!r}",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={
+                        "code": "LCX_SESSION_NOT_BOUND_TO_DEVICE",
+                        "message": "Session token predates device binding; sign in again",
+                    },
+                )
+            # The account is this device's: bind it now, so the tokens issued below
+            # carry the binding and the strict check applies from the next refresh on.
+            if not owner.device_account:
+                owner.device_account = request_device
+                await db.commit()
+            logger.info(
+                "🔗 [Auth] Accepted pre-binding token for player %s on device %r",
+                owner.id,
                 request_device,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={
-                    "code": "LCX_SESSION_NOT_BOUND_TO_DEVICE",
-                    "message": "Session token predates device binding; sign in again",
-                },
             )
     elif presented_token:
         logger.warning("🔒 [Auth] Ignoring unverifiable token presented by the client")

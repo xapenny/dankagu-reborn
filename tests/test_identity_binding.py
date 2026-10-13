@@ -154,12 +154,73 @@ async def test_sign_out_revokes_the_session_token() -> None:
 
 
 @pytest.mark.asyncio
-async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> None:
-    """A token minted before device binding must not survive a device-bearing refresh.
+async def test_pre_binding_token_is_accepted_on_its_own_device() -> None:
+    """An existing install must not be locked out while it upgrades its token.
 
-    Such a token carries no ``deviceHash``, so a copied one would keep working from
-    any device until it expired -- the state the 2026-10-13 incident left behind.
+    The token records no device, but the account it names already belongs to this
+    device, so the claim is good -- and the tokens handed back carry the binding.
     """
+    device = f"legacy-own-{uuid.uuid4()}"
+    async with _client() as client:
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device}, json={})
+        assert sign_in.status_code == 200
+        user_id = sign_in.json()["user"]["id"]
+
+        legacy_token = jwt.encode(
+            {
+                "kind": "SIGN_IN_SESSION_TOKEN",
+                "data": {"store": "GUEST", "sessionId": str(uuid.uuid4()), "userId": user_id},
+            },
+            settings.require_jwt_secret(),
+            algorithm="HS256",
+        )
+        refreshed = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device},
+            json={"signInSessionToken": legacy_token},
+        )
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["userId"] == user_id
+
+    # The replacement access token carries the device binding, so the strict rule
+    # applies from now on.
+    replacement = refreshed.json()["accessToken"]
+    payload = jwt.decode(replacement, settings.require_jwt_secret(), algorithms=["HS256"])
+    assert payload["data"]["session"]["deviceHash"] == device
+
+
+@pytest.mark.asyncio
+async def test_pre_binding_token_is_refused_from_a_different_device() -> None:
+    """Same stale token, another device: the account is not theirs, so refuse."""
+    owner_device = f"legacy-owner-{uuid.uuid4()}"
+    async with _client() as client:
+        sign_in = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": owner_device}, json={}
+        )
+        user_id = sign_in.json()["user"]["id"]
+
+        legacy_token = jwt.encode(
+            {
+                "kind": "SIGN_IN_SESSION_TOKEN",
+                "data": {"store": "GUEST", "sessionId": str(uuid.uuid4()), "userId": user_id},
+            },
+            settings.require_jwt_secret(),
+            algorithm="HS256",
+        )
+        res = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": f"thief-{uuid.uuid4()}"},
+            json={"signInSessionToken": legacy_token},
+        )
+
+    assert res.status_code == 401
+    assert res.json()["detail"]["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
+
+
+@pytest.mark.asyncio
+async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> None:
+    """An unbound token for an account nobody knows must not be honoured."""
     legacy_payload = {
         "kind": "SIGN_IN_SESSION_TOKEN",
         "data": {"store": "GUEST", "userId": "legacy-user", "sessionId": str(uuid.uuid4())},
