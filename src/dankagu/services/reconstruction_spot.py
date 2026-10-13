@@ -11,6 +11,7 @@ from sqlalchemy import select
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
+from dankagu.grpc.errors import fail_internal_on_error
 from dankagu.grpc.generated.takasho.schema.common_featureset.resource.player_inventory.v1_pb2 import (
     ItemType,
     Route,
@@ -63,13 +64,18 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
                     len(self.cached_response.spots),
                 )
         except Exception as e:
+            # Do not fall back to an empty list: "no reconstruction spots" is a
+            # different answer from "the server could not read them", and the client
+            # would show an empty shrine either way.
             logger.error("Failed to load reconstruction spots from database: %s", e)
+            raise
 
         if self.cached_response is None:
             self.cached_response = (
                 reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
             )
 
+    @fail_internal_on_error("Failed to serve reconstruction spots")
     async def GetAvailableV1(
         self,
         request: reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Request,
@@ -78,15 +84,27 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
         logger.info("⛩️ [ReconstructionSpot] GetAvailableV1")
         await self._ensure_loaded()
         if self.cached_response:
-            return self.cached_response
+            # Hand the caller its own message. The cached one is shared by every
+            # player, so anything that mutates a response -- the servicer today, a
+            # per-player field tomorrow -- would leak into everybody else's shrine.
+            response = reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
+            response.CopyFrom(self.cached_response)
+            return response
         return reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
 
+    @fail_internal_on_error("Failed to hand out reconstruction prizes")
     async def ReceivePrizesV1(
         self,
         request: reconstruction_spot_pb2.ReconstructionSpotReceivePrizesV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> reconstruction_spot_pb2.ReconstructionSpotReceivePrizesV1.Response:
-        current_pid = get_current_player_id() or "dankagu-reborn-user"
+        current_pid = get_current_player_id()
+        if not current_pid:
+            # This used to fall back to the literal id "dankagu-reborn-user", so an
+            # unauthenticated call would read and write one shared account's prizes.
+            logger.warning("⛩️ [ReconstructionSpot] ReceivePrizesV1 without a player session")
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return reconstruction_spot_pb2.ReconstructionSpotReceivePrizesV1.Response()
         event_count = len(request.player_event_logs)
         logger.info(
             "⛩️ [ReconstructionSpot] ReceivePrizesV1 player=%s (%d event logs)",
