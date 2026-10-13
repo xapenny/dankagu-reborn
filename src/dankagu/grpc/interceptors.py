@@ -9,6 +9,7 @@ from typing import Any
 import grpc
 from grpc.aio import ServerInterceptor
 
+from dankagu.core.redaction import redact_text
 from dankagu.core.session import (
     reset_current_player,
     resolve_session_player_id,
@@ -137,7 +138,9 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                 server_timestamp = str(int(time.time()))
                 date_header = formatdate(timeval=None, localtime=False, usegmt=True)
 
-                req_str = str(request).strip()
+                # Redact before truncating: a token cut in half has no closing quote,
+                # so the remainder of it would be written out verbatim.
+                req_str = redact_text(str(request).strip())
                 if not req_str:
                     req_str = "(empty message)"
                 elif len(req_str) > 1000:
@@ -211,7 +214,7 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     )
                 )
 
-                resp_str = str(response).strip()
+                resp_str = redact_text(str(response).strip())
                 if not resp_str:
                     resp_str = "(empty message)"
                 elif len(resp_str) > 1000:
