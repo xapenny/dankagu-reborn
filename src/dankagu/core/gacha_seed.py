@@ -2,7 +2,6 @@
 
 import json
 import logging
-from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,16 +13,86 @@ logger = logging.getLogger("dankagu.core.gacha_seed")
 
 
 DEFAULT_BANNERS = [
-    {"id": 1, "name": "Tutorial", "element": 0, "guaranteed_ssr": True, "pickups": [], "enabled": True},
-    {"id": 3, "name": "Start Dash", "element": 0, "guaranteed_ssr": True, "pickups": [], "enabled": True},
-    {"id": 159, "name": "Standard 1", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},
-    {"id": 160, "name": "Standard 2", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},
-    {"id": 161, "name": "Standard 3", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},
-    {"id": 163, "name": "Finale Ro", "element": 3, "guaranteed_ssr": True, "pickups": [], "enabled": True},
-    {"id": 167, "name": "Finale Em", "element": 1, "guaranteed_ssr": True, "pickups": [], "enabled": True},
-    {"id": 171, "name": "Finale Co", "element": 2, "guaranteed_ssr": True, "pickups": [], "enabled": True},
-    {"id": 4087, "name": "Point Gacha", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},
-    {"id": 80001, "name": "Ad Gacha", "element": 0, "guaranteed_ssr": False, "pickups": [], "enabled": True},
+    {
+        "id": 1,
+        "name": "Tutorial",
+        "element": 0,
+        "guaranteed_ssr": True,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 3,
+        "name": "Start Dash",
+        "element": 0,
+        "guaranteed_ssr": True,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 159,
+        "name": "Standard 1",
+        "element": 0,
+        "guaranteed_ssr": False,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 160,
+        "name": "Standard 2",
+        "element": 0,
+        "guaranteed_ssr": False,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 161,
+        "name": "Standard 3",
+        "element": 0,
+        "guaranteed_ssr": False,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 163,
+        "name": "Finale Ro",
+        "element": 3,
+        "guaranteed_ssr": True,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 167,
+        "name": "Finale Em",
+        "element": 1,
+        "guaranteed_ssr": True,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 171,
+        "name": "Finale Co",
+        "element": 2,
+        "guaranteed_ssr": True,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 4087,
+        "name": "Point Gacha",
+        "element": 0,
+        "guaranteed_ssr": False,
+        "pickups": [],
+        "enabled": True,
+    },
+    {
+        "id": 80001,
+        "name": "Ad Gacha",
+        "element": 0,
+        "guaranteed_ssr": False,
+        "pickups": [],
+        "enabled": True,
+    },
 ]
 
 

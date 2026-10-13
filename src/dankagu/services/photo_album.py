@@ -42,9 +42,7 @@ def _fill_album_photo(proto: my_album_v1_pb2.AlbumPhoto, row: PlayerPhoto) -> No
     proto.content_value = row.content_value or b""
 
 
-def _fill_published_photo(
-    proto: published_photo_v1_pb2.PublishedPhoto, row: PlayerPhoto
-) -> None:
+def _fill_published_photo(proto: published_photo_v1_pb2.PublishedPhoto, row: PlayerPhoto) -> None:
     proto.photo_id = row.photo_id
     if row.character_ids:
         proto.character_ids.extend(str(cid) for cid in row.character_ids)
@@ -414,13 +412,17 @@ class LikePublishedPhotoService(like_published_photo_pb2_grpc.LikePublishedPhoto
             session_factory = get_sessionmaker()
             async with session_factory() as session:
                 existing = (
-                    await session.execute(
-                        select(PhotoLikeRecord).where(
-                            PhotoLikeRecord.photo_id == photo_id,
-                            PhotoLikeRecord.player_id == current_pid,
+                    (
+                        await session.execute(
+                            select(PhotoLikeRecord).where(
+                                PhotoLikeRecord.photo_id == photo_id,
+                                PhotoLikeRecord.player_id == current_pid,
+                            )
                         )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 if existing is None:
                     session.add(
                         PhotoLikeRecord(

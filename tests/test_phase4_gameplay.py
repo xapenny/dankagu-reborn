@@ -15,17 +15,12 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     system_pb2,
     wallet_pb2,
 )
-from dankagu.grpc.generated.takasho.schema.common_featureset.resource.player_event_log import (
-    v1_pb2 as player_event_log_pb2,
-)
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     reconstruction_spot_pb2,
     regular_ranking_pb2,
     score_ranking_pb2,
 )
-from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.player import Player
-from dankagu.models.ranking import SongLeaderboard
 from dankagu.models.storage import PlayerStorageEntry
 from dankagu.services.player_inventory import PlayerInventoryService
 from dankagu.services.ranking import RegularRankingService, ScoreRankingService
@@ -110,7 +105,9 @@ async def second_player() -> Player:
 
 
 @pytest.mark.asyncio
-async def test_regular_ranking_register_and_rank(sample_player: Player, second_player: Player) -> None:
+async def test_regular_ranking_register_and_rank(
+    sample_player: Player, second_player: Player
+) -> None:
     """Test registering song scores, high-score preservation, and dynamic rank updates."""
     ranking_service = RegularRankingService()
     ranking_key = f"stage_test_{uuid.uuid4().hex[:6]}_extra"
@@ -161,7 +158,9 @@ async def test_regular_ranking_register_and_rank(sample_player: Player, second_p
 
 
 @pytest.mark.asyncio
-async def test_regular_ranking_get_top_ranking(sample_player: Player, second_player: Player) -> None:
+async def test_regular_ranking_get_top_ranking(
+    sample_player: Player, second_player: Player
+) -> None:
     """Test fetching paginated top rankings with ordered entries and nicknames."""
     ranking_service = RegularRankingService()
     ranking_key = f"stage_top_{uuid.uuid4().hex[:6]}"
@@ -280,7 +279,9 @@ async def test_reconstruction_spot_receive_prizes(sample_player: Player) -> None
 
     # Verify wallet has +100 free stones
     bal_after = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
-    vc_map_after = {vc.virtual_currency_name: vc.amount for vc in bal_after.total.virtual_currencies}
+    vc_map_after = {
+        vc.virtual_currency_name: vc.amount for vc in bal_after.total.virtual_currencies
+    }
     assert vc_map_after.get("FREE_STONE", 0) == initial_free + 100
 
 
@@ -304,7 +305,6 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     set_current_player(sample_player.id, "token_login")
     system_service = SystemService()
     inv_service = PlayerInventoryService()
-    wallet_service = WalletService()
     ctx = DummyContext()
 
     session_factory = get_sessionmaker()
@@ -324,8 +324,7 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     box_res = await inv_service.GetInventoriesV1(
         player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(), ctx
     )
-    login_gifts_initial = [g for g in box_res.inventories if g.search_label == "LOGIN_BONUS"]
-    initial_login_gift_count = len(login_gifts_initial)
+    assert all(g.search_label != "LOGIN_BONUS" for g in box_res.inventories)
 
     # 2. Simulate login 24 hours later (crossing 04:00 JST)
     future_ts = int(time.time()) + 86400 + 3600
@@ -428,4 +427,3 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
         _, count_f = decode_growth_item(row_f.value)
         # Same source as the mail count above.
         assert count_f == 10000
-

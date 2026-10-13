@@ -14,9 +14,7 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
     """Servicer for OndemandMaster RPCs."""
 
     def __init__(self) -> None:
-        manifest_meta = (
-            settings.data_dir / "metadata" / "AssetUploadV2+v2_1_0_any+g262.json"
-        )
+        manifest_meta = settings.data_dir / "metadata" / "AssetUploadV2+v2_1_0_any+g262.json"
         self._manifest_path = (
             manifest_meta
             if manifest_meta.exists()
@@ -33,6 +31,7 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
             return
 
         import json
+
         from sqlalchemy import select
 
         from dankagu.core.database import get_sessionmaker

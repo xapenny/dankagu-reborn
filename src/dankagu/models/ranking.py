@@ -22,7 +22,9 @@ class SongLeaderboard(Base):
         String(64), ForeignKey("players.id", ondelete="CASCADE"), index=True, nullable=False
     )
     score: Mapped[int] = mapped_column(BigInteger, default=0, index=True, nullable=False)
-    updated_at: Mapped[int] = mapped_column(BigInteger, default=lambda: int(time.time()), nullable=False)
+    updated_at: Mapped[int] = mapped_column(
+        BigInteger, default=lambda: int(time.time()), nullable=False
+    )
 
     def __repr__(self) -> str:
         return (

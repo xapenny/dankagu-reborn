@@ -36,9 +36,7 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            res = await session.execute(
-                select(Player).where(Player.id != current_pid).limit(50)
-            )
+            res = await session.execute(select(Player).where(Player.id != current_pid).limit(50))
             candidates = list(res.scalars().all())
             if candidates:
                 chosen = random.choice(candidates)

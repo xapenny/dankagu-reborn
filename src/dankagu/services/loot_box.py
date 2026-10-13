@@ -7,11 +7,9 @@ import time
 import uuid
 
 import grpc
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import (
     InsufficientFundsError,
@@ -33,6 +31,10 @@ logger = logging.getLogger("dankagu.services.loot_box")
 # Fallback gacha IDs if database cache has not yet initialized
 VALID_GACHA_IDS = {1, 3, 159, 160, 161, 163, 167, 171, 4087, 80001}
 
+# Card handed out when the database holds no gacha rows at all (fresh install / CI),
+# so that a purchase can never fail on an empty candidate pool.
+STARTER_CARD_ID = 100001
+
 # In-memory card pool and banner caches loaded directly from database
 _CARDS_BY_RARITY: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
 _BY_ELEMENT: dict[int, dict[int, list[int]]] = {1: {}, 2: {}, 3: {}}
@@ -45,10 +47,10 @@ async def load_gacha_cache_from_db(session: AsyncSession) -> None:
     """Load card pool and banner configurations from database into memory."""
     global _CARDS_BY_RARITY, _BY_ELEMENT, _BANNERS, _CARDS_BY_ID, _GACHA_CACHE_INITIALIZED
 
-    cards_stmt = select(GachaCard).where(GachaCard.enabled == True)
+    cards_stmt = select(GachaCard).where(GachaCard.enabled)
     cards = (await session.execute(cards_stmt)).scalars().all()
 
-    banners_stmt = select(GachaBanner).where(GachaBanner.enabled == True)
+    banners_stmt = select(GachaBanner).where(GachaBanner.enabled)
     banners = (await session.execute(banners_stmt)).scalars().all()
 
     by_rarity: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
@@ -118,12 +120,14 @@ def _roll_card(
     # 2. Candidate pool for this rarity (respecting element restriction if banner is elemental)
     if elem_filter in (1, 2, 3) and elem_filter in _BY_ELEMENT:
         elem_dict = _BY_ELEMENT[elem_filter]
-        candidate_pool = elem_dict.get(rarity, [])
+        candidate_pool = elem_dict.get(rarity) or []
     else:
-        candidate_pool = _CARDS_BY_RARITY.get(rarity, [])
+        candidate_pool = _CARDS_BY_RARITY.get(rarity) or []
 
     if not candidate_pool:
-        candidate_pool = _CARDS_BY_RARITY.get(2, [100001])
+        # The per-rarity maps exist but may be empty when the database holds no
+        # gacha rows yet (fresh install / CI). Fall back to the common pool.
+        candidate_pool = _CARDS_BY_RARITY.get(2) or []
 
     # 3. Check for pickup cards in this rarity
     rarity_pickups = [
@@ -142,7 +146,15 @@ def _roll_card(
     non_pickups = [cid for cid in candidate_pool if cid not in rarity_pickups]
     if non_pickups:
         return random.choice(non_pickups)
-    return random.choice(candidate_pool)
+    if candidate_pool:
+        return random.choice(candidate_pool)
+
+    # 6. Nothing loaded at all: never crash a purchase on an empty sequence.
+    logger.warning(
+        "Gacha card pool is empty (database not seeded); falling back to starter card %d",
+        STARTER_CARD_ID,
+    )
+    return STARTER_CARD_ID
 
 
 class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
@@ -234,7 +246,9 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         parts = pid.split("_")
         gacha_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 159
         is_ten_pull = "_10_" in pid or request.purchase_num == 10
-        pull_count = request.purchase_num if request.purchase_num > 0 else (10 if is_ten_pull else 1)
+        pull_count = (
+            request.purchase_num if request.purchase_num > 0 else (10 if is_ten_pull else 1)
+        )
         is_pt = (
             "_PT_" in pid
             or request.resource_type == loot_box_pb2.LootBoxV3PurchaseV1.Request.PLAYER_KEY_VALUE
@@ -305,9 +319,8 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             for i in range(pull_count):
                 is_last = i == pull_count - 1
                 is_guaranteed_ssr = (
-                    (is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr)
-                    or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
-                )
+                    is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr
+                ) or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
                 is_guaranteed_sr = (
                     is_last and (is_ten_pull or pull_count == 10) and not is_guaranteed_ssr
                 )

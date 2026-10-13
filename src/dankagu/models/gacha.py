@@ -1,6 +1,6 @@
 """Gacha cards and banners ORM models."""
 
-from sqlalchemy import Boolean, Integer, JSON, String
+from sqlalchemy import JSON, Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from dankagu.core.database import Base

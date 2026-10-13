@@ -72,6 +72,16 @@ async def test_phase5_social_and_fes_player_flow() -> None:
                         level=25,
                         last_login_at=now,
                     ),
+                    # PlayerSearchByPlayerShortIDV1 only publishes accounts that
+                    # finished the tutorial, which the client marks by writing
+                    # PlayerBase--1. Without it Bob would be hidden from search.
+                    PlayerStorageEntry(
+                        player_id=p2_id,
+                        key="PlayerBase--1",
+                        value=b"\x08\x01\x10\x02",
+                        created_at=now,
+                        updated_at=now,
+                    ),
                     PlayerStorageEntry(
                         player_id=p2_id,
                         key="PlayerProfile--1",
@@ -213,9 +223,7 @@ async def test_phase5_myspace_and_photo_album_flow() -> None:
     # 1. Visitor draws a player and likes Creator's MySpace
     tokens_v = set_current_player(p2_id)
     try:
-        draw_resp = await myspace_svc.DrawPlayerV1(
-            my_space_pb2.MySpaceDrawPlayerV1.Request(), ctx
-        )
+        draw_resp = await myspace_svc.DrawPlayerV1(my_space_pb2.MySpaceDrawPlayerV1.Request(), ctx)
         assert draw_resp.player_id != ""
 
         status_before = await myspace_svc.GetPlayerLikeStatusV1(

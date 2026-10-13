@@ -4,7 +4,6 @@ import logging
 
 import grpc
 
-from dankagu.config import settings
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     login_bonus_pb2,

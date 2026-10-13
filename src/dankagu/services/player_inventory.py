@@ -5,6 +5,8 @@ import logging
 import time
 
 import grpc
+from google.protobuf.internal.decoder import _DecodeVarint
+from google.protobuf.internal.encoder import _EncodeVarint
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -18,9 +20,6 @@ from dankagu.core.growth import (
 )
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
-from google.protobuf.internal.decoder import _DecodeVarint
-from google.protobuf.internal.encoder import _EncodeVarint
-
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_inventory_pb2,
@@ -97,7 +96,9 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                 stmt = stmt.where(PlayerInventoryItem.expired_at <= expired_before)
             if expired_after > 0:
                 stmt = stmt.where(PlayerInventoryItem.expired_at >= expired_after)
-            stmt = stmt.order_by(PlayerInventoryItem.created_at.desc(), PlayerInventoryItem.id.asc()).limit(limit)
+            stmt = stmt.order_by(
+                PlayerInventoryItem.created_at.desc(), PlayerInventoryItem.id.asc()
+            ).limit(limit)
             res = await session.execute(stmt)
             items = res.scalars().all()
 

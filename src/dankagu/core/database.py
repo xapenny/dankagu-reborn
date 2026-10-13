@@ -66,39 +66,27 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
-async def init_db() -> None:
-    """Initialize database tables and run lightweight migrations."""
+async def create_all_tables() -> None:
+    """Create any missing table straight from the ORM metadata.
+
+    This is the *legacy* initialisation path: it can create a schema from
+    nothing, but it cannot evolve an existing one. It is kept for the test suite;
+    the server startup path uses the versioned migrations in
+    ``dankagu.db.migrations`` (see ``src/dankagu/db/README.md``).
+    """
     import dankagu.models  # noqa: F401 Ensure all ORM models are registered
 
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Ensure sequence for short_id exists on PostgreSQL
-        try:
-            await conn.execute(text("CREATE SEQUENCE IF NOT EXISTS player_short_id_seq START WITH 1;"))
-        except Exception:
-            pass
+        # Not modelled by the ORM: AuthorizeV3 allocates 8-digit player short ids
+        # from this sequence. The baseline migration creates it for databases that
+        # are migrated instead of created.
+        await conn.execute(text("CREATE SEQUENCE IF NOT EXISTS player_short_id_seq START WITH 1;"))
 
-        # Ensure new player columns exist if running on an existing DB instance
-        for col_def in [
-            "short_id VARCHAR(16)",
-            "nickname VARCHAR(64) DEFAULT ''",
-            "birth_year INTEGER DEFAULT 0",
-            "birth_month INTEGER DEFAULT 0",
-            "consented_tos_version VARCHAR(32) DEFAULT ''",
-        ]:
-            try:
-                await conn.execute(text(f"ALTER TABLE players ADD COLUMN IF NOT EXISTS {col_def};"))
-            except Exception:
-                pass
 
-        try:
-            await conn.execute(
-                text("ALTER TABLE master_announcements ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT FALSE;")
-            )
-        except Exception:
-            pass
-
+async def seed_runtime_data() -> None:
+    """Populate master/gacha rows when their tables are empty (idempotent)."""
     from dankagu.core.gacha_seed import seed_gacha_data_if_empty
     from dankagu.core.master_seed import seed_master_data_if_empty
 
@@ -106,3 +94,14 @@ async def init_db() -> None:
     async with session_factory() as session:
         await seed_gacha_data_if_empty(session)
         await seed_master_data_if_empty(session)
+
+
+async def init_db() -> None:
+    """Create the schema from the ORM models and seed runtime data.
+
+    Kept for the test suite and one-off scripts. Server startup performs the same
+    work in two explicit steps: ``run_migrations()`` (versioned schema) followed
+    by :func:`seed_runtime_data`.
+    """
+    await create_all_tables()
+    await seed_runtime_data()

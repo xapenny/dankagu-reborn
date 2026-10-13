@@ -6,7 +6,6 @@ import time
 import grpc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import InsufficientFundsError, deduct_stones
 from dankagu.core.session import get_current_player_id
@@ -36,6 +35,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
 
         import base64
         import json
+
         from google.protobuf import json_format
         from sqlalchemy import select
 
