@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    ForeignKey,
     Integer,
     LargeBinary,
     String,
@@ -19,7 +20,13 @@ from dankagu.core.database import Base
 
 
 class FriendRelation(Base):
-    """Stores directed follow relationships between players."""
+    """Stores directed follow relationships between players.
+
+    Both columns hold ``players.id``. The foreign keys were added by migration
+    ``0002_friend_relations_normalize`` (they are not part of the pre-Alembic
+    schema described by ``0001_baseline``) and cascade so deleting a player can
+    never leave a dangling relation behind.
+    """
 
     __tablename__ = "friend_relations"
     __table_args__ = (
@@ -27,8 +34,18 @@ class FriendRelation(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    follower_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
-    target_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    follower_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="CASCADE", name="fk_friend_follower"),
+        index=True,
+        nullable=False,
+    )
+    target_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="CASCADE", name="fk_friend_target"),
+        index=True,
+        nullable=False,
+    )
     created_at: Mapped[int] = mapped_column(
         BigInteger, default=lambda: int(time.time()), nullable=False
     )

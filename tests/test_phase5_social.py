@@ -72,6 +72,16 @@ async def test_phase5_social_and_fes_player_flow() -> None:
                         level=25,
                         last_login_at=now,
                     ),
+                    # PlayerSearchByPlayerShortIDV1 only publishes accounts that
+                    # finished the tutorial, which the client marks by writing
+                    # PlayerBase--1. Without it Bob would be hidden from search.
+                    PlayerStorageEntry(
+                        player_id=p2_id,
+                        key="PlayerBase--1",
+                        value=b"\x08\x01\x10\x02",
+                        created_at=now,
+                        updated_at=now,
+                    ),
                     PlayerStorageEntry(
                         player_id=p2_id,
                         key="PlayerProfile--1",
