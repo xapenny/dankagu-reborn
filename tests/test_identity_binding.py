@@ -154,6 +154,71 @@ async def test_sign_out_revokes_the_session_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> None:
+    """A token minted before device binding must not survive a device-bearing refresh.
+
+    Such a token carries no ``deviceHash``, so a copied one would keep working from
+    any device until it expired -- the state the 2026-10-13 incident left behind.
+    """
+    legacy_payload = {
+        "kind": "SIGN_IN_SESSION_TOKEN",
+        "data": {"store": "GUEST", "userId": "legacy-user", "sessionId": str(uuid.uuid4())},
+    }
+    legacy_token = jwt.encode(legacy_payload, settings.require_jwt_secret(), algorithm="HS256")
+
+    async with _client() as client:
+        res = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": f"legacy-device-{uuid.uuid4()}"},
+            json={"signInSessionToken": legacy_token},
+        )
+    assert res.status_code == 401
+    assert res.json()["detail"]["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
+
+
+@pytest.mark.asyncio
+async def test_token_without_a_binding_still_works_when_no_device_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to compare against means the token cannot be judged; keep it working."""
+    async with _client() as client:
+        sign_in = await client.post("/identity/sign-in", json={})
+        assert sign_in.status_code == 200
+        token = sign_in.json()["signInSessionToken"]
+
+        refreshed = await client.post("/auth/user-access-token", json={"signInSessionToken": token})
+    assert refreshed.status_code == 200
+    assert refreshed.json()["userId"] == sign_in.json()["user"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_rotating_the_signing_secret_invalidates_every_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The only lever that revokes a stateless LCX token: rotate the secret."""
+    async with _client() as client:
+        sign_in = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": f"rotate-{uuid.uuid4()}"}
+        )
+        token = sign_in.json()["signInSessionToken"]
+        victim_user = sign_in.json()["user"]["id"]
+
+    monkeypatch.setattr(
+        settings, "jwt_secret", "rotated-secret-that-nobody-holds-yet", raising=False
+    )
+
+    async with _client() as client:
+        res = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": f"rotate-{uuid.uuid4()}"},
+            json={"signInSessionToken": token},
+        )
+    # The old token no longer proves an identity, so it cannot reach that account.
+    assert res.status_code == 200
+    assert res.json()["userId"] != victim_user
+
+
+@pytest.mark.asyncio
 async def test_shared_device_identifier_is_ignored() -> None:
     """The old global `storeAccountIdHash` constant must not identify a device."""
     shared = "dankagu-local-account-hash"

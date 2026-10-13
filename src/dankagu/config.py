@@ -106,6 +106,12 @@ class Settings(BaseSettings):
     #: false so a new device always gets the registration flow and a copied token
     #: cannot walk into somebody else's account.
     reuse_device_account_when_onboarded: bool = False
+    #: When true, a session token that records no device binding is rejected as soon
+    #: as the request carries a device identifier. Tokens issued before device
+    #: binding existed (2026-10-13) therefore stop working on a real client and the
+    #: player signs in once more. Set it to false only while migrating a client that
+    #: legitimately refreshes without any device information.
+    require_device_bound_tokens: bool = True
 
     # Database
     db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"
