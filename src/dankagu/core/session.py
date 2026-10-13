@@ -143,3 +143,28 @@ def invalidate_player_sessions(player_id: str) -> None:
     stale = [tok for tok, (p_id, _, _) in _session_cache.items() if p_id == player_id]
     for tok in stale:
         _session_cache.pop(tok, None)
+
+
+async def revoke_player_sessions(player_id: str) -> int:
+    """Delete every stored session for a player and drop them from the cache.
+
+    Used when the account changes hands (an account transfer) or is closed: the
+    old device must lose access immediately, not when its token happens to expire.
+
+    Returns:
+        int: number of stored sessions that were revoked.
+    """
+    invalidate_player_sessions(player_id)
+    revoked = 0
+    try:
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            result = await session.execute(delete(Session).where(Session.player_id == player_id))
+            await session.commit()
+            revoked = int(result.rowcount or 0)
+    except Exception as exc:
+        logger.error("Failed to revoke sessions for player %s: %s", player_id, exc)
+        raise
+    if revoked:
+        logger.info("🚪 Revoked %d session(s) for player %s", revoked, player_id)
+    return revoked

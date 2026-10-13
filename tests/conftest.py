@@ -16,7 +16,7 @@ import pytest_asyncio
 os.environ.setdefault("DANKAGU_JWT_SECRET", "test-suite-jwt-secret-not-for-production")
 
 from dankagu.config import settings
-from dankagu.core.database import init_db, reset_engine
+from dankagu.core.database import Base, get_engine, init_db, reset_engine
 
 # Ensure test suite always uses 'dankagu_test' instead of production 'dankagu'
 if "DANKAGU_TEST_PG_URL" in os.environ:
@@ -30,9 +30,30 @@ else:
 os.environ.setdefault("DANKAGU_TEST_PG_URL", settings.db_url)
 
 
+#: The ORM schema is rebuilt once per pytest process (see ``_rebuild_schema``).
+_SCHEMA_SYNCED = False
+
+
+async def _rebuild_schema() -> None:
+    """Drop and recreate every table once per run so the schema matches the models.
+
+    ``init_db()`` only creates *missing* tables. A model change — a new column, or a
+    changed ``ondelete`` clause — therefore left the old shape in place and the suite
+    happily validated a schema production no longer had (an ``ON DELETE CASCADE``
+    that had become ``SET NULL``, for example). The Alembic migrations remain the
+    production source of truth and are covered by ``tests/test_db_migrations.py``,
+    which runs on its own scratch database.
+    """
+    engine = get_engine()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+        await connection.run_sync(Base.metadata.create_all)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGenerator[None, None]:
     """Ensure database tables exist before test, and clean up test data afterwards."""
+    global _SCHEMA_SYNCED
     reset_engine()
     clean_url = settings.db_url.replace("postgresql+asyncpg://", "postgresql://")
     try:
@@ -44,6 +65,9 @@ async def initialize_test_database(request: pytest.FixtureRequest) -> AsyncGener
             sys_conn = await asyncpg.connect(base_url, timeout=2.0)
             await sys_conn.execute("CREATE DATABASE dankagu_test;")
             await sys_conn.close()
+        if not _SCHEMA_SYNCED:
+            await _rebuild_schema()
+            _SCHEMA_SYNCED = True
         await init_db()
     except Exception as e:
         # If DB connection failed, skip tests that need database

@@ -10,12 +10,16 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_db_session
 from dankagu.core.identity import normalise_device_account, resolve_or_create_player
-from dankagu.core.session import invalidate_player_sessions, invalidate_session
+from dankagu.core.session import (
+    invalidate_player_sessions,
+    invalidate_session,
+    revoke_player_sessions,
+)
 from dankagu.core.transfer import (
     generate_transfer_id,
     generate_transfer_password,
@@ -158,7 +162,7 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         request_device = normalise_device_account(device_account)
         if bound_device and request_device and bound_device != request_device:
             logger.warning(
-                "🔒 [Auth] Rejected token issued to device %r presented from %r",
+                "馃敀 [Auth] Rejected token issued to device %r presented from %r",
                 bound_device,
                 request_device,
             )
@@ -170,7 +174,7 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 },
             )
     elif presented_token:
-        logger.warning("🔒 [Auth] Ignoring unverifiable token presented by the client")
+        logger.warning("馃敀 [Auth] Ignoring unverifiable token presented by the client")
 
     player, _matched_by = await resolve_or_create_player(
         db, user_id=user_id, device_account=device_account
@@ -333,14 +337,26 @@ async def post_transfer_execute(
             },
         )
 
-    stmt = select(AccountTransfer).where(
-        AccountTransfer.transfer_id == transfer_id,
-        AccountTransfer.is_used.is_(False),
-    )
+    stmt = select(AccountTransfer).where(AccountTransfer.transfer_id == transfer_id)
     res = await db.execute(stmt)
     transfer = res.scalars().first()
 
-    if transfer is None or not verify_transfer_password(password, transfer.password_hash):
+    # Diagnostics matter here: the client shows one generic string for every
+    # failure, so the server has to say *which* one happened or an operator is
+    # left guessing (see docs/AUTH_IDENTITY_FIX_PLAN.md, transfer section).
+    if transfer is None:
+        logger.warning("馃帿 [Transfer] Unknown transfer id %r", transfer_id)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "LCX_TRANSFER_ID_NOT_FOUND",
+                "message": "Transfer ID not found",
+            },
+        )
+
+    if not verify_transfer_password(password, transfer.password_hash):
+        # Keep the client's familiar string for the one failure a player can fix.
+        logger.warning("馃帿 [Transfer] Wrong password for transfer id %r", transfer_id)
         return JSONResponse(
             status_code=400,
             content={
@@ -349,7 +365,31 @@ async def post_transfer_execute(
             },
         )
 
+    if transfer.player_id is None:
+        # The account was deleted after the code was issued. The row survives (FK is
+        # ON DELETE SET NULL, and deactivation detaches it) so we can say so instead
+        # of pretending the player mistyped a correct code.
+        logger.warning("馃帿 [Transfer] Transfer id %r points at a deleted account", transfer_id)
+        return JSONResponse(
+            status_code=404,
+            content={
+                "code": "LCX_TRANSFER_SOURCE_ACCOUNT_DELETED",
+                "message": "The account this transfer ID belongs to no longer exists",
+            },
+        )
+
+    if transfer.is_used:
+        logger.warning("馃帿 [Transfer] Transfer id %r was already used", transfer_id)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "LCX_TRANSFER_ID_ALREADY_USED",
+                "message": "Transfer ID has already been used",
+            },
+        )
+
     if transfer.expires_at < now:
+        logger.warning("馃帿 [Transfer] Transfer id %r expired", transfer_id)
         return JSONResponse(
             status_code=400,
             content={
@@ -358,11 +398,13 @@ async def post_transfer_execute(
             },
         )
 
-    # Transfer succeeds: mark used
-    transfer.is_used = True
-
     target_player = await db.get(Player, transfer.player_id)
     if target_player is None:
+        logger.warning(
+            "馃帿 [Transfer] Transfer id %r references missing player %s",
+            transfer_id,
+            transfer.player_id,
+        )
         return JSONResponse(
             status_code=404,
             content={
@@ -370,6 +412,9 @@ async def post_transfer_execute(
                 "message": "Target player not found",
             },
         )
+
+    # Transfer succeeds: single use.
+    transfer.is_used = True
 
     device_account = normalise_device_account(
         request.headers.get("deviceAccount")
@@ -380,6 +425,17 @@ async def post_transfer_execute(
         target_player.device_account = device_account
 
     await db.commit()
+
+    # The account now lives on the new device: every session the old device held
+    # must stop working, otherwise the transfer leaves two live devices behind.
+    revoked = await revoke_player_sessions(target_player.id)
+    logger.info(
+        "馃帿 [Transfer] id=%s moved player=%s to device=%r, revoked %d session(s)",
+        transfer_id,
+        target_player.id,
+        device_account,
+        revoked,
+    )
 
     tokens = generate_lcx_tokens(
         target_player.user_id, target_player.registered_at, device_hash=device_account
@@ -457,7 +513,7 @@ async def post_sign_out(request: Request) -> Response:
 
     if token:
         await invalidate_session(token)
-        logger.info("🚪 [Auth] Signed out and revoked session token")
+        logger.info("馃毆 [Auth] Signed out and revoked session token")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -498,14 +554,22 @@ async def post_deactivate_user(
     # enforce ON DELETE CASCADE unless the pragma is on.
     await db.execute(delete(PlayerStorageEntry).where(PlayerStorageEntry.player_id == pid))
     await db.execute(delete(Session).where(Session.player_id == pid))
-    await db.execute(delete(AccountTransfer).where(AccountTransfer.player_id == pid))
+    # Transfer codes are detached and revoked instead of deleted: an issued code
+    # must not vanish silently behind "transfer ID or password is wrong" when the
+    # player tries to use it after the account is gone (2026-10-13 report). A
+    # detached, revoked row can never restore anything.
+    await db.execute(
+        update(AccountTransfer)
+        .where(AccountTransfer.player_id == pid)
+        .values(player_id=None, is_used=True)
+    )
     await db.execute(delete(WalletBalance).where(WalletBalance.player_id == pid))
     await db.execute(delete(PlayerInventoryItem).where(PlayerInventoryItem.player_id == pid))
     await db.execute(delete(Player).where(Player.id == pid))
     await db.commit()
     invalidate_player_sessions(pid)
 
-    logger.info("🗑️  Deleted account player_id=%s user_id=%s", pid, player.user_id)
+    logger.info("馃棏锔? Deleted account player_id=%s user_id=%s", pid, player.user_id)
     return {"success": True}
 
 
@@ -553,10 +617,10 @@ async def post_analytics_event(request: Request) -> Response:
         if body.startswith(b"\x1f\x8b"):
             decompressed = gzip.decompress(body)
             logger.info(
-                "📊 [Analytics Event (gzip)] %s", decompressed.decode("utf-8", errors="replace")
+                "馃搳 [Analytics Event (gzip)] %s", decompressed.decode("utf-8", errors="replace")
             )
         elif body:
-            logger.info("📊 [Analytics Event] %s", body.decode("utf-8", errors="replace"))
+            logger.info("馃搳 [Analytics Event] %s", body.decode("utf-8", errors="replace"))
     except Exception as exc:
         logger.debug("Failed to decompress analytics event: %s", exc)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -603,14 +667,14 @@ async def post_sdk_log(request: Request) -> SdkLogResponse:
         encoding = request.headers.get("content-encoding", "")
         text = _decode_sdk_body(body, encoding)
         logger.warning(
-            "📥 [SDK Log] %d bytes (encoding=%r) from %s\n%s",
+            "馃摜 [SDK Log] %d bytes (encoding=%r) from %s\n%s",
             len(body),
             encoding or "identity",
             request.client.host if request.client else "?",
             text,
         )
     except Exception as exc:  # never fail the upload
-        logger.warning("📥 [SDK Log] could not read body: %s", exc)
+        logger.warning("馃摜 [SDK Log] could not read body: %s", exc)
     return SdkLogResponse()
 
 
