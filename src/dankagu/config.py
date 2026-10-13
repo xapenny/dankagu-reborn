@@ -101,11 +101,17 @@ class Settings(BaseSettings):
     #: Lifetime of the LCX ``signInSessionToken`` in seconds
     #: (``DANKAGU_SIGN_IN_SESSION_TTL_SECONDS``, default 7 days).
     sign_in_session_ttl_seconds: int = 86400 * 7
-    #: When true, matching an *already onboarded* account by ``device_account``
-    #: alone re-attaches the request to that account (the old behaviour). Keep it
-    #: false so a new device always gets the registration flow and a copied token
-    #: cannot walk into somebody else's account.
-    reuse_device_account_when_onboarded: bool = False
+    #: When true (default), a request that carries no token and matches an *already
+    #: onboarded* account by ``device_account`` re-attaches to that account — the
+    #: behaviour a device that reinstalls expects, and the only way such a player gets
+    #: their save back without a transfer code.
+    #:
+    #: Set it to false to force the registration flow on every device: a device match
+    #: then creates a fresh player instead, which also means an account that has been
+    #: onboarded can no longer be reached by device alone. The 2026-10-13 "two devices,
+    #: one account" report was caused by a *token* being reused across devices, which
+    #: is refused regardless of this setting (see ``lcx.router`` device binding).
+    reuse_device_account_when_onboarded: bool = True
     #: When true, a session token that records no device binding is rejected as soon
     #: as the request carries a device identifier. Tokens issued before device
     #: binding existed (2026-10-13) therefore stop working on a real client and the

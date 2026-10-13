@@ -104,28 +104,54 @@ async def test_forged_token_cannot_claim_an_existing_account() -> None:
     assert res.json()["userId"] != victim_user_id
 
 
-@pytest.mark.asyncio
-async def test_onboarded_account_is_not_reused_by_device_alone() -> None:
-    """Once an account is onboarded, a bare device match registers a new player."""
-    device = f"onboarded-{uuid.uuid4()}"
-
+async def _onboarded_device(device: str) -> str:
+    """Create an account on ``device`` and mark it onboarded; return its user id."""
     async with _client() as client:
         first = await client.post("/identity/sign-in", headers={"deviceAccount": device})
         assert first.status_code == 200
-        first_user_id = first.json()["user"]["id"]
+        user_id = first.json()["user"]["id"]
 
-        # Mark the account as onboarded (what SetPreferenceV1 does in the client).
-        async with get_sessionmaker()() as session:
-            player = (
-                await session.execute(select(Player).where(Player.user_id == first_user_id))
-            ).scalar_one()
-            player.nickname = "onboarded"
-            player.consented_tos_version = "v1"
-            await session.commit()
+    # What SetPreferenceV1 does when the client finishes the onboarding questions.
+    async with get_sessionmaker()() as session:
+        player = (
+            await session.execute(select(Player).where(Player.user_id == user_id))
+        ).scalar_one()
+        player.nickname = "onboarded"
+        player.consented_tos_version = "v1"
+        await session.commit()
+    return user_id
 
+
+@pytest.mark.asyncio
+async def test_a_reinstalled_device_gets_its_own_account_back() -> None:
+    """No token, same device: the account that device already owns must be reused.
+
+    This is the default. Creating a fresh account here would strand a player who
+    reinstalled, because the old account could then only be reached with a transfer
+    code they no longer have.
+    """
+    device = f"reinstall-{uuid.uuid4()}"
+    user_id = await _onboarded_device(device)
+
+    async with _client() as client:
+        again = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+    assert again.status_code == 200
+    assert again.json()["user"]["id"] == user_id
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_registers_a_new_player_for_an_onboarded_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DANKAGU_REUSE_DEVICE_ACCOUNT_WHEN_ONBOARDED=false`` forces the flow."""
+    device = f"strict-{uuid.uuid4()}"
+    user_id = await _onboarded_device(device)
+    monkeypatch.setattr(settings, "reuse_device_account_when_onboarded", False, raising=False)
+
+    async with _client() as client:
         second = await client.post("/identity/sign-in", headers={"deviceAccount": device})
     assert second.status_code == 200
-    assert second.json()["user"]["id"] != first_user_id
+    assert second.json()["user"]["id"] != user_id
 
 
 @pytest.mark.asyncio
