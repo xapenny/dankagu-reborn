@@ -5,9 +5,11 @@ import logging
 import random
 import time
 import uuid
+from dataclasses import dataclass
 
 import grpc
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
@@ -20,11 +22,14 @@ from dankagu.core.economy import (
 )
 from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
+from dankagu.grpc.errors import fail_internal_on_error
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     loot_box_pb2,
     loot_box_pb2_grpc,
 )
 from dankagu.models.gacha import GachaBanner, GachaCard
+from dankagu.models.master import MasterLootBoxProduct
+from dankagu.models.receipt import PurchaseReceipt
 
 logger = logging.getLogger("dankagu.services.loot_box")
 
@@ -157,6 +162,64 @@ def _roll_card(
     return STARTER_CARD_ID
 
 
+@dataclass(frozen=True)
+class MasterPrice:
+    """Price of a loot box product as the master data describes it."""
+
+    pull_count: int = 0
+    stone_cost: int = 0
+    point_cost: int = 0
+    resource_label: str = ""
+
+
+async def _master_price(session: AsyncSession, product_id: str) -> MasterPrice | None:
+    """Read the authoritative price for ``product_id`` from master data.
+
+    Master only carries a usable number for some products: ``G_1_10_TT_L`` consumes
+    the ``tutorial`` key with amount ``-1`` (a ticket, not a price), while
+    ``G_3_10_VC_L`` states ``1500``. Products the client asks for that are absent
+    (``G_159_*``, for instance) stay on the built-in heuristic; inventing a price for
+    them here would be worse than leaving the status quo in place.
+    """
+    row = await session.get(MasterLootBoxProduct, product_id)
+    if row is None or not isinstance(row.data, dict):
+        return None
+
+    product = row.data.get("lootProduct")
+    if not isinstance(product, dict):
+        product = row.data
+
+    raw_pull_count = product.get("totalLotNum")
+    try:
+        pull_count = int(raw_pull_count) if raw_pull_count is not None else 0
+    except (TypeError, ValueError):
+        pull_count = 0
+
+    resource_sets = product.get("consumeResourceSets") or []
+    if not isinstance(resource_sets, list) or not resource_sets:
+        return MasterPrice(pull_count=pull_count)
+
+    first = resource_sets[0] if isinstance(resource_sets[0], dict) else {}
+    resource_type = first.get("resourceType")
+    try:
+        amount = int(first.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+
+    if amount <= 0:
+        # A non-positive amount is not a price (the tutorial key uses -1); report it
+        # as "no charge" and let the caller log exactly what master said.
+        return MasterPrice(pull_count=pull_count, resource_label=str(resource_type))
+
+    if resource_type == "PLAYER_KEY_VALUE":
+        return MasterPrice(
+            pull_count=pull_count, point_cost=amount, resource_label="PLAYER_KEY_VALUE"
+        )
+    return MasterPrice(
+        pull_count=pull_count, stone_cost=amount, resource_label=str(resource_type or "VC")
+    )
+
+
 class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
     """Servicer for LootBox V3 gacha banners."""
 
@@ -231,6 +294,7 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         response.next_page_token = ""
         return response
 
+    @fail_internal_on_error("Failed to complete a loot box purchase")
     async def PurchaseV1(
         self,
         request: loot_box_pb2.LootBoxV3PurchaseV1.Request,
@@ -259,77 +323,166 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         point_cost = (5 * pull_count) if is_pt else 0
         now = int(time.time())
 
-        logger.info(
-            "🎁 [LootBox] PurchaseV1 player=%s product=%s (gacha=%d, count=%d, stone_cost=%d, pt_cost=%d, tx=%s)",
-            current_pid,
-            pid,
-            gacha_id,
-            pull_count,
-            stone_cost,
-            point_cost,
-            request.transaction_id,
-        )
-
         point_remaining: int | None = None
         # Atomic currency handling and card persistence
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             await ensure_gacha_cache_loaded(session)
 
-            if stone_cost > 0:
-                try:
-                    free_remaining, paid_remaining = await deduct_stones(
-                        session, current_pid, stone_cost
+            # Master data is authoritative where it actually carries a price: the
+            # heuristic above priced the tutorial ten-pull (``G_1_10_TT_L``) as 1500
+            # stones although master says it consumes the ``tutorial`` key, and its
+            # default gacha id 159 is not a product that exists at all.
+            master_price = await _master_price(session, pid)
+            if master_price is not None:
+                pull_count = master_price.pull_count or pull_count
+                if master_price.stone_cost:
+                    stone_cost, point_cost, is_vc, is_pt = master_price.stone_cost, 0, True, False
+                elif master_price.point_cost:
+                    stone_cost, point_cost, is_vc, is_pt = 0, master_price.point_cost, False, True
+                else:
+                    # Master describes a ticket/key consumption here, not a price
+                    # (``G_1_10_TT_L`` consumes the ``tutorial`` key with amount -1).
+                    # Charging nothing would hand out free ten-pulls, so keep the
+                    # built-in price and say exactly what master declared.
+                    logger.warning(
+                        "🎁 [LootBox] master lists %s as consuming %s with no numeric price; "
+                        "keeping the built-in price (stone=%d, pt=%d)",
+                        pid,
+                        master_price.resource_label,
+                        stone_cost,
+                        point_cost,
                     )
-                except InsufficientFundsError as err:
-                    logger.warning("🎁 [LootBox] Insufficient funds for %s: %s", current_pid, err)
-                    await context.abort(
-                        grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient virtual currencies"
-                    )
-                    return loot_box_pb2.LootBoxV3PurchaseV1.Response()
             else:
+                logger.warning(
+                    "🎁 [LootBox] %s is absent from master_loot_box_products; "
+                    "pricing it with the built-in heuristic",
+                    pid,
+                )
+
+            logger.info(
+                "🎁 [LootBox] PurchaseV1 player=%s product=%s (gacha=%d, count=%d, "
+                "stone_cost=%d, pt_cost=%d, tx=%s)",
+                current_pid,
+                pid,
+                gacha_id,
+                pull_count,
+                stone_cost,
+                point_cost,
+                request.transaction_id,
+            )
+
+            # Idempotency gate: the first delivery of a transaction owns the purchase,
+            # every later one replays it. Without this a client retry charges again
+            # and rolls a second set of cards for one pull.
+            transaction_id = (request.transaction_id or "").strip()
+            replayed = False
+            drawn_cards: list[int] = []
+            if transaction_id:
+                inserted = await session.execute(
+                    pg_insert(PurchaseReceipt)
+                    .values(
+                        player_id=current_pid,
+                        transaction_id=transaction_id,
+                        product_id=pid,
+                        card_ids="[]",
+                        created_at=now,
+                    )
+                    .on_conflict_do_nothing(index_elements=["player_id", "transaction_id"])
+                )
+                if not inserted.rowcount:
+                    replayed = True
+                    stored = await session.get(PurchaseReceipt, (current_pid, transaction_id))
+                    if stored is not None and stored.card_ids:
+                        drawn_cards = [int(card) for card in json.loads(stored.card_ids)]
+                    logger.info(
+                        "🎁 [LootBox] transaction %s was already accepted; replaying %d card(s) "
+                        "without charging",
+                        transaction_id,
+                        len(drawn_cards),
+                    )
+            else:
+                logger.warning(
+                    "🎁 [LootBox] purchase without a transaction_id for player %s; "
+                    "it cannot be deduplicated",
+                    current_pid,
+                )
+
+            if replayed:
                 wallet = await get_or_create_wallet(session, current_pid)
                 free_remaining, paid_remaining = wallet.free_stones, wallet.paid_stones
-
-            if point_cost > 0:
-                try:
-                    point_remaining = await deduct_player_key_value(
-                        session, current_pid, "point", point_cost, default=8612
-                    )
-                except InsufficientFundsError as err:
-                    logger.warning("🎁 [LootBox] Insufficient points for %s: %s", current_pid, err)
-                    await context.abort(
-                        grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient dream points"
-                    )
-                    return loot_box_pb2.LootBoxV3PurchaseV1.Response()
-            else:
                 point_remaining = await get_player_key_value(
                     session, current_pid, "point", default=8612
                 )
+            else:
+                if stone_cost > 0:
+                    try:
+                        free_remaining, paid_remaining = await deduct_stones(
+                            session, current_pid, stone_cost
+                        )
+                    except InsufficientFundsError as err:
+                        logger.warning(
+                            "🎁 [LootBox] Insufficient funds for %s: %s", current_pid, err
+                        )
+                        await context.abort(
+                            grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient virtual currencies"
+                        )
+                        return loot_box_pb2.LootBoxV3PurchaseV1.Response()
+                else:
+                    wallet = await get_or_create_wallet(session, current_pid)
+                    free_remaining, paid_remaining = wallet.free_stones, wallet.paid_stones
 
-            banner = await session.get(GachaBanner, gacha_id)
-            has_guaranteed_ssr = (
-                (banner.guaranteed_ssr if banner else False)
-                or gacha_id in (1, 3, 163, 167, 171)
-                or "SSR" in pid
-                or "ssrGachaTicket" in pid
-            )
+                if point_cost > 0:
+                    try:
+                        point_remaining = await deduct_player_key_value(
+                            session, current_pid, "point", point_cost, default=8612
+                        )
+                    except InsufficientFundsError as err:
+                        logger.warning(
+                            "🎁 [LootBox] Insufficient points for %s: %s", current_pid, err
+                        )
+                        await context.abort(
+                            grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient dream points"
+                        )
+                        return loot_box_pb2.LootBoxV3PurchaseV1.Response()
+                else:
+                    point_remaining = await get_player_key_value(
+                        session, current_pid, "point", default=8612
+                    )
 
-            drawn_cards: list[int] = []
-            for i in range(pull_count):
-                is_last = i == pull_count - 1
-                is_guaranteed_ssr = (
-                    is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr
-                ) or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
-                is_guaranteed_sr = (
-                    is_last and (is_ten_pull or pull_count == 10) and not is_guaranteed_ssr
+                banner = await session.get(GachaBanner, gacha_id)
+                has_guaranteed_ssr = (
+                    (banner.guaranteed_ssr if banner else False)
+                    or gacha_id in (1, 3, 163, 167, 171)
+                    or "SSR" in pid
+                    or "ssrGachaTicket" in pid
                 )
-                card_id = _roll_card(
-                    gacha_id,
-                    is_guaranteed_sr=is_guaranteed_sr,
-                    is_guaranteed_ssr=is_guaranteed_ssr,
-                )
-                drawn_cards.append(card_id)
+
+                for i in range(pull_count):
+                    is_last = i == pull_count - 1
+                    is_guaranteed_ssr = (
+                        is_last and (is_ten_pull or pull_count == 10) and has_guaranteed_ssr
+                    ) or ("ssrGachaTicket" in pid or "pickupSsrGachaTicket" in pid)
+                    is_guaranteed_sr = (
+                        is_last and (is_ten_pull or pull_count == 10) and not is_guaranteed_ssr
+                    )
+                    card_id = _roll_card(
+                        gacha_id,
+                        is_guaranteed_sr=is_guaranteed_sr,
+                        is_guaranteed_ssr=is_guaranteed_ssr,
+                    )
+                    drawn_cards.append(card_id)
+
+                if transaction_id:
+                    # Same transaction as the charge: a crash leaves neither behind.
+                    await session.execute(
+                        update(PurchaseReceipt)
+                        .where(
+                            PurchaseReceipt.player_id == current_pid,
+                            PurchaseReceipt.transaction_id == transaction_id,
+                        )
+                        .values(card_ids=json.dumps(drawn_cards))
+                    )
 
             await session.commit()
 

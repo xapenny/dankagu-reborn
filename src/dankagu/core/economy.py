@@ -20,8 +20,31 @@ class CorruptedPlayerValueError(Exception):
     """Raised when a stored player value exists but cannot be decoded."""
 
 
-async def get_or_create_wallet(session: AsyncSession, player_id: str) -> WalletBalance:
-    """Fetch player's WalletBalance or create a seeded default if non-existent."""
+async def get_or_create_wallet(
+    session: AsyncSession, player_id: str, *, for_update: bool = False
+) -> WalletBalance:
+    """Fetch player's WalletBalance or create a seeded default if non-existent.
+
+    ``for_update=True`` takes a row lock, which the spend paths need: reading the
+    balance and writing it back without a lock lets two concurrent purchases both
+    pass the funds check and both write, so one of them is effectively free.
+    """
+    wallet: WalletBalance | None = None
+    if for_update:
+        wallet = (
+            (
+                await session.execute(
+                    select(WalletBalance)
+                    .where(WalletBalance.player_id == player_id)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if wallet is not None:
+            return wallet
+
     wallet = await session.get(WalletBalance, player_id)
     if wallet is None:
         wallet = WalletBalance(
@@ -50,7 +73,7 @@ async def deduct_stones(
     Raises:
         InsufficientFundsError: if total balance is insufficient.
     """
-    wallet = await get_or_create_wallet(session, player_id)
+    wallet = await get_or_create_wallet(session, player_id, for_update=True)
     total_available = wallet.free_stones + (wallet.paid_stones if allow_paid else 0)
 
     if total_available < cost:
@@ -88,7 +111,7 @@ async def add_stones(
     Returns:
         tuple[int, int]: (new_free_stones, new_paid_stones)
     """
-    wallet = await get_or_create_wallet(session, player_id)
+    wallet = await get_or_create_wallet(session, player_id, for_update=True)
     wallet.free_stones += free_amount
     wallet.paid_stones += paid_amount
     wallet.updated_at = int(time.time())
@@ -318,15 +341,36 @@ async def get_player_key_value(
     player_id: str,
     key: str,
     default: int = 0,
+    *,
+    for_update: bool = False,
 ) -> int:
     """Retrieve player key value (e.g. points, tickets) from PlayerStorage.
 
     A value that is present but unreadable raises instead of silently falling back
     to ``default``: pretending a corrupted balance is 0 (or 8612 points) is how a
     player's currency appears to vanish — or is handed to them for free.
+
+    ``for_update=True`` locks the row so a spend cannot race another spend.
     """
     storage_key = f"PlayerKeyValue:{key}"
-    entry = await session.get(PlayerStorageEntry, (player_id, storage_key))
+    entry: PlayerStorageEntry | None
+    if for_update:
+        entry = (
+            (
+                await session.execute(
+                    select(PlayerStorageEntry)
+                    .where(
+                        PlayerStorageEntry.player_id == player_id,
+                        PlayerStorageEntry.key == storage_key,
+                    )
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .first()
+        )
+    else:
+        entry = await session.get(PlayerStorageEntry, (player_id, storage_key))
     if entry and entry.value:
         try:
             return int(entry.value.decode("utf-8"))
@@ -351,8 +395,12 @@ async def deduct_player_key_value(
     amount: int,
     default: int = 0,
 ) -> int:
-    """Atomically deduct amount from a player key value (e.g. points)."""
-    current = await get_player_key_value(session, player_id, key, default=default)
+    """Atomically deduct amount from a player key value (e.g. points).
+
+    The row is locked before it is read, so two concurrent spends cannot both see
+    the old balance and both write it back (which would make one of them free).
+    """
+    current = await get_player_key_value(session, player_id, key, default=default, for_update=True)
     if current < amount:
         raise InsufficientFundsError(f"Insufficient {key}: has {current}, requires {amount}")
     new_val = current - amount
