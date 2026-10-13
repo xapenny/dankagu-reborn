@@ -124,12 +124,13 @@ async def _onboarded_device(device: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_reinstalled_device_gets_its_own_account_back() -> None:
-    """No token, same device: the account that device already owns must be reused.
+async def test_a_reinstall_without_a_token_registers_a_new_account() -> None:
+    """A device match on an onboarded account must not hand it over.
 
-    This is the default. Creating a fresh account here would strand a player who
-    reinstalled, because the old account could then only be reached with a transfer
-    code they no longer have.
+    The identifier cannot carry that meaning: on the shipped Android build every
+    install reports the same value, and on iOS it is genuine. So the default is to
+    register a new account -- the player gets the registration flow, and their old
+    account stays theirs, reachable with the token they kept or a transfer code.
     """
     device = f"reinstall-{uuid.uuid4()}"
     user_id = await _onboarded_device(device)
@@ -137,22 +138,36 @@ async def test_a_reinstalled_device_gets_its_own_account_back() -> None:
     async with _client() as client:
         again = await client.post("/identity/sign-in", headers={"deviceAccount": device})
     assert again.status_code == 200
-    assert again.json()["user"]["id"] == user_id
+    assert again.json()["user"]["id"] != user_id
 
 
 @pytest.mark.asyncio
-async def test_strict_mode_registers_a_new_player_for_an_onboarded_device(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``DANKAGU_REUSE_DEVICE_ACCOUNT_WHEN_ONBOARDED=false`` forces the flow."""
-    device = f"strict-{uuid.uuid4()}"
-    user_id = await _onboarded_device(device)
-    monkeypatch.setattr(settings, "reuse_device_account_when_onboarded", False, raising=False)
+async def test_an_abandoned_registration_is_reused() -> None:
+    """The hint is still honoured while the account has not been onboarded."""
+    device = f"abandoned-{uuid.uuid4()}"
 
     async with _client() as client:
+        first = await client.post("/identity/sign-in", headers={"deviceAccount": device})
         second = await client.post("/identity/sign-in", headers={"deviceAccount": device})
-    assert second.status_code == 200
-    assert second.json()["user"]["id"] != user_id
+
+    assert first.status_code == 200 and second.status_code == 200
+    # Nothing was ever entered for it, so reusing it costs nobody anything.
+    assert first.json()["user"]["id"] == second.json()["user"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_behaviour_can_still_be_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DANKAGU_REUSE_DEVICE_ACCOUNT_WHEN_ONBOARDED=true`` restores the old reuse."""
+    device = f"legacy-reuse-{uuid.uuid4()}"
+    user_id = await _onboarded_device(device)
+    monkeypatch.setattr(settings, "reuse_device_account_when_onboarded", True, raising=False)
+
+    async with _client() as client:
+        again = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+    assert again.status_code == 200
+    assert again.json()["user"]["id"] == user_id
 
 
 @pytest.mark.asyncio
