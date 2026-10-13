@@ -357,3 +357,22 @@ async def test_game_product_purchase_continue(sample_player: Player) -> None:
         )
         assert saved_entry is not None
         assert saved_entry.value == b"\x08\x01\x10\x64"
+
+
+def test_roll_card_survives_empty_gacha_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: an unseeded database must not crash a roll.
+
+    ``_CARDS_BY_RARITY`` is initialised with empty lists, so the ``.get(2, [...])``
+    fallback used to hand back an empty pool and ``random.choice([])`` raised
+    IndexError (seen on CI, where the database holds no gacha rows).
+    """
+    from dankagu.services import loot_box as lb
+
+    monkeypatch.setattr(lb, "_CARDS_BY_RARITY", {1: [], 2: [], 3: [], 4: []})
+    monkeypatch.setattr(lb, "_BY_ELEMENT", {1: {}, 2: {}, 3: {}})
+    monkeypatch.setattr(lb, "_CARDS_BY_ID", {})
+    monkeypatch.setattr(lb, "_BANNERS", {})
+
+    # guaranteed SSR and a plain roll both have to survive the empty pool
+    assert lb._roll_card(159, is_guaranteed_ssr=True) == lb.STARTER_CARD_ID
+    assert lb._roll_card(159) == lb.STARTER_CARD_ID
