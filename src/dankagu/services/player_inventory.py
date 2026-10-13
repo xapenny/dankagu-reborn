@@ -21,6 +21,7 @@ from dankagu.core.growth import (
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
+from dankagu.grpc.errors import fail_internal, fail_internal_on_error
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_inventory_pb2,
     player_inventory_pb2_grpc,
@@ -232,6 +233,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         return response
 
+    @fail_internal_on_error("Failed to claim mailbox items")
     async def ReceiveV1(
         self,
         request: player_inventory_pb2.PlayerInventoryReceiveV1.Request,
@@ -296,8 +298,17 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                     parsed: dict = {}
                     try:
                         parsed = json.loads(item.value.decode("utf-8"))
-                    except Exception:
-                        parsed = {}
+                    except Exception as exc:
+                        # Refuse to guess. The previous fallback kept `parsed = {}`
+                        # and then used `system_resource_num or 200` — so an
+                        # unreadable mailbox payload silently granted 200 stones.
+                        await fail_internal(
+                            context,
+                            "Mailbox payload is unreadable; refusing to grant a guessed reward",
+                            exc,
+                            inventory_id=item.id,
+                            label=item.search_label,
+                        )
 
                     prefix = str(parsed.get("Prefix", ""))
                     val = parsed.get("Value")

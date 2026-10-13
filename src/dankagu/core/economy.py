@@ -16,6 +16,10 @@ class InsufficientFundsError(Exception):
     """Raised when player does not have enough virtual currencies."""
 
 
+class CorruptedPlayerValueError(Exception):
+    """Raised when a stored player value exists but cannot be decoded."""
+
+
 async def get_or_create_wallet(session: AsyncSession, player_id: str) -> WalletBalance:
     """Fetch player's WalletBalance or create a seeded default if non-existent."""
     wallet = await session.get(WalletBalance, player_id)
@@ -315,14 +319,28 @@ async def get_player_key_value(
     key: str,
     default: int = 0,
 ) -> int:
-    """Retrieve player key value (e.g. points, tickets) from PlayerStorage."""
+    """Retrieve player key value (e.g. points, tickets) from PlayerStorage.
+
+    A value that is present but unreadable raises instead of silently falling back
+    to ``default``: pretending a corrupted balance is 0 (or 8612 points) is how a
+    player's currency appears to vanish — or is handed to them for free.
+    """
     storage_key = f"PlayerKeyValue:{key}"
     entry = await session.get(PlayerStorageEntry, (player_id, storage_key))
     if entry and entry.value:
         try:
             return int(entry.value.decode("utf-8"))
-        except Exception:
-            return default
+        except Exception as exc:
+            logger.error(
+                "❌ Unreadable player value player=%s key=%r raw=%r",
+                player_id,
+                storage_key,
+                entry.value[:64],
+                exc_info=exc,
+            )
+            raise CorruptedPlayerValueError(
+                f"Player {player_id} value {storage_key!r} cannot be decoded"
+            ) from exc
     return default
 
 
