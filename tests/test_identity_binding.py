@@ -17,6 +17,7 @@ from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import invalidate_session, resolve_session_player_id
 from dankagu.lcx.app import create_lcx_app
+from dankagu.lcx.tokens import generate_lcx_tokens
 from dankagu.models.player import Player
 
 _BASE = "https://danmakujp4-v1.lcx.tokyo"
@@ -264,6 +265,103 @@ async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> N
     # The SDK reads ``code`` at the top level; a nested ``detail`` envelope reached the
     # client with nothing to show, so the dialog printed a bare 30000.
     assert "detail" not in res.json()
+
+
+@pytest.mark.asyncio
+async def test_expired_token_still_returns_the_player_to_their_account() -> None:
+    """A long break must not cost an account: same device, stale token, back in.
+
+    The claim is expired, so it proves nothing on its own; the account it names does
+    belong to this device, and that is what is checked.
+    """
+    device = f"returning-{uuid.uuid4()}"
+    async with _client() as client:
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device}, json={})
+        assert sign_in.status_code == 200
+        user_id = sign_in.json()["user"]["id"]
+
+        expired = jwt.encode(
+            {
+                "kind": "SIGN_IN_SESSION_TOKEN",
+                "exp": int(time.time()) - 86400,
+                "data": {
+                    "store": "GUEST",
+                    "sessionId": str(uuid.uuid4()),
+                    "userId": user_id,
+                    "deviceHash": device,
+                },
+            },
+            settings.require_jwt_secret(),
+            algorithm="HS256",
+        )
+        refreshed = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device},
+            json={"signInSessionToken": expired},
+        )
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["userId"] == user_id
+
+
+@pytest.mark.asyncio
+async def test_expired_token_from_another_device_is_refused() -> None:
+    """A leaked token must stop working once its lifetime runs out.
+
+    Two shapes, because the token may or may not say which device it was issued to:
+    with a binding the device mismatch is reported (it is the stronger fact), without
+    one the refusal is the expiry itself.
+    """
+    owner_device = f"expired-owner-{uuid.uuid4()}"
+    async with _client() as client:
+        sign_in = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": owner_device}, json={}
+        )
+        user_id = sign_in.json()["user"]["id"]
+
+        def _expired(with_binding: bool) -> str:
+            data: dict[str, object] = {
+                "store": "GUEST",
+                "sessionId": str(uuid.uuid4()),
+                "userId": user_id,
+            }
+            if with_binding:
+                data["deviceHash"] = owner_device
+            return jwt.encode(
+                {
+                    "kind": "SIGN_IN_SESSION_TOKEN",
+                    "exp": int(time.time()) - 86400,
+                    "data": data,
+                },
+                settings.require_jwt_secret(),
+                algorithm="HS256",
+            )
+
+        bound = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": f"stranger-{uuid.uuid4()}"},
+            json={"signInSessionToken": _expired(with_binding=True)},
+        )
+        unbound = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": f"stranger2-{uuid.uuid4()}"},
+            json={"signInSessionToken": _expired(with_binding=False)},
+        )
+
+    assert bound.status_code == 401
+    assert bound.json()["code"] == "LCX_INVALID_SESSION_DEVICE"
+    assert unbound.status_code == 401
+    assert unbound.json()["code"] == "LCX_SESSION_EXPIRED"
+
+
+def test_sign_in_session_token_lasts_thirty_days() -> None:
+    """The client-visible lifetime, which bounds how long a leaked token is useful."""
+    assert settings.sign_in_session_ttl_seconds == 86400 * 30
+
+    token = generate_lcx_tokens("ttl-user", 0, device_hash="ttl-device")["signInSessionToken"]
+    payload = jwt.decode(token, settings.require_jwt_secret(), algorithms=["HS256"])
+    remaining = payload["exp"] - int(time.time())
+    assert 86400 * 29 < remaining <= 86400 * 30
 
 
 @pytest.mark.asyncio

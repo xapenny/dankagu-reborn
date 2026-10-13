@@ -99,8 +99,14 @@ class Settings(BaseSettings):
     #: ``storeAccountIdHash`` constant is rejected regardless of this setting.
     shared_device_ids: str = ""
     #: Lifetime of the LCX ``signInSessionToken`` in seconds
-    #: (``DANKAGU_SIGN_IN_SESSION_TTL_SECONDS``, default 7 days).
-    sign_in_session_ttl_seconds: int = 86400 * 7
+    #: (``DANKAGU_SIGN_IN_SESSION_TTL_SECONDS``, default 30 days).
+    #:
+    #: The server does not *require* the claim to be unexpired (see
+    #: ``lcx.router``: an expired token is downgraded to a device proof instead of
+    #: being refused), so this value is what the client sees and what bounds a leaked
+    #: token's useful life. Shortening it makes the client re-sign-in sooner, which is
+    #: only safe because a re-sign-in from the same device recovers the same account.
+    sign_in_session_ttl_seconds: int = 86400 * 30
     #: When true (default), a request that carries no token and matches an *already
     #: onboarded* account by ``device_account`` re-attaches to that account — the
     #: behaviour a device that reinstalls expects, and the only way such a player gets
