@@ -1,7 +1,11 @@
 """Account deletion (`/identity/deactivate-user`) must actually remove data.
 
-Each test signs in with its own fresh ``userId`` so it only ever deletes the
-player it created, never a real account in the shared database.
+Each test signs in from its own fresh ``deviceAccount`` so it only ever deletes
+the player it created, never a real account in the shared database.
+
+Identities are taken from the server response rather than asserted upfront: a
+bare ``userId`` in the request body is deliberately **not** trusted as an identity
+any more (it let anybody claim somebody else's account).
 """
 
 import uuid
@@ -38,12 +42,14 @@ async def _player_and_storage_count(user_id: str) -> tuple[Player | None, int]:
 
 @pytest.mark.asyncio
 async def test_deactivate_user_deletes_player_and_storage() -> None:
-    user_id = f"delete-test-{uuid.uuid4()}"
+    device = f"delete-test-device-{uuid.uuid4()}"
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
-        sign_in = await client.post("/identity/sign-in", json={"userId": user_id})
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device})
         assert sign_in.status_code == 200
-        access_token = sign_in.json()["accessToken"]
+        sign_in_body = sign_in.json()
+        user_id = sign_in_body["user"]["id"]
+        access_token = sign_in_body["accessToken"]
 
         player, storage_rows = await _player_and_storage_count(user_id)
         assert player is not None
@@ -63,11 +69,12 @@ async def test_deactivate_user_deletes_player_and_storage() -> None:
 
 @pytest.mark.asyncio
 async def test_deactivate_user_without_token_deletes_nothing() -> None:
-    user_id = f"delete-test-{uuid.uuid4()}"
+    device = f"delete-test-device-{uuid.uuid4()}"
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
-        sign_in = await client.post("/identity/sign-in", json={"userId": user_id})
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device})
         assert sign_in.status_code == 200
+        user_id = sign_in.json()["user"]["id"]
 
         res = await client.post("/identity/deactivate-user", json=_BODY)
         assert res.status_code == 401
@@ -121,19 +128,23 @@ async def test_deactivate_and_re_signin_creates_fresh_player() -> None:
 @pytest.mark.asyncio
 async def test_deactivate_user_does_not_affect_other_players() -> None:
     """Deleting User A must strictly isolate and leave User B completely intact."""
-    user_a = f"user-a-{uuid.uuid4()}"
-    user_b = f"user-b-{uuid.uuid4()}"
-
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
         # Create Player A
-        sign_in_a = await client.post("/identity/sign-in", json={"userId": user_a})
+        sign_in_a = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": f"user-a-{uuid.uuid4()}"}
+        )
         assert sign_in_a.status_code == 200
-        token_a = sign_in_a.json()["accessToken"]
+        body_a = sign_in_a.json()
+        user_a = body_a["user"]["id"]
+        token_a = body_a["accessToken"]
 
         # Create Player B
-        sign_in_b = await client.post("/identity/sign-in", json={"userId": user_b})
+        sign_in_b = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": f"user-b-{uuid.uuid4()}"}
+        )
         assert sign_in_b.status_code == 200
+        user_b = sign_in_b.json()["user"]["id"]
 
         # Verify both exist before deletion
         p_a, count_a = await _player_and_storage_count(user_a)

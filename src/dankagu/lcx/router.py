@@ -4,28 +4,33 @@ import base64
 import gzip
 import logging
 import time
-import uuid
 from typing import Annotated, Any
 
 import jwt
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_db_session
-from dankagu.core.session import invalidate_player_sessions
-from dankagu.core.starter import seed_starter_player
+from dankagu.core.identity import normalise_device_account, resolve_or_create_player
+from dankagu.core.session import invalidate_player_sessions, invalidate_session
 from dankagu.core.transfer import (
     generate_transfer_id,
     generate_transfer_password,
     hash_transfer_password,
     verify_transfer_password,
 )
-from dankagu.lcx.tokens import decode_token_user_id, generate_lcx_tokens
+from dankagu.lcx.tokens import (
+    decode_token_payload,
+    decode_token_user_id,
+    generate_lcx_tokens,
+    token_device_hash,
+    user_id_from_payload,
+)
 from dankagu.models.inventory import PlayerInventoryItem
-from dankagu.models.player import Player, allocate_short_id
+from dankagu.models.player import Player
 from dankagu.models.session import Session
 from dankagu.models.storage import PlayerStorageEntry
 from dankagu.models.transfer import AccountTransfer
@@ -78,7 +83,9 @@ async def post_user_access_token(
 ) -> dict[str, Any]:
     """Refresh or issue new user access token."""
     player = await _resolve_or_create_player(db, request)
-    tokens = generate_lcx_tokens(player.user_id, player.registered_at)
+    tokens = generate_lcx_tokens(
+        player.user_id, player.registered_at, device_hash=_request_device(request)
+    )
     return {
         "userId": player.user_id,
         "accessToken": tokens["accessToken"],
@@ -87,82 +94,98 @@ async def post_user_access_token(
     }
 
 
+def _device_from_verification_token(verification_token: str) -> str | None:
+    """Best-effort device hint from an LCX verification token.
+
+    The token is signed by the platform, not by us, so it can only ever be a
+    *hint*: it never grants access to an existing account on its own (see
+    :mod:`dankagu.core.identity`).
+    """
+    try:
+        payload = jwt.decode(verification_token, options={"verify_signature": False})
+    except Exception:
+        return None
+    iss = str(payload.get("iss", ""))
+    if not iss:
+        return None
+    try:
+        # Typically base64 encoded bundle_id:device_identifier
+        return base64.b64decode(iss).decode("utf-8")
+    except Exception:
+        return iss
+
+
 async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Player:
-    """Retrieve player matching client credentials or register a distinct new player."""
+    """Retrieve player matching client credentials or register a distinct new player.
+
+    Identity rules live in :mod:`dankagu.core.identity`. This wrapper only pulls
+    credentials out of the HTTP request and enforces the device binding that the
+    presented token recorded when it was issued.
+    """
     user_id: str | None = None
     device_account: str | None = None
+    presented_token: str | None = None
 
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
-        user_id = decode_token_user_id(auth_header[7:].strip())
+        presented_token = auth_header[7:].strip()
 
-    if not device_account:
-        device_account = request.headers.get("deviceAccount") or request.headers.get(
-            "x-device-account"
-        )
+    device_account = request.headers.get("deviceAccount") or request.headers.get("x-device-account")
 
     try:
         body = await request.json()
-        if isinstance(body, dict):
-            if not user_id and "userId" in body and body["userId"]:
-                user_id = str(body["userId"])
-            if not user_id and "signInSessionToken" in body and body["signInSessionToken"]:
-                user_id = decode_token_user_id(str(body["signInSessionToken"]))
-            if not user_id and "sessionToken" in body and body["sessionToken"]:
-                user_id = decode_token_user_id(str(body["sessionToken"]))
-            if not device_account:
-                device_account = body.get("storeAccountIdHash") or body.get("deviceAccount")
-            if not device_account and "verificationToken" in body and body["verificationToken"]:
-                try:
-                    vt_payload = jwt.decode(
-                        str(body["verificationToken"]),
-                        options={"verify_signature": False},
-                    )
-                    iss = str(vt_payload.get("iss", ""))
-                    if iss:
-                        try:
-                            # Typically base64 encoded bundle_id:device_identifier
-                            decoded_iss = base64.b64decode(iss).decode("utf-8")
-                            device_account = decoded_iss
-                        except Exception:
-                            device_account = iss
-                except Exception:
-                    pass
     except Exception:
-        pass
+        body = None
 
-    now = int(time.time())
-    player: Player | None = None
+    if isinstance(body, dict):
+        if not presented_token:
+            for key in ("signInSessionToken", "sessionToken"):
+                if body.get(key):
+                    presented_token = str(body[key])
+                    break
+        if not device_account:
+            # NOTE: ``storeAccountIdHash`` is deliberately *not* accepted as a
+            # device identifier. This server mints it (per player), so treating it
+            # as one used to make every install look like the same device.
+            device_account = body.get("deviceAccount")
+        if not device_account and body.get("verificationToken"):
+            device_account = _device_from_verification_token(str(body["verificationToken"]))
 
-    if user_id:
-        res = await db.execute(select(Player).where(Player.user_id == user_id))
-        player = res.scalars().first()
+    payload = decode_token_payload(presented_token) if presented_token else None
+    if payload is not None:
+        user_id = user_id_from_payload(payload)
+        bound_device = token_device_hash(payload)
+        request_device = normalise_device_account(device_account)
+        if bound_device and request_device and bound_device != request_device:
+            logger.warning(
+                "🔒 [Auth] Rejected token issued to device %r presented from %r",
+                bound_device,
+                request_device,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "LCX_INVALID_SESSION_DEVICE",
+                    "message": "Session token was issued to another device",
+                },
+            )
+    elif presented_token:
+        logger.warning("🔒 [Auth] Ignoring unverifiable token presented by the client")
 
-    if player is None and device_account:
-        res = await db.execute(select(Player).where(Player.device_account == device_account))
-        player = res.scalars().first()
-
-    if player is None:
-        uid = user_id or str(uuid.uuid4())
-        short_id = await allocate_short_id(db)
-        player = Player(
-            user_id=uid,
-            device_account=device_account,
-            short_id=short_id,
-            registered_at=now,
-        )
-        db.add(player)
-        await db.flush()
-        await seed_starter_player(db, player)
-        await db.commit()
-        await db.refresh(player)
-
+    player, _matched_by = await resolve_or_create_player(
+        db, user_id=user_id, device_account=device_account
+    )
+    request.state.device_account = normalise_device_account(device_account)
     return player
 
 
-def _build_verified_token_response(player: Player) -> dict[str, Any]:
+def _build_verified_token_response(
+    player: Player, device_hash: str | None = None
+) -> dict[str, Any]:
     """Build LCX VerifiedTokenEntity response payload."""
-    tokens = generate_lcx_tokens(player.user_id, player.registered_at)
+    tokens = generate_lcx_tokens(
+        player.user_id, player.registered_at, device_hash=normalise_device_account(device_hash)
+    )
     return {
         "accessToken": tokens["accessToken"],
         "lcxUserIdToken": tokens["lcxUserIdToken"],
@@ -178,6 +201,11 @@ def _build_verified_token_response(player: Player) -> dict[str, Any]:
     }
 
 
+def _request_device(request: Request) -> str | None:
+    """Device the current request was resolved for (set by _resolve_or_create_player)."""
+    return getattr(request.state, "device_account", None)
+
+
 @router.post("/identity/sign-in")
 @router.post("/identity/force-sign-in")
 @router.post("/identity/pre-sign-in")
@@ -188,7 +216,7 @@ async def post_identity_session(
 ) -> dict[str, Any]:
     """Execute initial sign-in or session establishment."""
     player = await _resolve_or_create_player(db, request)
-    return _build_verified_token_response(player)
+    return _build_verified_token_response(player, _request_device(request))
 
 
 @router.api_route("/identity/active-published-store", methods=["GET", "POST"])
@@ -294,7 +322,7 @@ async def post_transfer_execute(
     if not password:
         # Fallback for passwordless test calls / legacy mock invocations
         player = await _resolve_or_create_player(db, request)
-        return _build_verified_token_response(player)
+        return _build_verified_token_response(player, _request_device(request))
 
     if not transfer_id:
         return JSONResponse(
@@ -343,13 +371,19 @@ async def post_transfer_execute(
             },
         )
 
-    device_account = request.headers.get("deviceAccount") or body.get("deviceAccount")
+    device_account = normalise_device_account(
+        request.headers.get("deviceAccount")
+        or body.get("deviceAccount")
+        or _device_from_verification_token(str(body.get("verificationToken", "")))
+    )
     if device_account:
-        target_player.device_account = str(device_account)
+        target_player.device_account = device_account
 
     await db.commit()
 
-    tokens = generate_lcx_tokens(target_player.user_id, target_player.registered_at)
+    tokens = generate_lcx_tokens(
+        target_player.user_id, target_player.registered_at, device_hash=device_account
+    )
     return {
         "accessToken": tokens["accessToken"],
         "signInSessionToken": tokens["signInSessionToken"],
@@ -404,8 +438,26 @@ async def post_mock_link(user_id: str | None = None) -> dict[str, bool]:
 
 
 @router.post("/identity/sign-out", status_code=status.HTTP_204_NO_CONTENT)
-async def post_sign_out() -> Response:
-    """Handle sign out request."""
+async def post_sign_out(request: Request) -> Response:
+    """Sign out: revoke the presented session token so it cannot be reused."""
+    token: str | None = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict) and not token:
+        for key in ("signInSessionToken", "sessionToken", "accessToken"):
+            if body.get(key):
+                token = str(body[key])
+                break
+
+    if token:
+        await invalidate_session(token)
+        logger.info("🚪 [Auth] Signed out and revoked session token")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

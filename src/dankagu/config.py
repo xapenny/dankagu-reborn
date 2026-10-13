@@ -93,6 +93,20 @@ class Settings(BaseSettings):
     #: ``python -c "import secrets; print(secrets.token_urlsafe(48))"``.
     jwt_secret: str = ""
 
+    # Identity / session policy
+    #: Extra device identifiers that must never be used as a device identity
+    #: because every install shares them (comma separated). The historical LCX
+    #: ``storeAccountIdHash`` constant is rejected regardless of this setting.
+    shared_device_ids: str = ""
+    #: Lifetime of the LCX ``signInSessionToken`` in seconds
+    #: (``DANKAGU_SIGN_IN_SESSION_TTL_SECONDS``, default 7 days).
+    sign_in_session_ttl_seconds: int = 86400 * 7
+    #: When true, matching an *already onboarded* account by ``device_account``
+    #: alone re-attaches the request to that account (the old behaviour). Keep it
+    #: false so a new device always gets the registration flow and a copied token
+    #: cannot walk into somebody else's account.
+    reuse_device_account_when_onboarded: bool = False
+
     # Database
     db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"
 
