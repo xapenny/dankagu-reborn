@@ -12,11 +12,12 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, text
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.lcx.app import create_lcx_app
 from dankagu.models.player import Player
+from dankagu.models.social import MySpaceLikeRecord, PhotoLikeRecord, PlayerPhoto
 from dankagu.models.storage import PlayerStorageEntry
 
 _BASE = "https://danmakujp4-v1.lcx.tokyo"
@@ -81,6 +82,86 @@ async def test_deactivate_user_without_token_deletes_nothing() -> None:
 
     player, _ = await _player_and_storage_count(user_id)
     assert player is not None
+
+
+async def test_deleting_the_player_row_cascades_every_player_scoped_table() -> None:
+    """The database itself must remove the account's data, not a hand-kept table list.
+
+    ``player_storage_entries``, ``player_photos``, ``photo_likes`` and
+    ``my_space_likes`` had no foreign key, so anything the application forgot survived
+    a deletion. This deletes the ``players`` row directly -- the way an operator's SQL
+    would -- and expects every dependent row to be gone.
+    """
+    device = f"cascade-test-{uuid.uuid4()}"
+    app = create_lcx_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+        assert sign_in.status_code == 200
+        user_id = sign_in.json()["user"]["id"]
+
+    async with get_sessionmaker()() as session:
+        player = (
+            await session.execute(select(Player).where(Player.user_id == user_id))
+        ).scalar_one()
+        player_id = player.id
+
+        other = Player(user_id=f"cascade-other-{uuid.uuid4()}", registered_at=0)
+        session.add(other)
+        await session.flush()
+
+        session.add(
+            PlayerPhoto(
+                photo_id=f"photo-{uuid.uuid4()}",
+                player_id=player_id,
+                character_ids=[],
+                category="",
+                content_value=b"",
+                original_url="",
+                thumbnail_url="",
+                created_at=0,
+            )
+        )
+        await session.flush()
+        photo_id = (
+            await session.execute(
+                select(PlayerPhoto.photo_id).where(PlayerPhoto.player_id == player_id)
+            )
+        ).scalar_one()
+
+        session.add(PhotoLikeRecord(photo_id=photo_id, player_id=other.id, created_at=0))
+        session.add(MySpaceLikeRecord(from_player_id=other.id, to_player_id=player_id, liked_at=0))
+        await session.commit()
+
+    async with get_sessionmaker()() as session:
+        await session.execute(delete(Player).where(Player.id == player_id))
+        await session.commit()
+
+        remaining = {
+            "player_storage_entries": await _count(
+                "player_storage_entries", "player_id", player_id
+            ),
+            "player_photos": await _count("player_photos", "player_id", player_id),
+            "photo_likes": await _count("photo_likes", "player_id", player_id),
+            "my_space_likes": await _count("my_space_likes", "to_player_id", player_id),
+        }
+    assert remaining == {
+        "player_storage_entries": 0,
+        "player_photos": 0,
+        "photo_likes": 0,
+        "my_space_likes": 0,
+    }
+
+
+async def _count(table: str, column: str, value: str) -> int:
+    async with get_sessionmaker()() as session:
+        return int(
+            (
+                await session.execute(
+                    text(f"SELECT count(*) FROM {table} WHERE {column} = :value"),
+                    {"value": value},
+                )
+            ).scalar_one()
+        )
 
 
 @pytest.mark.asyncio

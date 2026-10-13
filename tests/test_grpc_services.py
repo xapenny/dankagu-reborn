@@ -1,4 +1,5 @@
 import pytest
+from player_factory import ensure_player
 
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     ondemand_master_pb2,
@@ -72,7 +73,7 @@ async def test_player_storage_roundtrip() -> None:
     context = MockContext()
     pid = "player-101"
 
-    tokens = set_current_player(pid)
+    tokens = set_current_player(await ensure_player(pid))
     try:
         # 1. SetEntries
         set_req = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
