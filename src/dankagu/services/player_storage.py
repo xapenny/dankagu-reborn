@@ -2,12 +2,24 @@
 
 import logging
 import time
+from typing import Any
 
 import grpc
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.economy import (
+    CARD_FIELD_CARD_ID,
+    CARD_FIELD_DUPLICATE,
+    CARD_STATUS_PREFIX,
+    CardCanonicalisation,
+    _parse_card_fields,
+    canonicalise_card_entries,
+    card_progress,
+    merge_card_payload,
+)
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
@@ -68,6 +80,93 @@ PERSONAL_STORAGE_PREFIXES = (
     "EventRaidAttackStatus--",
     "SaveHash--",
 )
+
+
+async def _upsert_entry(
+    session: AsyncSession, player_id: str, key: str, value: bytes, now: int
+) -> None:
+    """Write one storage entry, replacing whatever was there."""
+    stmt = pg_insert(PlayerStorageEntry).values(
+        player_id=player_id,
+        key=key,
+        value=value,
+        created_at=now,
+        updated_at=now,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
+        set_={"value": stmt.excluded.value, "updated_at": stmt.excluded.updated_at},
+    )
+    await session.execute(stmt)
+
+
+async def _plan_card_merge(
+    session: AsyncSession, player_id: str, request: Any, now: int
+) -> CardCanonicalisation | None:
+    """Work out how this request's card entries should be folded together."""
+    incoming = [(entry.key, entry.value) for entry in request.entries if entry.value]
+    if not any(key.startswith(CARD_STATUS_PREFIX) for key, _ in incoming):
+        return None
+
+    stored = await session.execute(
+        select(PlayerStorageEntry).where(
+            PlayerStorageEntry.player_id == player_id,
+            PlayerStorageEntry.key.like(f"{CARD_STATUS_PREFIX}%"),
+        )
+    )
+    existing: dict[int, tuple[str, bytes]] = {}
+    duplicates: dict[int, list[str]] = {}
+    for entry in sorted(stored.scalars().all(), key=lambda item: item.key):
+        fields = _parse_card_fields(entry.value)
+        card_id = fields.get(CARD_FIELD_CARD_ID)
+        if not card_id:
+            continue
+        card_id = int(card_id)
+        if card_id in existing:
+            # The collection already holds this card more than once. Keep the entry the
+            # player has developed furthest (a level or a limit break must never be lost
+            # to tidying up), fold the copies this entry stands for into the surviving
+            # counter, and remember the redundant key.
+            keep_key, keep_value = existing[card_id]
+            keep_fields = _parse_card_fields(keep_value)
+            survivor_fields, survivor_key = (
+                (fields, entry.key)
+                if card_progress(fields) > card_progress(keep_fields)
+                else (keep_fields, keep_key)
+            )
+            if survivor_key != keep_key:
+                duplicates.setdefault(card_id, []).append(keep_key)
+            duplicates.setdefault(card_id, []).append(entry.key)
+            existing[card_id] = (
+                survivor_key,
+                merge_card_payload(
+                    card_id=card_id,
+                    survivor=survivor_fields,
+                    others=[keep_fields if survivor_key != keep_key else fields],
+                    duplicate=(keep_fields.get(CARD_FIELD_DUPLICATE, 1) or 1)
+                    + (fields.get(CARD_FIELD_DUPLICATE, 1) or 1),
+                    now=now,
+                ),
+            )
+            continue
+        existing[card_id] = (entry.key, entry.value)
+
+    plan = canonicalise_card_entries(existing, incoming, now)
+    if plan is not None and duplicates:
+        # Only drop the redundant keys of cards this request actually rewrites: the
+        # survivor's counter is carried over when it is written, so deleting a duplicate
+        # of a card the request does not mention would silently lose the copies it stood
+        # for. Those rows stay until that card is next written.
+        doomed = [
+            key for card_id, keys in duplicates.items() if card_id in plan.copies for key in keys
+        ]
+        plan.drop_keys.extend(doomed)
+        logger.info(
+            "🎴 [Storage] Repairing %d pre-existing duplicate card entr(ies) for player %s",
+            len(doomed),
+            player_id,
+        )
+    return plan
 
 
 class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
@@ -234,7 +333,40 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 for proto_entry in request.entries
             )
 
+            # Fold the client's per-copy card entries into one entry per card before
+            # anything is written, so a ten-pull holding two copies of a card lands as
+            # one collection entry whose duplicate counter says two. This is a fix, not a
+            # policy: without it a collection grows one entry per drawn copy.
+            card_plan = await _plan_card_merge(session, current_pid, request, now)
+
+            written_keys: set[str] = set()
+            if card_plan is not None:
+                for key, value in card_plan.writes:
+                    await _upsert_entry(session, current_pid, key, value, now)
+                    written_keys.add(key)
+
+                if card_plan.drop_keys:
+                    deleted = await session.execute(
+                        delete(PlayerStorageEntry).where(
+                            PlayerStorageEntry.player_id == current_pid,
+                            PlayerStorageEntry.key.in_(card_plan.drop_keys),
+                        )
+                    )
+                    logger.info(
+                        "🎴 [Storage] Collapsed %d duplicate card entr(ies) into a counter "
+                        "for player %s (cards=%s)",
+                        deleted.rowcount or 0,
+                        current_pid,
+                        card_plan.collapsed,
+                    )
+
             for proto_entry in request.entries:
+                if proto_entry.key in written_keys or (
+                    card_plan is not None and proto_entry.key in card_plan.drop_keys
+                ):
+                    # Already written (or dropped) as part of the card merge.
+                    continue
+
                 # A SetEntriesV2 entry with no value is the client clearing that
                 # key (construction sites, inventory history, ...). Storing the
                 # empty blob poisons every later GetEntriesV2, so delete instead.

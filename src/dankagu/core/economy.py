@@ -2,6 +2,7 @@
 
 import logging
 import time
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,6 +140,159 @@ def _encode_varint(field_num: int, val: int) -> bytes:
         val >>= 7
     buf.append(val)
     return bytes(buf)
+
+
+CARD_STATUS_PREFIX = "CardStatus--"
+
+#: CardStatus payload fields, as the client's own schema numbers them.
+CARD_FIELD_INSTANCE_ID = 1
+CARD_FIELD_CARD_ID = 2
+CARD_FIELD_CREATED_AT = 3
+CARD_FIELD_BLOSSOM = 5
+CARD_FIELD_EXP = 6
+CARD_FIELD_STATUS = 8
+CARD_FIELD_DUPLICATE = 11
+
+
+@dataclass
+class CardCanonicalisation:
+    """What to write, what to drop, and the resulting copy count per card."""
+
+    writes: list[tuple[str, bytes]]
+    drop_keys: list[str]
+    copies: dict[int, int]
+    collapsed: dict[int, int]
+
+
+def card_progress(fields: dict[int, int]) -> tuple[int, int, int]:
+    """How far a card has been developed: (status, blossom, exp), strongest last.
+
+    Used to pick which of several copies of one card survives a merge, and to carry the
+    highest development into the surviving entry, so folding duplicates can never discard
+    a level or a limit break the player earned.
+    """
+    return (
+        fields.get(CARD_FIELD_STATUS, 0) or 0,
+        fields.get(CARD_FIELD_BLOSSOM, 0) or 0,
+        fields.get(CARD_FIELD_EXP, 0) or 0,
+    )
+
+
+def merge_card_payload(
+    card_id: int,
+    survivor: dict[int, int],
+    others: list[dict[int, int]],
+    duplicate: int,
+    now: int,
+) -> bytes:
+    """Build the surviving payload, keeping the strongest development of every copy."""
+    strongest = max([survivor, *others], key=card_progress)
+    created = [fields.get(CARD_FIELD_CREATED_AT) for fields in [survivor, *others]]
+    created = [value for value in created if value]
+    return encode_card_status(
+        instance_id=survivor.get(CARD_FIELD_INSTANCE_ID, 0),
+        card_id=card_id,
+        created_at=min(created) if created else now,
+        updated_at=now,
+        blossom=strongest.get(CARD_FIELD_BLOSSOM, 1) or 1,
+        exp=strongest.get(CARD_FIELD_EXP, 0) or 0,
+        duplicate=duplicate,
+        status=strongest.get(CARD_FIELD_STATUS, 1) or 1,
+    )
+
+
+def canonicalise_card_entries(
+    existing: dict[int, tuple[str, bytes]],
+    incoming: list[tuple[str, bytes]],
+    now: int,
+) -> CardCanonicalisation | None:
+    """Fold the client's per-copy card entries into one entry per card.
+
+    The client writes one ``CardStatus--<instance id>`` entry **per drawn copy**, so two
+    copies of a card in a single ten-pull became two collection entries (the live
+    database shows cards occupying up to four), instead of one entry whose ``duplicate``
+    field counts the copies -- which is what this project's own merge helper always
+    assumed, and what the client's limit-break logic reads.
+
+    Returns ``None`` when the request carries no card entries at all, so the caller can
+    keep its fast path.
+    """
+    card_incoming: list[tuple[str, bytes]] = [
+        (key, value) for key, value in incoming if key.startswith(CARD_STATUS_PREFIX)
+    ]
+    if not card_incoming:
+        return None
+
+    writes: list[tuple[str, bytes]] = []
+    drop_keys: list[str] = []
+    copies: dict[int, int] = {}
+    collapsed: dict[int, int] = {}
+
+    # Group the request by card id, keeping the order the client sent them in.
+    grouped: dict[int, list[tuple[str, bytes]]] = {}
+    for key, value in card_incoming:
+        fields = _parse_card_fields(value)
+        card_id = fields.get(CARD_FIELD_CARD_ID)
+        if not card_id:
+            # Not a card we can read; store it verbatim rather than losing the write.
+            writes.append((key, value))
+            continue
+        grouped.setdefault(int(card_id), []).append((key, value))
+
+    for card_id, entries in grouped.items():
+        stored = existing.get(card_id)
+        # One copy means one increment; an entry without the field still counts as one.
+        increment = sum(
+            _parse_card_fields(value).get(CARD_FIELD_DUPLICATE, 1) or 1 for _, value in entries
+        )
+
+        if stored is not None:
+            stored_key, stored_value = stored
+            stored_fields = _parse_card_fields(stored_value)
+            incoming_fields = [_parse_card_fields(value) for _key, value in entries]
+            total = (stored_fields.get(CARD_FIELD_DUPLICATE, 1) or 1) + increment
+            writes.append(
+                (
+                    stored_key,
+                    merge_card_payload(
+                        card_id=card_id,
+                        survivor=stored_fields,
+                        others=incoming_fields,
+                        duplicate=total,
+                        now=now,
+                    ),
+                )
+            )
+            # Every key the client just sent is redundant: the card lives under the key
+            # it already had. Drop them, including copies stored by earlier writes.
+            for key, _value in entries:
+                if key != stored_key:
+                    drop_keys.append(key)
+        else:
+            keep_key, keep_value = entries[0]
+            keep_fields = _parse_card_fields(keep_value)
+            writes.append(
+                (
+                    keep_key,
+                    merge_card_payload(
+                        card_id=card_id,
+                        survivor=keep_fields,
+                        others=[_parse_card_fields(value) for _key, value in entries[1:]],
+                        duplicate=increment,
+                        now=now,
+                    ),
+                )
+            )
+            for key, _value in entries[1:]:
+                drop_keys.append(key)
+
+        copies[card_id] = increment
+        if len(entries) > 1:
+            collapsed[card_id] = len(entries)
+
+    return CardCanonicalisation(
+        writes=writes, drop_keys=drop_keys, copies=copies, collapsed=collapsed
+    )
 
 
 def _parse_card_fields(data: bytes) -> dict[int, int]:
