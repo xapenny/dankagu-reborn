@@ -324,3 +324,33 @@ async def test_executing_a_code_on_its_own_device_never_deletes_the_account() ->
 async def _player_id(session, user_id: str) -> str:
     """The player row id behind an LCX user id."""
     return (await session.execute(select(Player.id).where(Player.user_id == user_id))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_a_spent_code_id_can_be_registered_again() -> None:
+    """Re-using an id that was already spent must issue a new code, not a 500.
+
+    ``transfer_id`` is the primary key, so the spent row left behind by a used code made
+    the insert collide.
+    """
+    device = f"reuse-id-{uuid.uuid4()}"
+    transfer_id = f"DK{uuid.uuid4().hex[:6].upper()}"
+    async with _client() as client:
+        await _sign_in(client, device)
+        first = await client.post(
+            "/identity/transfer",
+            headers={"deviceAccount": device},
+            json={"id": transfer_id, "password": "smoke-pass-1"},
+        )
+        assert first.status_code == 200, first.text
+        spent = await _execute(client, transfer_id, "smoke-pass-1", f"dst-{uuid.uuid4()}")
+        assert spent.status_code == 200
+
+        again = await client.post(
+            "/identity/transfer",
+            headers={"deviceAccount": device},
+            json={"id": transfer_id, "password": "smoke-pass-2"},
+        )
+        assert again.status_code == 200, again.text
+        reuse = await _execute(client, transfer_id, "smoke-pass-2", f"dst-{uuid.uuid4()}")
+        assert reuse.status_code == 200

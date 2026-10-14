@@ -396,6 +396,20 @@ async def post_transfer_register(
             player.id,
         )
 
+    # A spent or expired row with this id is only a leftover, and ``transfer_id`` is the
+    # primary key: re-registering a code the player has already used collided with it and
+    # answered a bare 500. Anything still here is not active (checked above), so it is
+    # replaced.
+    replaced = await db.execute(
+        delete(AccountTransfer).where(AccountTransfer.transfer_id == transfer_id)
+    )
+    if replaced.rowcount:
+        logger.info(
+            "🎫 [Transfer] Replaced %d spent/expired row(s) holding id %r",
+            replaced.rowcount,
+            transfer_id,
+        )
+
     # ``0`` means no expiry at all; the rest of the codebase treats 4102498799 as
     # "far future", which also keeps ``expires_at`` a plain ascending integer.
     expires_at = (
