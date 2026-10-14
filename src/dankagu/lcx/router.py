@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.config import settings
@@ -241,6 +242,26 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
             )
     elif presented_token:
         logger.warning("🔒 [Auth] Ignoring unverifiable token presented by the client")
+
+    if user_id:
+        # A signed token naming a user that no longer exists is not a credential. The
+        # account can be gone because a transfer replaced it on that device (the token
+        # still matches the device, so the checks above let it through) or because the
+        # player deleted it. Resolving would mint a fresh account and, worse, take the
+        # device binding back from the account that now owns it. Checked after the binding
+        # rules so a token that is merely unbound still reports that, not this.
+        known, _matched = await find_player(db, user_id=user_id, device_account=None)
+        if known is None:
+            logger.warning(
+                "🔒 [Auth] Rejected token for unknown user_id=%s from device %r",
+                user_id,
+                normalise_device_account(device_account),
+            )
+            raise LcxApiError(
+                status.HTTP_401_UNAUTHORIZED,
+                "LCX_SESSION_EXPIRED",
+                "This session belongs to an account that no longer exists; sign in again",
+            )
 
     player, _matched_by = await resolve_or_create_player(
         db, user_id=user_id, device_account=device_account
@@ -540,9 +561,45 @@ async def post_transfer_execute(
         or _device_from_verification_token(str(body.get("verificationToken", "")))
     )
     if device_account:
+        # An identifier belongs to the device, not to whoever used it last. Changing
+        # phones means the new phone already holds an account, and that account is the
+        # one the player is replacing: it is deleted here, exactly as the client's own
+        # deactivate flow would, so the device does not keep two owners (a bare 500 from
+        # the unique constraint used to be the whole answer, on the one flow a player
+        # cannot work around).
+        resident, _matched = await find_player(db, user_id=None, device_account=device_account)
+        if resident is not None and resident.id != target_player.id:
+            logger.warning(
+                "🎫 [Transfer] id=%s replaces the account on device %r: "
+                "deleting player=%s (user_id=%s)",
+                transfer_id,
+                device_account,
+                resident.id,
+                resident.user_id,
+            )
+            await _delete_player_account(db, resident)
+
         target_player.device_account = device_account
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Never leave the client with an unexplained 500: the code stays unused (the
+        # transaction rolled back) and the player is told the move did not happen.
+        await db.rollback()
+        logger.exception(
+            "🎫 [Transfer] id=%s could not move player=%s to device=%r",
+            transfer_id,
+            transfer.player_id,
+            device_account,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "LCX_TRANSFER_FAILED",
+                "message": "The account could not be moved to this device; try again",
+            },
+        )
 
     # The account now lives on the new device: every session the old device held
     # must stop working, otherwise the transfer leaves two live devices behind.
@@ -635,6 +692,32 @@ async def post_sign_out(request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+async def _delete_player_account(db: AsyncSession, player: Player) -> None:
+    """Permanently remove an account and everything it owns, without committing.
+
+    The caller owns the transaction: an account transfer deletes the account that held the
+    target device and must be able to roll the whole move back if anything fails.
+
+    Explicit deletes, because ``player_storage_entries`` carries no foreign key and a
+    database never applies ON DELETE CASCADE to it on its own. Transfer codes are
+    detached and revoked rather than deleted: an issued code must not vanish silently
+    behind "transfer ID or password is wrong" (2026-10-13 report).
+    """
+    pid = player.id
+    await db.execute(delete(PlayerStorageEntry).where(PlayerStorageEntry.player_id == pid))
+    await db.execute(delete(Session).where(Session.player_id == pid))
+    await db.execute(
+        update(AccountTransfer)
+        .where(AccountTransfer.player_id == pid)
+        .values(player_id=None, is_used=True)
+    )
+    await db.execute(delete(WalletBalance).where(WalletBalance.player_id == pid))
+    await db.execute(delete(PlayerInventoryItem).where(PlayerInventoryItem.player_id == pid))
+    await db.execute(delete(Player).where(Player.id == pid))
+    invalidate_player_sessions(pid)
+    logger.warning("🗑️ Deleted account player_id=%s user_id=%s", pid, player.user_id)
+
+
 @router.post("/identity/deactivate-user")
 async def post_deactivate_user(
     request: Request,
@@ -667,27 +750,9 @@ async def post_deactivate_user(
             content={"code": "LCX_UNAUTHORIZED", "message": "Unknown or missing user"},
         )
 
-    pid = player.id
-    # Explicit deletes: player_storage_entries has no FK, and SQLite does not
-    # enforce ON DELETE CASCADE unless the pragma is on.
-    await db.execute(delete(PlayerStorageEntry).where(PlayerStorageEntry.player_id == pid))
-    await db.execute(delete(Session).where(Session.player_id == pid))
-    # Transfer codes are detached and revoked instead of deleted: an issued code
-    # must not vanish silently behind "transfer ID or password is wrong" when the
-    # player tries to use it after the account is gone (2026-10-13 report). A
-    # detached, revoked row can never restore anything.
-    await db.execute(
-        update(AccountTransfer)
-        .where(AccountTransfer.player_id == pid)
-        .values(player_id=None, is_used=True)
-    )
-    await db.execute(delete(WalletBalance).where(WalletBalance.player_id == pid))
-    await db.execute(delete(PlayerInventoryItem).where(PlayerInventoryItem.player_id == pid))
-    await db.execute(delete(Player).where(Player.id == pid))
+    await _delete_player_account(db, player)
     await db.commit()
-    invalidate_player_sessions(pid)
 
-    logger.info("🗑️ Deleted account player_id=%s user_id=%s", pid, player.user_id)
     return {"success": True}
 
 

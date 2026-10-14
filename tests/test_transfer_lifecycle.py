@@ -236,3 +236,86 @@ async def test_repeated_guesses_are_throttled(monkeypatch: pytest.MonkeyPatch) -
 
     assert statuses[0] == (400, "LCX_INVALID_TRANSFER_ID_OR_PASSWORD")
     assert statuses[-1] == (429, "LCX_TOO_MANY_ATTEMPTS")
+
+
+@pytest.mark.asyncio
+async def test_a_code_replaces_the_account_that_held_the_target_device() -> None:
+    """Changing phones: the account already on the new phone is replaced, not just unbound.
+
+    ``players.device_account`` is unique, so assigning the identifier while the phone's
+    current account still held it raised IntegrityError and the client showed a generic
+    server error -- on the one flow a player cannot work around. The device belongs to the
+    account being moved, so the account that lived there is deleted the way the client's
+    own deactivate flow deletes one, and its still-valid token must not come back and take
+    the device with it.
+    """
+    source_device = f"transfer-src-{uuid.uuid4()}"
+    target_device = f"transfer-dst-{uuid.uuid4()}"
+
+    async with _client() as client:
+        # the phone's current account owns the identifier
+        resident = await _sign_in(client, target_device)
+        resident_user = resident["user"]["id"]
+
+        code = await _register_code(client, source_device, "smoke-pass-1")
+        moved = await _execute(client, code["id"], "smoke-pass-1", target_device)
+
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["user"]["id"] == code["user"]["id"]
+
+        # the replaced account is gone, and its token is refused instead of resurrecting it
+        replaced = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": target_device},
+            json={"signInSessionToken": resident["signInSessionToken"]},
+        )
+        assert replaced.status_code == 401
+        assert replaced.json()["code"] == "LCX_SESSION_EXPIRED"
+
+    async with get_sessionmaker()() as session:
+        moved_player = await session.get(Player, await _player_id(session, code["user"]["id"]))
+    assert moved_player is not None
+    assert moved_player.device_account == target_device
+
+    async with get_sessionmaker()() as session:
+        gone = (
+            (await session.execute(select(Player).where(Player.user_id == resident_user)))
+            .scalars()
+            .first()
+        )
+    assert gone is None, "the account that held the device must have been deleted"
+
+
+@pytest.mark.asyncio
+async def test_executing_a_code_on_its_own_device_never_deletes_the_account() -> None:
+    """Self-transfer: the device's account *is* the account being moved.
+
+    The transfer deletes whichever account holds the target device, because changing
+    phones replaces the account that was there. When that account is the one being moved,
+    deleting it would destroy the very account the player asked to keep -- so the guard
+    on player id matters more than the deletion itself.
+    """
+    device = f"transfer-self-{uuid.uuid4()}"
+    async with _client() as client:
+        code = await _register_code(client, device, "smoke-pass-1")
+        moved = await _execute(client, code["id"], "smoke-pass-1", device)
+        assert moved.status_code == 200, moved.text
+
+        # the account is intact and still reachable from that device
+        refreshed = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device},
+            json={"signInSessionToken": moved.json()["signInSessionToken"]},
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.json()["userId"] == code["user"]["id"]
+
+    async with get_sessionmaker()() as session:
+        player = await session.get(Player, await _player_id(session, code["user"]["id"]))
+    assert player is not None, "a self-transfer must never delete the account"
+    assert player.device_account == device
+
+
+async def _player_id(session, user_id: str) -> str:
+    """The player row id behind an LCX user id."""
+    return (await session.execute(select(Player.id).where(Player.user_id == user_id))).scalar_one()
