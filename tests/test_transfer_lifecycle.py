@@ -1,9 +1,4 @@
-"""Account transfer lifecycle: the code must survive, diagnose, and actually move.
-
-Guards the 2026-10-13 report -- a correctly typed transfer ID + password answered
-``LCX_INVALID_TRANSFER_ID_OR_PASSWORD`` because the code row had been cascaded away
-with its account, and that error string cannot tell the two cases apart.
-"""
+"""Account transfer lifecycle: codes are issued, survive, diagnose, and move an account."""
 
 import time
 import uuid
@@ -263,14 +258,24 @@ async def test_a_code_replaces_the_account_that_held_the_target_device() -> None
         assert moved.status_code == 200, moved.text
         assert moved.json()["user"]["id"] == code["user"]["id"]
 
-        # the replaced account is gone, and its token is refused instead of resurrecting it
+        # the replaced account is gone, and its still-valid token signs this device in as
+        # a new player instead of resurrecting it or taking anything from the moved one
         replaced = await client.post(
             "/auth/user-access-token",
             headers={"deviceAccount": target_device},
             json={"signInSessionToken": resident["signInSessionToken"]},
         )
-        assert replaced.status_code == 401
-        assert replaced.json()["code"] == "LCX_SESSION_EXPIRED"
+        assert replaced.status_code == 200, replaced.text
+        assert replaced.json()["userId"] != resident_user
+
+        # the account that moved here is untouched
+        refreshed = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": target_device},
+            json={"signInSessionToken": moved.json()["signInSessionToken"]},
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.json()["userId"] == code["user"]["id"]
 
     async with get_sessionmaker()() as session:
         moved_player = await session.get(Player, await _player_id(session, code["user"]["id"]))

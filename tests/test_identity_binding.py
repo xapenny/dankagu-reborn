@@ -1,9 +1,4 @@
-"""Identity / session invariants (see docs/AUTH_IDENTITY_FIX_PLAN.md).
-
-Covers the 2026-10-13 incident: a session token copied to a second device walked
-straight into the first device's account, so the new device never saw the
-registration flow. Each test pins one of the rules that now prevent it.
-"""
+"""Identity and session invariants: which device may reach which account."""
 
 import time
 import uuid
@@ -52,7 +47,7 @@ async def test_new_device_registers_a_fresh_unonboarded_account() -> None:
 
 @pytest.mark.asyncio
 async def test_token_presented_from_another_device_is_rejected() -> None:
-    """The exact 2026-10-13 failure: device B replaying device A's token."""
+    """Device B replaying device A's token must not reach A's account."""
     device_a = f"device-a-{uuid.uuid4()}"
     device_b = f"device-b-{uuid.uuid4()}"
 
@@ -218,8 +213,11 @@ async def test_pre_binding_token_is_accepted_on_its_own_device() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pre_binding_token_is_refused_from_a_different_device() -> None:
-    """Same stale token, another device: the account is not theirs, so refuse."""
+async def test_pre_binding_token_from_another_device_signs_in_as_a_new_player() -> None:
+    """An unbound token proves nothing, so the stranger gets their own account.
+
+    The account the token names must never be handed over -- and it is not.
+    """
     owner_device = f"legacy-owner-{uuid.uuid4()}"
     async with _client() as client:
         sign_in = await client.post(
@@ -240,14 +238,22 @@ async def test_pre_binding_token_is_refused_from_a_different_device() -> None:
             headers={"deviceAccount": f"thief-{uuid.uuid4()}"},
             json={"signInSessionToken": legacy_token},
         )
+        assert res.status_code == 200, res.text
+        assert res.json()["userId"] != user_id, "the stranger must not get that account"
 
-    assert res.status_code == 401
-    assert res.json()["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
+        # ... and the owner is unaffected on their own device
+        owner = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": owner_device},
+            json={"signInSessionToken": sign_in.json()["signInSessionToken"]},
+        )
+        assert owner.status_code == 200
+        assert owner.json()["userId"] == user_id
 
 
 @pytest.mark.asyncio
-async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> None:
-    """An unbound token for an account nobody knows must not be honoured."""
+async def test_a_token_for_an_unknown_user_signs_the_device_in_as_a_new_player() -> None:
+    """A token naming an account that does not exist is not a credential either."""
     legacy_payload = {
         "kind": "SIGN_IN_SESSION_TOKEN",
         "data": {"store": "GUEST", "userId": "legacy-user", "sessionId": str(uuid.uuid4())},
@@ -260,11 +266,9 @@ async def test_token_without_a_device_binding_is_refused_on_a_real_client() -> N
             headers={"deviceAccount": f"legacy-device-{uuid.uuid4()}"},
             json={"signInSessionToken": legacy_token},
         )
-    assert res.status_code == 401
-    assert res.json()["code"] == "LCX_SESSION_NOT_BOUND_TO_DEVICE"
-    # The SDK reads ``code`` at the top level; a nested ``detail`` envelope reached the
-    # client with nothing to show, so the dialog printed a bare 30000.
-    assert "detail" not in res.json()
+    assert res.status_code == 200, res.text
+    assert res.json()["userId"] != "legacy-user"
+    assert res.json()["accessToken"]
 
 
 @pytest.mark.asyncio
@@ -305,12 +309,10 @@ async def test_expired_token_still_returns_the_player_to_their_account() -> None
 
 
 @pytest.mark.asyncio
-async def test_expired_token_from_another_device_is_refused() -> None:
-    """A leaked token must stop working once its lifetime runs out.
+async def test_an_expired_token_from_another_device_signs_in_as_a_new_player() -> None:
+    """A leaked token must stop reaching the account once its lifetime runs out.
 
-    Two shapes, because the token may or may not say which device it was issued to:
-    with a binding the device mismatch is reported (it is the stronger fact), without
-    one the refusal is the expiry itself.
+    Bound to a device, the mismatch is reported; unbound, the device gets a new player.
     """
     owner_device = f"expired-owner-{uuid.uuid4()}"
     async with _client() as client:
@@ -348,10 +350,22 @@ async def test_expired_token_from_another_device_is_refused() -> None:
             json={"signInSessionToken": _expired(with_binding=False)},
         )
 
+    # A **bound** token from a device it was not issued to is still refused: that is the
+    # clearest sign of a copied token, and the caller keeps the explicit error.
     assert bound.status_code == 401
     assert bound.json()["code"] == "LCX_INVALID_SESSION_DEVICE"
-    assert unbound.status_code == 401
-    assert unbound.json()["code"] == "LCX_SESSION_EXPIRED"
+    # An unbound one cannot prove anything, so the device is signed in as a new player.
+    assert unbound.status_code == 200, unbound.text
+    assert unbound.json()["userId"] != user_id
+
+    async with _client() as client:
+        owner = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": owner_device},
+            json={"signInSessionToken": sign_in.json()["signInSessionToken"]},
+        )
+    assert owner.status_code == 200
+    assert owner.json()["userId"] == user_id
 
 
 @pytest.mark.asyncio

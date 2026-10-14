@@ -194,13 +194,9 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 "Session token was issued to another device",
             )
 
-        # Two token states cannot stand on their own: a token minted before device
-        # binding existed (no ``deviceHash`` to compare) and one whose lifetime ran
-        # out. Neither is refused outright, because that locked every existing install
-        # out of its own account (2026-10-13) -- the claim is checked against the
-        # database instead: the account must already belong to this device, or have no
-        # device yet (first claim). A stale token copied to another device still fails
-        # here, which is what gives a leaked token a finite life.
+        # An unbound or expired claim proves nothing about the account it names, so it is
+        # checked against the database: the account must belong to this device already, or
+        # have no device yet.
         if (
             request_device
             and settings.require_device_bound_tokens
@@ -208,30 +204,30 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         ):
             owner, _matched = await find_player(db, user_id=user_id, device_account=None)
             if owner is None or (owner.device_account and owner.device_account != request_device):
+                # Not this device's account: register a new player instead of refusing, or
+                # the client re-presents the same token forever. The user id is dropped, so
+                # the account it named can never be reached from here.
                 state = "expired" if expired_claim else "pre-dates device binding"
                 logger.warning(
-                    "🔒 [Auth] Rejected %s token for device %r: account %s is %s",
+                    "🆕 [Auth] %s token for device %r names account %s, which is %s; "
+                    "registering a new player for this device instead",
                     state,
                     request_device,
                     user_id,
                     "unknown" if owner is None else f"bound to {owner.device_account!r}",
                 )
-                raise LcxApiError(
-                    status.HTTP_401_UNAUTHORIZED,
-                    "LCX_SESSION_EXPIRED" if expired_claim else "LCX_SESSION_NOT_BOUND_TO_DEVICE",
-                    "Session token is no longer valid for this device; sign in again",
+                user_id = None
+            else:
+                # This device owns the account: accept it and claim the binding if free.
+                if not owner.device_account:
+                    owner.device_account = request_device
+                    await db.commit()
+                logger.info(
+                    "🔗 [Auth] Accepted %s token for player %s on device %r",
+                    "expired" if expired_claim else "pre-binding",
+                    owner.id,
+                    request_device,
                 )
-            # This device owns the account: accept, and bind it if it never was, so the
-            # tokens issued below carry the binding and the strict check applies next time.
-            if not owner.device_account:
-                owner.device_account = request_device
-                await db.commit()
-            logger.info(
-                "🔗 [Auth] Accepted %s token for player %s on device %r",
-                "expired" if expired_claim else "pre-binding",
-                owner.id,
-                request_device,
-            )
         elif expired_claim:
             # Nothing to verify the claim against; refusing here would lock out any
             # client that does not send device information at all.
@@ -244,24 +240,17 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         logger.warning("🔒 [Auth] Ignoring unverifiable token presented by the client")
 
     if user_id:
-        # A signed token naming a user that no longer exists is not a credential. The
-        # account can be gone because a transfer replaced it on that device (the token
-        # still matches the device, so the checks above let it through) or because the
-        # player deleted it. Resolving would mint a fresh account and, worse, take the
-        # device binding back from the account that now owns it. Checked after the binding
-        # rules so a token that is merely unbound still reports that, not this.
+        # The named account is gone (replaced by a transfer, or deleted): same rule, a new
+        # player for this device.
         known, _matched = await find_player(db, user_id=user_id, device_account=None)
         if known is None:
             logger.warning(
-                "🔒 [Auth] Rejected token for unknown user_id=%s from device %r",
+                "🆕 [Auth] Token names unknown user_id=%s from device %r; "
+                "registering a new player instead",
                 user_id,
                 normalise_device_account(device_account),
             )
-            raise LcxApiError(
-                status.HTTP_401_UNAUTHORIZED,
-                "LCX_SESSION_EXPIRED",
-                "This session belongs to an account that no longer exists; sign in again",
-            )
+            user_id = None
 
     player, _matched_by = await resolve_or_create_player(
         db, user_id=user_id, device_account=device_account
@@ -561,12 +550,8 @@ async def post_transfer_execute(
         or _device_from_verification_token(str(body.get("verificationToken", "")))
     )
     if device_account:
-        # An identifier belongs to the device, not to whoever used it last. Changing
-        # phones means the new phone already holds an account, and that account is the
-        # one the player is replacing: it is deleted here, exactly as the client's own
-        # deactivate flow would, so the device does not keep two owners (a bare 500 from
-        # the unique constraint used to be the whole answer, on the one flow a player
-        # cannot work around).
+        # The device belongs to the account being moved, so the account living on it is
+        # replaced -- the same deletion the client's own deactivate flow performs.
         resident, _matched = await find_player(db, user_id=None, device_account=device_account)
         if resident is not None and resident.id != target_player.id:
             logger.warning(
@@ -584,8 +569,7 @@ async def post_transfer_execute(
     try:
         await db.commit()
     except IntegrityError:
-        # Never leave the client with an unexplained 500: the code stays unused (the
-        # transaction rolled back) and the player is told the move did not happen.
+        # Roll back so the code stays unused, and answer in the envelope the client reads.
         await db.rollback()
         logger.exception(
             "🎫 [Transfer] id=%s could not move player=%s to device=%r",
@@ -693,19 +677,12 @@ async def post_sign_out(request: Request) -> Response:
 
 
 async def _delete_player_account(db: AsyncSession, player: Player) -> None:
-    """Permanently remove an account and everything it owns, without committing.
-
-    The caller owns the transaction: an account transfer deletes the account that held the
-    target device and must be able to roll the whole move back if anything fails.
-
-    Explicit deletes, because ``player_storage_entries`` carries no foreign key and a
-    database never applies ON DELETE CASCADE to it on its own. Transfer codes are
-    detached and revoked rather than deleted: an issued code must not vanish silently
-    behind "transfer ID or password is wrong" (2026-10-13 report).
-    """
+    """Delete an account and everything it owns. Commits nothing; the caller decides."""
     pid = player.id
+    # Explicit deletes, because ``player_storage_entries`` carries no foreign key.
     await db.execute(delete(PlayerStorageEntry).where(PlayerStorageEntry.player_id == pid))
     await db.execute(delete(Session).where(Session.player_id == pid))
+    # Codes are revoked, not deleted, so an issued one cannot vanish behind "wrong code".
     await db.execute(
         update(AccountTransfer)
         .where(AccountTransfer.player_id == pid)
