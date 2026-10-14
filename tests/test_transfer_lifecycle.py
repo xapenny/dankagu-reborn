@@ -5,15 +5,18 @@ Guards the 2026-10-13 report -- a correctly typed transfer ID + password answere
 with its account, and that error string cannot tell the two cases apart.
 """
 
+import time
 import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
+from dankagu.config import settings
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import create_session, resolve_session_player_id
 from dankagu.lcx.app import create_lcx_app
+from dankagu.lcx.router import FAR_FUTURE
 from dankagu.models.player import Player
 from dankagu.models.transfer import AccountTransfer
 
@@ -149,3 +152,87 @@ async def test_transfer_moves_the_account_and_kills_the_old_device_session() -> 
         player = await session.get(Player, player_id)
     assert player is not None
     assert player.device_account == device_b
+
+
+@pytest.mark.asyncio
+async def test_a_code_outlives_a_phone_by_default() -> None:
+    """Ten years, so a code is the recovery path for a lost device, not a 90 day one."""
+    device = f"ttl-{uuid.uuid4()}"
+    async with _client() as client:
+        code = await _register_code(client, device, "smoke-pass-1")
+
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(AccountTransfer).where(AccountTransfer.transfer_id == code["id"])
+            )
+        ).scalar_one()
+    remaining_days = (row.expires_at - int(time.time())) / 86400
+    assert remaining_days > 3640
+
+
+@pytest.mark.asyncio
+async def test_the_ttl_can_be_made_permanent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DANKAGU_TRANSFER_TTL_DAYS=0`` means the code never expires."""
+    monkeypatch.setattr(settings, "transfer_ttl_days", 0, raising=False)
+    device = f"forever-{uuid.uuid4()}"
+    async with _client() as client:
+        code = await _register_code(client, device, "smoke-pass-1")
+
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(AccountTransfer).where(AccountTransfer.transfer_id == code["id"])
+            )
+        ).scalar_one()
+    assert row.expires_at == FAR_FUTURE
+
+
+@pytest.mark.asyncio
+async def test_a_short_password_is_refused() -> None:
+    """The ID is eight digits, so the password carries the account's safety."""
+    device = f"shortpw-{uuid.uuid4()}"
+    async with _client() as client:
+        await _sign_in(client, device)
+        res = await client.post(
+            "/identity/transfer",
+            headers={"deviceAccount": device},
+            json={"id": f"DK{uuid.uuid4().hex[:6].upper()}", "password": "1234"},
+        )
+    assert res.status_code == 400
+    assert res.json()["code"] == "LCX_TRANSFER_PASSWORD_TOO_SHORT"
+
+
+@pytest.mark.asyncio
+async def test_registering_a_new_code_retires_the_old_one() -> None:
+    """A player who regenerates should not leave live credentials behind."""
+    device = f"rotate-{uuid.uuid4()}"
+    async with _client() as client:
+        first = await _register_code(client, device, "smoke-pass-1")
+        second = await _register_code(client, device, "smoke-pass-2")
+
+        retired = await _execute(client, first["id"], "smoke-pass-1", f"dst-{uuid.uuid4()}")
+        current = await _execute(client, second["id"], "smoke-pass-2", f"dst-{uuid.uuid4()}")
+
+    assert retired.status_code == 400
+    assert retired.json()["code"] == "LCX_TRANSFER_ID_NOT_FOUND"
+    assert current.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_repeated_guesses_are_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long-lived code must not be guessable at script speed."""
+    monkeypatch.setattr(settings, "transfer_attempts_per_hour", 3, raising=False)
+    device = f"throttle-{uuid.uuid4()}"
+    async with _client() as client:
+        code = await _register_code(client, device, "smoke-pass-1")
+
+        statuses = []
+        for _ in range(5):
+            attempt = await _execute(client, code["id"], "wrong-password", f"dst-{uuid.uuid4()}")
+            statuses.append((attempt.status_code, attempt.json().get("code")))
+
+    assert statuses[0] == (400, "LCX_INVALID_TRANSFER_ID_OR_PASSWORD")
+    assert statuses[-1] == (429, "LCX_TOO_MANY_ATTEMPTS")

@@ -46,6 +46,22 @@ logger = logging.getLogger("dankagu.lcx.router")
 
 router = APIRouter(tags=["LCX"])
 
+#: Sentinel the rest of the codebase uses for "no expiry" on integer timestamps.
+FAR_FUTURE = 4102498799
+
+#: Failed transfer attempts, per transfer id, as a list of epoch seconds. A long-lived
+#: code is worth guessing at, so guesses are cheap to count and expensive to repeat.
+_transfer_attempts: dict[str, list[int]] = {}
+
+
+def _throttle_check(transfer_id: str, now: int) -> bool:
+    """Record an attempt and say whether it is still within the hourly allowance."""
+    hour_ago = now - 3600
+    attempts = [stamp for stamp in _transfer_attempts.get(transfer_id, []) if stamp > hour_ago]
+    attempts.append(now)
+    _transfer_attempts[transfer_id] = attempts
+    return len(attempts) <= settings.transfer_attempts_per_hour
+
 
 class CustomerServiceResponse(BaseModel):
     url: str = ""
@@ -322,6 +338,19 @@ async def post_transfer_register(
             },
         )
 
+    if len(password) < settings.transfer_min_password_length:
+        # The ID is eight digits; the password is the whole lock, so refuse a short one
+        # instead of minting a credential that a script can brute force.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "LCX_TRANSFER_PASSWORD_TOO_SHORT",
+                "message": (
+                    f"Password must be at least {settings.transfer_min_password_length} characters"
+                ),
+            },
+        )
+
     player = await _resolve_or_create_player(db, request)
 
     # Check if active unused transfer already exists with this ID
@@ -341,7 +370,27 @@ async def post_transfer_register(
             },
         )
 
-    expires_at = now + 90 * 86400  # 90 days validity
+    # Registering a new code invalidates this player's older unused ones: a player who
+    # has screenshotted a code several times should not leave a trail of live
+    # credentials behind, and "generate a fresh one" is the revocation they have.
+    revoked = await db.execute(
+        delete(AccountTransfer).where(
+            AccountTransfer.player_id == player.id,
+            AccountTransfer.is_used.is_(False),
+        )
+    )
+    if revoked.rowcount:
+        logger.info(
+            "🎫 [Transfer] Replaced %d older unused code(s) for player %s",
+            revoked.rowcount,
+            player.id,
+        )
+
+    # ``0`` means no expiry at all; the rest of the codebase treats 4102498799 as
+    # "far future", which also keeps ``expires_at`` a plain ascending integer.
+    expires_at = (
+        now + settings.transfer_ttl_days * 86400 if settings.transfer_ttl_days > 0 else FAR_FUTURE
+    )
     transfer = AccountTransfer(
         transfer_id=transfer_id,
         player_id=player.id,
@@ -393,6 +442,22 @@ async def post_transfer_execute(
     stmt = select(AccountTransfer).where(AccountTransfer.transfer_id == transfer_id)
     res = await db.execute(stmt)
     transfer = res.scalars().first()
+
+    # Throttle before looking anything up: a long-lived code must not be guessable at
+    # script speed, and counting the attempt costs nothing.
+    if not _throttle_check(transfer_id, now):
+        logger.warning(
+            "🎫 [Transfer] Throttled after %d attempts for id %r",
+            settings.transfer_attempts_per_hour,
+            transfer_id,
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "code": "LCX_TOO_MANY_ATTEMPTS",
+                "message": "Too many attempts; try again later",
+            },
+        )
 
     # Diagnostics matter here: the client shows one generic string for every
     # failure, so the server has to say *which* one happened or an operator is

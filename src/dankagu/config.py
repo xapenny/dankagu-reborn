@@ -114,6 +114,23 @@ class Settings(BaseSettings):
     #: legitimately refreshes without any device information.
     require_device_bound_tokens: bool = True
 
+    # Transfer codes (引継ぎID) -- the only way a player gets an account back when they
+    # have lost the app data, so they should outlive a phone.
+    #: How long a transfer code stays usable (``DANKAGU_TRANSFER_TTL_DAYS``).
+    #: Default 3650 days (ten years, effectively permanent); ``0`` means no expiry at
+    #: all, stored as the far-future sentinel the rest of the codebase uses. A code is a
+    #: bearer credential -- whoever holds the ID and password takes the account over --
+    #: so the protections below matter more the longer this is.
+    transfer_ttl_days: int = 3650
+    #: Shortest password a player may set on a transfer code
+    #: (``DANKAGU_TRANSFER_MIN_PASSWORD_LENGTH``). The ID is only eight digits, so the
+    #: password is what actually protects the account.
+    transfer_min_password_length: int = 8
+    #: Failed execute attempts allowed per transfer ID per hour
+    #: (``DANKAGU_TRANSFER_ATTEMPTS_PER_HOUR``); beyond it the ID is throttled. Without
+    #: this a long-lived code is an open invitation to guess passwords.
+    transfer_attempts_per_hour: int = 20
+
     # Database
     db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"
 
