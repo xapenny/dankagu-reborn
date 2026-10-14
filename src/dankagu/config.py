@@ -107,31 +107,29 @@ class Settings(BaseSettings):
     #: token's useful life. Shortening it makes the client re-sign-in sooner, which is
     #: only safe because a re-sign-in from the same device recovers the same account.
     sign_in_session_ttl_seconds: int = 86400 * 30
-    #: When true, a request that carries no token and matches an *already onboarded*
-    #: account by ``device_account`` re-attaches to that account. Off by default.
-    #:
-    #: Reason: on the Android build this deployment ships, that identifier is
-    #: **build-scoped** -- every install of the same APK reports the same value (proved
-    #: against two devices with different ``ANDROID_ID``s that still sent the same one),
-    #: while iOS reports a genuine per-device value. Keying an onboarded account on it
-    #: therefore hands the first install's account to everybody else, and that account
-    #: is already onboarded, so the client never asks for a name or birthday.
-    #:
-    #: Off, a request without a token registers a **new** account -- which is what the
-    #: live service did for guests as well (an install was a guest account until it was
-    #: *linked*, and moving one used a transfer code). Continuity then comes from the
-    #: stored token or a transfer code, never from a guess.
-    #:
-    #: A device match is still honoured for an account that has **not** been onboarded:
-    #: such a row belongs to an install that abandoned registration, so reusing it
-    #: costs nobody anything and keeps the player table tidy.
-    reuse_device_account_when_onboarded: bool = False
     #: When true, a session token that records no device binding is rejected as soon
     #: as the request carries a device identifier. Tokens issued before device
     #: binding existed (2026-10-13) therefore stop working on a real client and the
     #: player signs in once more. Set it to false only while migrating a client that
     #: legitimately refreshes without any device information.
     require_device_bound_tokens: bool = True
+
+    # Transfer codes (引継ぎID) -- the only way a player gets an account back when they
+    # have lost the app data, so they should outlive a phone.
+    #: How long a transfer code stays usable (``DANKAGU_TRANSFER_TTL_DAYS``).
+    #: Default 3650 days (ten years, effectively permanent); ``0`` means no expiry at
+    #: all, stored as the far-future sentinel the rest of the codebase uses. A code is a
+    #: bearer credential -- whoever holds the ID and password takes the account over --
+    #: so the protections below matter more the longer this is.
+    transfer_ttl_days: int = 3650
+    #: Shortest password a player may set on a transfer code
+    #: (``DANKAGU_TRANSFER_MIN_PASSWORD_LENGTH``). The ID is only eight digits, so the
+    #: password is what actually protects the account.
+    transfer_min_password_length: int = 8
+    #: Failed execute attempts allowed per transfer ID per hour
+    #: (``DANKAGU_TRANSFER_ATTEMPTS_PER_HOUR``); beyond it the ID is throttled. Without
+    #: this a long-lived code is an open invitation to guess passwords.
+    transfer_attempts_per_hour: int = 20
 
     # Database
     db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"

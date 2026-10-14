@@ -115,12 +115,12 @@ async def resolve_or_create_player(
     device_account = normalise_device_account(device_account)
     player, matched_by = await find_player(session, user_id=user_id, device_account=device_account)
 
-    if (
-        player is not None
-        and matched_by == "device_account"
-        and is_onboarded(player)
-        and not settings.reuse_device_account_when_onboarded
-    ):
+    if player is not None and matched_by == "device_account" and is_onboarded(player):
+        # A device identifier may not decide who owns an account that has been onboarded.
+        # On the Android build this deployment ships it is build-scoped -- every install
+        # reports the same value -- so honouring it here handed the first install's
+        # account (already onboarded, hence no name or birthday prompt) to everybody
+        # else. Such a request registers a separate account instead.
         logger.warning(
             "🔒 device_account %r already belongs to onboarded player %s; "
             "registering a separate account instead",

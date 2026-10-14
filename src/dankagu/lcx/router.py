@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.config import settings
@@ -45,6 +46,22 @@ from dankagu.models.wallet import WalletBalance
 logger = logging.getLogger("dankagu.lcx.router")
 
 router = APIRouter(tags=["LCX"])
+
+#: Sentinel the rest of the codebase uses for "no expiry" on integer timestamps.
+FAR_FUTURE = 4102498799
+
+#: Failed transfer attempts, per transfer id, as a list of epoch seconds. A long-lived
+#: code is worth guessing at, so guesses are cheap to count and expensive to repeat.
+_transfer_attempts: dict[str, list[int]] = {}
+
+
+def _throttle_check(transfer_id: str, now: int) -> bool:
+    """Record an attempt and say whether it is still within the hourly allowance."""
+    hour_ago = now - 3600
+    attempts = [stamp for stamp in _transfer_attempts.get(transfer_id, []) if stamp > hour_ago]
+    attempts.append(now)
+    _transfer_attempts[transfer_id] = attempts
+    return len(attempts) <= settings.transfer_attempts_per_hour
 
 
 class CustomerServiceResponse(BaseModel):
@@ -177,13 +194,9 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 "Session token was issued to another device",
             )
 
-        # Two token states cannot stand on their own: a token minted before device
-        # binding existed (no ``deviceHash`` to compare) and one whose lifetime ran
-        # out. Neither is refused outright, because that locked every existing install
-        # out of its own account (2026-10-13) -- the claim is checked against the
-        # database instead: the account must already belong to this device, or have no
-        # device yet (first claim). A stale token copied to another device still fails
-        # here, which is what gives a leaked token a finite life.
+        # An unbound or expired claim proves nothing about the account it names, so it is
+        # checked against the database: the account must belong to this device already, or
+        # have no device yet.
         if (
             request_device
             and settings.require_device_bound_tokens
@@ -191,30 +204,30 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         ):
             owner, _matched = await find_player(db, user_id=user_id, device_account=None)
             if owner is None or (owner.device_account and owner.device_account != request_device):
+                # Not this device's account: register a new player instead of refusing, or
+                # the client re-presents the same token forever. The user id is dropped, so
+                # the account it named can never be reached from here.
                 state = "expired" if expired_claim else "pre-dates device binding"
                 logger.warning(
-                    "🔒 [Auth] Rejected %s token for device %r: account %s is %s",
+                    "🆕 [Auth] %s token for device %r names account %s, which is %s; "
+                    "registering a new player for this device instead",
                     state,
                     request_device,
                     user_id,
                     "unknown" if owner is None else f"bound to {owner.device_account!r}",
                 )
-                raise LcxApiError(
-                    status.HTTP_401_UNAUTHORIZED,
-                    "LCX_SESSION_EXPIRED" if expired_claim else "LCX_SESSION_NOT_BOUND_TO_DEVICE",
-                    "Session token is no longer valid for this device; sign in again",
+                user_id = None
+            else:
+                # This device owns the account: accept it and claim the binding if free.
+                if not owner.device_account:
+                    owner.device_account = request_device
+                    await db.commit()
+                logger.info(
+                    "🔗 [Auth] Accepted %s token for player %s on device %r",
+                    "expired" if expired_claim else "pre-binding",
+                    owner.id,
+                    request_device,
                 )
-            # This device owns the account: accept, and bind it if it never was, so the
-            # tokens issued below carry the binding and the strict check applies next time.
-            if not owner.device_account:
-                owner.device_account = request_device
-                await db.commit()
-            logger.info(
-                "🔗 [Auth] Accepted %s token for player %s on device %r",
-                "expired" if expired_claim else "pre-binding",
-                owner.id,
-                request_device,
-            )
         elif expired_claim:
             # Nothing to verify the claim against; refusing here would lock out any
             # client that does not send device information at all.
@@ -225,6 +238,19 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
             )
     elif presented_token:
         logger.warning("🔒 [Auth] Ignoring unverifiable token presented by the client")
+
+    if user_id:
+        # The named account is gone (replaced by a transfer, or deleted): same rule, a new
+        # player for this device.
+        known, _matched = await find_player(db, user_id=user_id, device_account=None)
+        if known is None:
+            logger.warning(
+                "🆕 [Auth] Token names unknown user_id=%s from device %r; "
+                "registering a new player instead",
+                user_id,
+                normalise_device_account(device_account),
+            )
+            user_id = None
 
     player, _matched_by = await resolve_or_create_player(
         db, user_id=user_id, device_account=device_account
@@ -322,6 +348,19 @@ async def post_transfer_register(
             },
         )
 
+    if len(password) < settings.transfer_min_password_length:
+        # The ID is eight digits; the password is the whole lock, so refuse a short one
+        # instead of minting a credential that a script can brute force.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "LCX_TRANSFER_PASSWORD_TOO_SHORT",
+                "message": (
+                    f"Password must be at least {settings.transfer_min_password_length} characters"
+                ),
+            },
+        )
+
     player = await _resolve_or_create_player(db, request)
 
     # Check if active unused transfer already exists with this ID
@@ -341,7 +380,41 @@ async def post_transfer_register(
             },
         )
 
-    expires_at = now + 90 * 86400  # 90 days validity
+    # Registering a new code invalidates this player's older unused ones: a player who
+    # has screenshotted a code several times should not leave a trail of live
+    # credentials behind, and "generate a fresh one" is the revocation they have.
+    revoked = await db.execute(
+        delete(AccountTransfer).where(
+            AccountTransfer.player_id == player.id,
+            AccountTransfer.is_used.is_(False),
+        )
+    )
+    if revoked.rowcount:
+        logger.info(
+            "🎫 [Transfer] Replaced %d older unused code(s) for player %s",
+            revoked.rowcount,
+            player.id,
+        )
+
+    # A spent or expired row with this id is only a leftover, and ``transfer_id`` is the
+    # primary key: re-registering a code the player has already used collided with it and
+    # answered a bare 500. Anything still here is not active (checked above), so it is
+    # replaced.
+    replaced = await db.execute(
+        delete(AccountTransfer).where(AccountTransfer.transfer_id == transfer_id)
+    )
+    if replaced.rowcount:
+        logger.info(
+            "🎫 [Transfer] Replaced %d spent/expired row(s) holding id %r",
+            replaced.rowcount,
+            transfer_id,
+        )
+
+    # ``0`` means no expiry at all; the rest of the codebase treats 4102498799 as
+    # "far future", which also keeps ``expires_at`` a plain ascending integer.
+    expires_at = (
+        now + settings.transfer_ttl_days * 86400 if settings.transfer_ttl_days > 0 else FAR_FUTURE
+    )
     transfer = AccountTransfer(
         transfer_id=transfer_id,
         player_id=player.id,
@@ -393,6 +466,22 @@ async def post_transfer_execute(
     stmt = select(AccountTransfer).where(AccountTransfer.transfer_id == transfer_id)
     res = await db.execute(stmt)
     transfer = res.scalars().first()
+
+    # Throttle before looking anything up: a long-lived code must not be guessable at
+    # script speed, and counting the attempt costs nothing.
+    if not _throttle_check(transfer_id, now):
+        logger.warning(
+            "🎫 [Transfer] Throttled after %d attempts for id %r",
+            settings.transfer_attempts_per_hour,
+            transfer_id,
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "code": "LCX_TOO_MANY_ATTEMPTS",
+                "message": "Too many attempts; try again later",
+            },
+        )
 
     # Diagnostics matter here: the client shows one generic string for every
     # failure, so the server has to say *which* one happened or an operator is
@@ -475,9 +564,40 @@ async def post_transfer_execute(
         or _device_from_verification_token(str(body.get("verificationToken", "")))
     )
     if device_account:
+        # The device belongs to the account being moved, so the account living on it is
+        # replaced -- the same deletion the client's own deactivate flow performs.
+        resident, _matched = await find_player(db, user_id=None, device_account=device_account)
+        if resident is not None and resident.id != target_player.id:
+            logger.warning(
+                "🎫 [Transfer] id=%s replaces the account on device %r: "
+                "deleting player=%s (user_id=%s)",
+                transfer_id,
+                device_account,
+                resident.id,
+                resident.user_id,
+            )
+            await _delete_player_account(db, resident)
+
         target_player.device_account = device_account
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Roll back so the code stays unused, and answer in the envelope the client reads.
+        await db.rollback()
+        logger.exception(
+            "🎫 [Transfer] id=%s could not move player=%s to device=%r",
+            transfer_id,
+            transfer.player_id,
+            device_account,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "LCX_TRANSFER_FAILED",
+                "message": "The account could not be moved to this device; try again",
+            },
+        )
 
     # The account now lives on the new device: every session the old device held
     # must stop working, otherwise the transfer leaves two live devices behind.
@@ -570,6 +690,25 @@ async def post_sign_out(request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+async def _delete_player_account(db: AsyncSession, player: Player) -> None:
+    """Delete an account and everything it owns. Commits nothing; the caller decides."""
+    pid = player.id
+    # Explicit deletes, because ``player_storage_entries`` carries no foreign key.
+    await db.execute(delete(PlayerStorageEntry).where(PlayerStorageEntry.player_id == pid))
+    await db.execute(delete(Session).where(Session.player_id == pid))
+    # Codes are revoked, not deleted, so an issued one cannot vanish behind "wrong code".
+    await db.execute(
+        update(AccountTransfer)
+        .where(AccountTransfer.player_id == pid)
+        .values(player_id=None, is_used=True)
+    )
+    await db.execute(delete(WalletBalance).where(WalletBalance.player_id == pid))
+    await db.execute(delete(PlayerInventoryItem).where(PlayerInventoryItem.player_id == pid))
+    await db.execute(delete(Player).where(Player.id == pid))
+    invalidate_player_sessions(pid)
+    logger.warning("🗑️ Deleted account player_id=%s user_id=%s", pid, player.user_id)
+
+
 @router.post("/identity/deactivate-user")
 async def post_deactivate_user(
     request: Request,
@@ -602,27 +741,9 @@ async def post_deactivate_user(
             content={"code": "LCX_UNAUTHORIZED", "message": "Unknown or missing user"},
         )
 
-    pid = player.id
-    # Explicit deletes: player_storage_entries has no FK, and SQLite does not
-    # enforce ON DELETE CASCADE unless the pragma is on.
-    await db.execute(delete(PlayerStorageEntry).where(PlayerStorageEntry.player_id == pid))
-    await db.execute(delete(Session).where(Session.player_id == pid))
-    # Transfer codes are detached and revoked instead of deleted: an issued code
-    # must not vanish silently behind "transfer ID or password is wrong" when the
-    # player tries to use it after the account is gone (2026-10-13 report). A
-    # detached, revoked row can never restore anything.
-    await db.execute(
-        update(AccountTransfer)
-        .where(AccountTransfer.player_id == pid)
-        .values(player_id=None, is_used=True)
-    )
-    await db.execute(delete(WalletBalance).where(WalletBalance.player_id == pid))
-    await db.execute(delete(PlayerInventoryItem).where(PlayerInventoryItem.player_id == pid))
-    await db.execute(delete(Player).where(Player.id == pid))
+    await _delete_player_account(db, player)
     await db.commit()
-    invalidate_player_sessions(pid)
 
-    logger.info("🗑️ Deleted account player_id=%s user_id=%s", pid, player.user_id)
     return {"success": True}
 
 

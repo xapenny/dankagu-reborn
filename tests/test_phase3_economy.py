@@ -13,6 +13,7 @@ from dankagu.core.economy import (
     _parse_card_fields,
     add_stones,
     deduct_stones,
+    encode_card_status,
     persist_card_to_storage,
 )
 from dankagu.core.session import set_current_player
@@ -218,15 +219,28 @@ async def test_lootbox_purchase_flow(sample_player: Player) -> None:
         assert w is not None
         assert w.free_stones == 58500
 
-    # Simulate client saving the drawn cards via SetEntriesV2
+    # Simulate client saving the drawn cards via SetEntriesV2. Each entry carries its own
+    # card id, the way the client writes them: a constant payload would describe ten
+    # copies of one card, which the storage layer now (correctly) folds into a single
+    # entry with a duplicate counter.
     storage_servicer = PlayerStorageService()
     set_req = player_storage_pb2.PlayerStorageSetEntriesV2.Request()
     set_req.next_revision = "3"
     written_keys: set[str] = set()
     for i, _inv in enumerate(resp.player_inventories):
+        instance_id = 916102786790457300 + i
         e = set_req.entries.add()
-        e.key = f"CardStatus--9161027867904573{i:02d}"
-        e.value = b"\x08\x01\x10\x64"
+        e.key = f"CardStatus--{instance_id}"
+        e.value = encode_card_status(
+            instance_id=instance_id,
+            card_id=100000 + i,
+            created_at=1,
+            updated_at=1,
+            blossom=1,
+            exp=0,
+            duplicate=1,
+            status=1,
+        )
         written_keys.add(e.key)
     await storage_servicer.SetEntriesV2(set_req, ctx)
 
