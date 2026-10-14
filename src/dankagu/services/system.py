@@ -5,19 +5,18 @@ import time
 import uuid
 
 import grpc
-from sqlalchemy import select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.growth import create_daily_reward_mail_items
+from dankagu.core.identity import resolve_or_create_player
 from dankagu.core.session import create_session, get_current_player_id, set_current_player
-from dankagu.core.starter import seed_starter_player
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     system_pb2,
     system_pb2_grpc,
 )
 from dankagu.lcx.tokens import decode_token_user_id
-from dankagu.models.player import Player, allocate_short_id
+from dankagu.models.player import Player
 
 logger = logging.getLogger("dankagu.services.system")
 
@@ -83,37 +82,13 @@ class SystemService(system_pb2_grpc.SystemServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            player: Player | None = None
-            if user_id:
-                stmt = select(Player).where(Player.user_id == user_id)
-                res = await session.execute(stmt)
-                player = res.scalars().first()
+            # Identity rules are shared with the LCX surface so both entry points
+            # resolve the same device to the same player (see core.identity).
+            player, matched_by = await resolve_or_create_player(
+                session, user_id=user_id, device_account=device_account
+            )
 
-            if player is None and device_account:
-                stmt = select(Player).where(Player.device_account == device_account)
-                res = await session.execute(stmt)
-                player = res.scalars().first()
-
-            if player is None:
-                new_user_id = user_id or str(uuid.uuid4())
-                new_dev = device_account or str(uuid.uuid4())
-                short_id = await allocate_short_id(session)
-                player = Player(
-                    user_id=new_user_id,
-                    device_account=new_dev,
-                    short_id=short_id,
-                    registered_at=now,
-                    last_login_at=now,
-                    total_login_days=1,
-                )
-                session.add(player)
-                await session.flush()
-
-                # Seed starter wallet and player storage entries
-                await seed_starter_player(session, player)
-                await session.commit()
-                await session.refresh(player)
-            else:
+            if matched_by != "created":
                 process_player_login(session, player, now)
                 if device_account and not player.device_account:
                     player.device_account = device_account

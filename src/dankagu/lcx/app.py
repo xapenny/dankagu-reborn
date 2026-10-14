@@ -9,6 +9,8 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from dankagu.core.database import init_db
+from dankagu.core.redaction import redact_text
+from dankagu.lcx.errors import LcxApiError, lcx_api_error_handler
 from dankagu.lcx.router import router as lcx_router
 
 logger = logging.getLogger("dankagu.http")
@@ -61,6 +63,8 @@ def create_lcx_app() -> FastAPI:
 
         req_body = await request.body()
         req_body_str = req_body.decode("utf-8", errors="replace").strip() if req_body else "(empty)"
+        # Redact before truncating: half a token has no closing quote to match on.
+        req_body_str = redact_text(req_body_str)
 
         logger.info(
             "📥 [LCX HTTP REQ] %s %s from %s (Host: %s)\n   Payload: %s",
@@ -68,7 +72,7 @@ def create_lcx_app() -> FastAPI:
             request.url.path,
             client_host,
             request.headers.get("host", ""),
-            req_body_str[:1000] if len(req_body_str) > 1000 else req_body_str,
+            req_body_str[:1000],
         )
 
         response = await call_next(request)
@@ -81,6 +85,8 @@ def create_lcx_app() -> FastAPI:
         resp_body_str = (
             resp_body.decode("utf-8", errors="replace").strip() if resp_body else "(empty)"
         )
+        # Redact before truncating: the response carries freshly minted tokens.
+        resp_body_str = redact_text(resp_body_str)
         new_response = Response(
             content=resp_body,
             status_code=response.status_code,
@@ -114,10 +120,11 @@ def create_lcx_app() -> FastAPI:
                 request.url.path,
                 response.status_code,
                 duration_ms,
-                resp_body_str[:1000] if len(resp_body_str) > 1000 else resp_body_str,
+                resp_body_str[:1000],
             )
         return new_response
 
+    app.add_exception_handler(LcxApiError, lcx_api_error_handler)
     app.include_router(lcx_router)
 
     return app

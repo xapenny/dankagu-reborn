@@ -16,6 +16,7 @@ regress silently again.
 """
 
 import pytest
+from player_factory import ensure_player
 
 from dankagu.core.session import reset_current_player, set_current_player
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
@@ -53,7 +54,7 @@ async def _read_back(
     service: PlayerStorageService, key: str, player_id: str = "upsert-player"
 ) -> bytes | None:
     """Fetch a single key back through the service's own read path."""
-    tokens = set_current_player(player_id)
+    tokens = set_current_player(await ensure_player(player_id))
     try:
         request = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
             criteria=[Criterion(key=key, matching_type=Criterion.MatchingType.EXACT)]
@@ -75,7 +76,7 @@ async def test_set_entries_v2_twice_with_same_key_updates_in_place() -> None:
     key = "UpsertRegression--1"
     pid = "upsert-player"
 
-    tokens = set_current_player(pid)
+    tokens = set_current_player(await ensure_player(pid))
     try:
         first = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
             entries=[Entry(player_id=pid, key=key, value=b"\x01\x02")],
@@ -100,7 +101,7 @@ async def test_set_entries_v2_defaults_blank_player_id() -> None:
     """When the client sends an empty player_id in entry, it is coerced to the authenticated player_id."""
     service = PlayerStorageService()
     pid = "authenticated-player"
-    tokens = set_current_player(pid)
+    tokens = set_current_player(await ensure_player(pid))
     try:
         request = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
             entries=[Entry(player_id="", key="BlankPlayerId--1", value=b"\x07")],
@@ -126,7 +127,7 @@ async def test_pkvs_increment_and_save_is_idempotent_for_entries() -> None:
             next_revision="rev-1",
         )
 
-    tokens = set_current_player(pid)
+    tokens = set_current_player(await ensure_player(pid))
     try:
         await service.IncrementPlayerKeyValuesAndSavePlayerStorageV1(make_request(b"\x01"), context)  # type: ignore[arg-type]
         response = await service.IncrementPlayerKeyValuesAndSavePlayerStorageV1(  # type: ignore[arg-type]

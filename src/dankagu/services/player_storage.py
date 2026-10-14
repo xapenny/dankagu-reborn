@@ -11,6 +11,7 @@ from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
+from dankagu.grpc.errors import fail_internal_on_error
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_storage_pb2,
     player_storage_pb2_grpc,
@@ -131,6 +132,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         )
         self._templates_loaded = True
 
+    @fail_internal_on_error("Failed to read player storage entries")
     async def GetEntriesV2(
         self,
         request: player_storage_pb2.PlayerStorageGetEntriesV2.Request,
@@ -212,6 +214,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
 
         return response
 
+    @fail_internal_on_error("Failed to persist player storage entries")
     async def SetEntriesV2(
         self,
         request: player_storage_pb2.PlayerStorageSetEntriesV2.Request,

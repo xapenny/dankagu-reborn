@@ -1,18 +1,23 @@
 """Account deletion (`/identity/deactivate-user`) must actually remove data.
 
-Each test signs in with its own fresh ``userId`` so it only ever deletes the
-player it created, never a real account in the shared database.
+Each test signs in from its own fresh ``deviceAccount`` so it only ever deletes
+the player it created, never a real account in the shared database.
+
+Identities are taken from the server response rather than asserted upfront: a
+bare ``userId`` in the request body is deliberately **not** trusted as an identity
+any more (it let anybody claim somebody else's account).
 """
 
 import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, text
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.lcx.app import create_lcx_app
 from dankagu.models.player import Player
+from dankagu.models.social import MySpaceLikeRecord, PhotoLikeRecord, PlayerPhoto
 from dankagu.models.storage import PlayerStorageEntry
 
 _BASE = "https://danmakujp4-v1.lcx.tokyo"
@@ -38,12 +43,14 @@ async def _player_and_storage_count(user_id: str) -> tuple[Player | None, int]:
 
 @pytest.mark.asyncio
 async def test_deactivate_user_deletes_player_and_storage() -> None:
-    user_id = f"delete-test-{uuid.uuid4()}"
+    device = f"delete-test-device-{uuid.uuid4()}"
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
-        sign_in = await client.post("/identity/sign-in", json={"userId": user_id})
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device})
         assert sign_in.status_code == 200
-        access_token = sign_in.json()["accessToken"]
+        sign_in_body = sign_in.json()
+        user_id = sign_in_body["user"]["id"]
+        access_token = sign_in_body["accessToken"]
 
         player, storage_rows = await _player_and_storage_count(user_id)
         assert player is not None
@@ -63,17 +70,98 @@ async def test_deactivate_user_deletes_player_and_storage() -> None:
 
 @pytest.mark.asyncio
 async def test_deactivate_user_without_token_deletes_nothing() -> None:
-    user_id = f"delete-test-{uuid.uuid4()}"
+    device = f"delete-test-device-{uuid.uuid4()}"
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
-        sign_in = await client.post("/identity/sign-in", json={"userId": user_id})
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device})
         assert sign_in.status_code == 200
+        user_id = sign_in.json()["user"]["id"]
 
         res = await client.post("/identity/deactivate-user", json=_BODY)
         assert res.status_code == 401
 
     player, _ = await _player_and_storage_count(user_id)
     assert player is not None
+
+
+async def test_deleting_the_player_row_cascades_every_player_scoped_table() -> None:
+    """The database itself must remove the account's data, not a hand-kept table list.
+
+    ``player_storage_entries``, ``player_photos``, ``photo_likes`` and
+    ``my_space_likes`` had no foreign key, so anything the application forgot survived
+    a deletion. This deletes the ``players`` row directly -- the way an operator's SQL
+    would -- and expects every dependent row to be gone.
+    """
+    device = f"cascade-test-{uuid.uuid4()}"
+    app = create_lcx_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+        sign_in = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+        assert sign_in.status_code == 200
+        user_id = sign_in.json()["user"]["id"]
+
+    async with get_sessionmaker()() as session:
+        player = (
+            await session.execute(select(Player).where(Player.user_id == user_id))
+        ).scalar_one()
+        player_id = player.id
+
+        other = Player(user_id=f"cascade-other-{uuid.uuid4()}", registered_at=0)
+        session.add(other)
+        await session.flush()
+
+        session.add(
+            PlayerPhoto(
+                photo_id=f"photo-{uuid.uuid4()}",
+                player_id=player_id,
+                character_ids=[],
+                category="",
+                content_value=b"",
+                original_url="",
+                thumbnail_url="",
+                created_at=0,
+            )
+        )
+        await session.flush()
+        photo_id = (
+            await session.execute(
+                select(PlayerPhoto.photo_id).where(PlayerPhoto.player_id == player_id)
+            )
+        ).scalar_one()
+
+        session.add(PhotoLikeRecord(photo_id=photo_id, player_id=other.id, created_at=0))
+        session.add(MySpaceLikeRecord(from_player_id=other.id, to_player_id=player_id, liked_at=0))
+        await session.commit()
+
+    async with get_sessionmaker()() as session:
+        await session.execute(delete(Player).where(Player.id == player_id))
+        await session.commit()
+
+        remaining = {
+            "player_storage_entries": await _count(
+                "player_storage_entries", "player_id", player_id
+            ),
+            "player_photos": await _count("player_photos", "player_id", player_id),
+            "photo_likes": await _count("photo_likes", "player_id", player_id),
+            "my_space_likes": await _count("my_space_likes", "to_player_id", player_id),
+        }
+    assert remaining == {
+        "player_storage_entries": 0,
+        "player_photos": 0,
+        "photo_likes": 0,
+        "my_space_likes": 0,
+    }
+
+
+async def _count(table: str, column: str, value: str) -> int:
+    async with get_sessionmaker()() as session:
+        return int(
+            (
+                await session.execute(
+                    text(f"SELECT count(*) FROM {table} WHERE {column} = :value"),
+                    {"value": value},
+                )
+            ).scalar_one()
+        )
 
 
 @pytest.mark.asyncio
@@ -121,19 +209,23 @@ async def test_deactivate_and_re_signin_creates_fresh_player() -> None:
 @pytest.mark.asyncio
 async def test_deactivate_user_does_not_affect_other_players() -> None:
     """Deleting User A must strictly isolate and leave User B completely intact."""
-    user_a = f"user-a-{uuid.uuid4()}"
-    user_b = f"user-b-{uuid.uuid4()}"
-
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
         # Create Player A
-        sign_in_a = await client.post("/identity/sign-in", json={"userId": user_a})
+        sign_in_a = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": f"user-a-{uuid.uuid4()}"}
+        )
         assert sign_in_a.status_code == 200
-        token_a = sign_in_a.json()["accessToken"]
+        body_a = sign_in_a.json()
+        user_a = body_a["user"]["id"]
+        token_a = body_a["accessToken"]
 
         # Create Player B
-        sign_in_b = await client.post("/identity/sign-in", json={"userId": user_b})
+        sign_in_b = await client.post(
+            "/identity/sign-in", headers={"deviceAccount": f"user-b-{uuid.uuid4()}"}
+        )
         assert sign_in_b.status_code == 200
+        user_b = sign_in_b.json()["user"]["id"]
 
         # Verify both exist before deletion
         p_a, count_a = await _player_and_storage_count(user_a)

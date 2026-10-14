@@ -57,8 +57,18 @@ class MySpaceLikeRecord(Base):
     __tablename__ = "my_space_likes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    from_player_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
-    to_player_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    from_player_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="CASCADE", name="fk_myspace_like_from"),
+        index=True,
+        nullable=False,
+    )
+    to_player_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="CASCADE", name="fk_myspace_like_to"),
+        index=True,
+        nullable=False,
+    )
     liked_at: Mapped[int] = mapped_column(
         BigInteger, default=lambda: int(time.time()), index=True, nullable=False
     )
@@ -72,7 +82,12 @@ class PlayerPhoto(Base):
     photo_id: Mapped[str] = mapped_column(
         String(64), primary_key=True, default=lambda: str(uuid.uuid4())
     )
-    player_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    player_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="CASCADE", name="fk_photo_player"),
+        index=True,
+        nullable=False,
+    )
     character_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     category: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     content_value: Mapped[bytes] = mapped_column(LargeBinary, default=b"", nullable=False)
@@ -95,8 +110,18 @@ class PhotoLikeRecord(Base):
     __table_args__ = (UniqueConstraint("photo_id", "player_id", name="uq_photo_like_player"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    photo_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
-    player_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    photo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("player_photos.photo_id", ondelete="CASCADE", name="fk_photo_like_photo"),
+        index=True,
+        nullable=False,
+    )
+    player_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="CASCADE", name="fk_photo_like_player"),
+        index=True,
+        nullable=False,
+    )
     created_at: Mapped[int] = mapped_column(
         BigInteger, default=lambda: int(time.time()), nullable=False
     )

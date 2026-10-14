@@ -9,13 +9,23 @@ from dankagu.core.database import Base
 
 
 class AccountTransfer(Base):
-    """Represents a transfer code credential for data migration."""
+    """Represents a transfer code credential for data migration.
+
+    ``player_id`` is nullable with ``ON DELETE SET NULL``: when the bound account
+    is deleted the code row survives, so an execute attempt can answer "the
+    account this code belonged to no longer exists" instead of the
+    indistinguishable "invalid transfer ID or password" (2026-10-13 report).
+    A row without a player can never restore anything, so this leaks no data.
+    """
 
     __tablename__ = "account_transfers"
 
     transfer_id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    player_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("players.id", ondelete="CASCADE"), index=True
+    player_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("players.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
     )
     password_hash: Mapped[str] = mapped_column(String(128))
     is_used: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -302,13 +302,14 @@ async def test_account_transfer_full_lifecycle() -> None:
         assert exec_data["user"]["id"] == user_a_id
         dev_b_id_token = exec_data["lcxUserIdToken"]
 
-        # 6. Re-executing already-used transfer code must be rejected
+        # 6. Re-executing already-used transfer code must be rejected, and say why:
+        #    the client shows one generic string, so the server has to be specific.
         reuse_res = await client.post(
             f"/identity/transfer/{transfer_id}/execute",
             json={"password": password},
         )
         assert reuse_res.status_code == 400
-        assert reuse_res.json()["code"] == "LCX_INVALID_TRANSFER_ID_OR_PASSWORD"
+        assert reuse_res.json()["code"] == "LCX_TRANSFER_ID_ALREADY_USED"
 
         # 7. Device B logs into gRPC with the new credentials -> gets original player profile!
         system_service = SystemService()

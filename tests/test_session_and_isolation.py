@@ -14,6 +14,7 @@ from typing import Any
 import grpc
 import pytest
 from httpx import ASGITransport, AsyncClient
+from player_factory import ensure_player
 
 from dankagu.core.session import (
     create_session,
@@ -119,7 +120,7 @@ async def test_player_storage_complete_isolation_between_tenants() -> None:
     val_b = b"\xbb\xbb\xbb\xbb"
 
     # Player A sets key
-    tokens_a = set_current_player(pid_a)
+    tokens_a = set_current_player(await ensure_player(pid_a))
     try:
         set_req_a = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
             entries=[Entry(key=key, value=val_a)],
@@ -131,7 +132,7 @@ async def test_player_storage_complete_isolation_between_tenants() -> None:
         reset_current_player(tokens_a)
 
     # Player B sets the SAME key with different value
-    tokens_b = set_current_player(pid_b)
+    tokens_b = set_current_player(await ensure_player(pid_b))
     try:
         set_req_b = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
             entries=[Entry(key=key, value=val_b)],
@@ -143,7 +144,7 @@ async def test_player_storage_complete_isolation_between_tenants() -> None:
         reset_current_player(tokens_b)
 
     # Player A reads the key back -> must see val_a, NOT val_b
-    tokens_a = set_current_player(pid_a)
+    tokens_a = set_current_player(await ensure_player(pid_a))
     try:
         get_req_a = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
             criteria=[Criterion(key=key, matching_type=Criterion.MatchingType.EXACT)]
@@ -156,7 +157,7 @@ async def test_player_storage_complete_isolation_between_tenants() -> None:
         reset_current_player(tokens_a)
 
     # Player B reads the key back -> must see val_b, NOT val_a
-    tokens_b = set_current_player(pid_b)
+    tokens_b = set_current_player(await ensure_player(pid_b))
     try:
         get_req_b = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
             criteria=[Criterion(key=key, matching_type=Criterion.MatchingType.EXACT)]
@@ -180,7 +181,7 @@ async def test_get_other_player_entries_v2() -> None:
     val = b"\x10\x20\x30\x40"
 
     # Seed target player's entry
-    tokens = set_current_player(target_pid)
+    tokens = set_current_player(await ensure_player(target_pid))
     try:
         await player_storage.SetEntriesV2(
             player_storage_pb2.PlayerStorageSetEntriesV2.Request(
@@ -194,7 +195,7 @@ async def test_get_other_player_entries_v2() -> None:
 
     # Other player queries target_pid's entries
     observer_pid = f"observer-player-{uuid.uuid4()}"
-    tokens_obs = set_current_player(observer_pid)
+    tokens_obs = set_current_player(await ensure_player(observer_pid))
     try:
         other_req = player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Request(
             player_ids=[target_pid],

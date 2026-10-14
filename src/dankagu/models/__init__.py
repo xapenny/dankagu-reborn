@@ -15,6 +15,7 @@ from dankagu.models.master import (
 )
 from dankagu.models.player import Player
 from dankagu.models.ranking import SongLeaderboard
+from dankagu.models.receipt import PurchaseReceipt
 from dankagu.models.session import Session
 from dankagu.models.social import (
     FriendRelation,
@@ -48,6 +49,7 @@ __all__ = [
     "PlayerInventoryItem",
     "PlayerPhoto",
     "PlayerStorageEntry",
+    "PurchaseReceipt",
     "Session",
     "SongLeaderboard",
     "WalletBalance",
