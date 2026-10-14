@@ -156,21 +156,6 @@ async def test_an_abandoned_registration_is_reused() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_behaviour_can_still_be_requested(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``DANKAGU_REUSE_DEVICE_ACCOUNT_WHEN_ONBOARDED=true`` restores the old reuse."""
-    device = f"legacy-reuse-{uuid.uuid4()}"
-    user_id = await _onboarded_device(device)
-    monkeypatch.setattr(settings, "reuse_device_account_when_onboarded", True, raising=False)
-
-    async with _client() as client:
-        again = await client.post("/identity/sign-in", headers={"deviceAccount": device})
-    assert again.status_code == 200
-    assert again.json()["user"]["id"] == user_id
-
-
-@pytest.mark.asyncio
 async def test_sign_out_revokes_the_session_token() -> None:
     from dankagu.core.session import create_session
 

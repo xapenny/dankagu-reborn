@@ -107,25 +107,6 @@ class Settings(BaseSettings):
     #: token's useful life. Shortening it makes the client re-sign-in sooner, which is
     #: only safe because a re-sign-in from the same device recovers the same account.
     sign_in_session_ttl_seconds: int = 86400 * 30
-    #: When true, a request that carries no token and matches an *already onboarded*
-    #: account by ``device_account`` re-attaches to that account. Off by default.
-    #:
-    #: Reason: on the Android build this deployment ships, that identifier is
-    #: **build-scoped** -- every install of the same APK reports the same value (proved
-    #: against two devices with different ``ANDROID_ID``s that still sent the same one),
-    #: while iOS reports a genuine per-device value. Keying an onboarded account on it
-    #: therefore hands the first install's account to everybody else, and that account
-    #: is already onboarded, so the client never asks for a name or birthday.
-    #:
-    #: Off, a request without a token registers a **new** account -- which is what the
-    #: live service did for guests as well (an install was a guest account until it was
-    #: *linked*, and moving one used a transfer code). Continuity then comes from the
-    #: stored token or a transfer code, never from a guess.
-    #:
-    #: A device match is still honoured for an account that has **not** been onboarded:
-    #: such a row belongs to an install that abandoned registration, so reusing it
-    #: costs nobody anything and keeps the player table tidy.
-    reuse_device_account_when_onboarded: bool = False
     #: When true, a session token that records no device binding is rejected as soon
     #: as the request carries a device identifier. Tokens issued before device
     #: binding existed (2026-10-13) therefore stop working on a real client and the
