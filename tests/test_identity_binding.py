@@ -119,13 +119,12 @@ async def _onboarded_device(device: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_reinstall_without_a_token_registers_a_new_account() -> None:
-    """A device match on an onboarded account must not hand it over.
+async def test_a_reinstall_without_a_token_returns_the_same_account() -> None:
+    """A device that names one device keeps the account bound to it.
 
-    The identifier cannot carry that meaning: on the shipped Android build every
-    install reports the same value, and on iOS it is genuine. So the default is to
-    register a new account -- the player gets the registration flow, and their old
-    account stays theirs, reachable with the token they kept or a transfer code.
+    Opening the game again on the same device is the same player: the registration flow must
+    not reappear and the account must not drift. Builds whose every install reports the same
+    identifier are handled by the install identity instead (see the tests below).
     """
     device = f"reinstall-{uuid.uuid4()}"
     user_id = await _onboarded_device(device)
@@ -133,7 +132,160 @@ async def test_a_reinstall_without_a_token_registers_a_new_account() -> None:
     async with _client() as client:
         again = await client.post("/identity/sign-in", headers={"deviceAccount": device})
     assert again.status_code == 200
-    assert again.json()["user"]["id"] != user_id
+    assert again.json()["user"]["id"] == user_id
+
+
+@pytest.mark.asyncio
+async def test_a_shared_device_identifier_keeps_one_account_per_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every install reports the same identifier; the per-install password separates them."""
+    shared = f"com.example.shared:{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "shared_device_ids", shared)
+
+    async with _client() as client:
+        first = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        )
+        again = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        )
+        other = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-b"},
+        )
+
+    assert first.status_code == again.status_code == other.status_code == 200
+    # Same install: fixed on one account, launch after launch.
+    assert first.json()["user"]["id"] == again.json()["user"]["id"]
+    # A different install of the same build stays a different player.
+    assert other.json()["user"]["id"] != first.json()["user"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_a_token_for_one_install_is_rejected_on_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replaying a shared-build token from another install must not reach the account."""
+    shared = f"com.example.shared:{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "shared_device_ids", shared)
+
+    async with _client() as client:
+        sign_in = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        )
+        assert sign_in.status_code == 200
+        user_a = sign_in.json()["user"]["id"]
+        token = sign_in.json()["signInSessionToken"]
+
+        # Same install, same password: the refresh is honoured.
+        same = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+            json={"signInSessionToken": token},
+        )
+        assert same.status_code == 200
+        assert same.json()["userId"] == user_a
+
+        # Another install of the same build: the token belongs to a different install.
+        other = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": shared, "devicePassword": "install-b"},
+            json={"signInSessionToken": token},
+        )
+        assert other.status_code == 401
+        assert other.json()["code"] == "LCX_INVALID_SESSION_DEVICE"
+
+
+@pytest.mark.asyncio
+async def test_one_install_cannot_take_another_installs_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared/copied identity must not move an account to another install.
+
+    This is the case the online log showed: a second device presenting the first device's
+    LCX identity reached the first device's account. It may be refused outright, but it must
+    never end up on that account.
+    """
+    shared = f"com.example.shared:{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "shared_device_ids", shared)
+
+    async with _client() as client:
+        first = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        )
+        assert first.status_code == 200
+        user_a = first.json()["user"]["id"]
+        identity_a = first.json()["signInSessionToken"]
+
+        # Install B presents install A's identity, as a copied token would.
+        second = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-b"},
+            json={"signInSessionToken": identity_a},
+        )
+
+    if second.status_code == 200:
+        assert second.json()["user"]["id"] != user_a
+    else:
+        assert second.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_identity_does_not_move_between_devices() -> None:
+    """Two phones, one LCX identity, different device values: this is the operator's log.
+
+    The devices report *different* identifiers, so the install identity does not apply. The
+    identity they share was minted before device binding, so it carries no device claim and
+    the binding has to be enforced from the account instead.
+    """
+    device_a = f"phone-a-{uuid.uuid4()}"
+    device_b = f"phone-b-{uuid.uuid4()}"
+
+    async with _client() as client:
+        first = await client.post("/identity/sign-in", headers={"deviceAccount": device_a})
+        assert first.status_code == 200
+        user_a = first.json()["user"]["id"]
+        player_a = await _load_player(user_a)
+        assert player_a is not None
+
+        # An identity with no device claim, exactly like the ones the log showed.
+        unbound = generate_lcx_tokens(user_a, player_a.registered_at)["signInSessionToken"]
+        second = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device_b},
+            json={"signInSessionToken": unbound},
+        )
+
+    if second.status_code == 200:
+        assert second.json()["userId"] != user_a
+    else:
+        assert second.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_an_install_identity_is_recorded_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The install is stored on the player, so later launches match it directly."""
+    shared = f"com.example.shared:{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "shared_device_ids", shared)
+
+    async with _client() as client:
+        res = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        )
+    assert res.status_code == 200
+    player = await _load_player(res.json()["user"]["id"])
+    assert player is not None
+    assert player.install_id
+    # A shared identifier must never be stored as if it named one device.
+    assert player.device_account is None
 
 
 @pytest.mark.asyncio

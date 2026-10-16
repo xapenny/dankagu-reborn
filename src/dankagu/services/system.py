@@ -8,7 +8,7 @@ import grpc
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.growth import create_daily_reward_mail_items
-from dankagu.core.identity import resolve_or_create_player
+from dankagu.core.identity import normalise_device_account, resolve_or_create_player
 from dankagu.core.session import create_session, get_current_player_id, set_current_player
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
@@ -85,13 +85,19 @@ class SystemService(system_pb2_grpc.SystemServicer):
             # Identity rules are shared with the LCX surface so both entry points
             # resolve the same device to the same player (see core.identity).
             player, matched_by = await resolve_or_create_player(
-                session, user_id=user_id, device_account=device_account
+                session,
+                user_id=user_id,
+                device_account=device_account,
+                device_password=request.device_password or None,
             )
 
             if matched_by != "created":
                 process_player_login(session, player, now)
-                if device_account and not player.device_account:
-                    player.device_account = device_account
+                # Only an identifier that names one device may be bound here: a shared one is
+                # represented by the install identity the resolver stored instead.
+                usable_device = normalise_device_account(device_account)
+                if usable_device and not player.device_account:
+                    player.device_account = usable_device
                 await session.commit()
 
             player_id = player.id
