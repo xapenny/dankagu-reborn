@@ -195,6 +195,22 @@ async def resolve_or_create_player(
                 session, user_id=None, device_account=device_account, install_id=install_id
             )
 
+    if player is not None and device_account and player.device_account:
+        if player.device_account != device_account:
+            # Same story for a device identifier that names one device: the account is bound
+            # elsewhere, so a shared or copied token must not carry it here.
+            logger.warning(
+                "🔒 [Auth] identity for %s is bound to another device (%r != %r); "
+                "resolving this device separately",
+                player.id,
+                player.device_account,
+                device_account,
+            )
+            user_id = None
+            player, matched_by = await find_player(
+                session, user_id=None, device_account=device_account, install_id=install_id
+            )
+
     if player is None:
         player = await _create_with_retry(
             session,

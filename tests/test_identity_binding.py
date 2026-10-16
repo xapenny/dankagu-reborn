@@ -236,6 +236,38 @@ async def test_one_install_cannot_take_another_installs_identity(
 
 
 @pytest.mark.asyncio
+async def test_an_unbound_identity_does_not_move_between_devices() -> None:
+    """Two phones, one LCX identity, different device values: this is the operator's log.
+
+    The devices report *different* identifiers, so the install identity does not apply. The
+    identity they share was minted before device binding, so it carries no device claim and
+    the binding has to be enforced from the account instead.
+    """
+    device_a = f"phone-a-{uuid.uuid4()}"
+    device_b = f"phone-b-{uuid.uuid4()}"
+
+    async with _client() as client:
+        first = await client.post("/identity/sign-in", headers={"deviceAccount": device_a})
+        assert first.status_code == 200
+        user_a = first.json()["user"]["id"]
+        player_a = await _load_player(user_a)
+        assert player_a is not None
+
+        # An identity with no device claim, exactly like the ones the log showed.
+        unbound = generate_lcx_tokens(user_a, player_a.registered_at)["signInSessionToken"]
+        second = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device_b},
+            json={"signInSessionToken": unbound},
+        )
+
+    if second.status_code == 200:
+        assert second.json()["userId"] != user_a
+    else:
+        assert second.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_an_install_identity_is_recorded_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
