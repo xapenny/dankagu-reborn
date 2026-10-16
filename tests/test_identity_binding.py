@@ -201,6 +201,41 @@ async def test_a_token_for_one_install_is_rejected_on_another(
 
 
 @pytest.mark.asyncio
+async def test_one_install_cannot_take_another_installs_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared/copied identity must not move an account to another install.
+
+    This is the case the online log showed: a second device presenting the first device's
+    LCX identity reached the first device's account. It may be refused outright, but it must
+    never end up on that account.
+    """
+    shared = f"com.example.shared:{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "shared_device_ids", shared)
+
+    async with _client() as client:
+        first = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        )
+        assert first.status_code == 200
+        user_a = first.json()["user"]["id"]
+        identity_a = first.json()["signInSessionToken"]
+
+        # Install B presents install A's identity, as a copied token would.
+        second = await client.post(
+            "/identity/sign-in",
+            headers={"deviceAccount": shared, "devicePassword": "install-b"},
+            json={"signInSessionToken": identity_a},
+        )
+
+    if second.status_code == 200:
+        assert second.json()["user"]["id"] != user_a
+    else:
+        assert second.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_an_install_identity_is_recorded_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

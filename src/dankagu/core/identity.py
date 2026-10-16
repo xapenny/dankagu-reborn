@@ -172,12 +172,28 @@ async def resolve_or_create_player(
         session, user_id=user_id, device_account=device_account, install_id=install_id
     )
 
-    if player is not None and install_id and player.install_id is None:
-        # Signed in without a password before, or created before this column existed:
-        # claim the install so every later launch lands on this account.
-        player.install_id = install_id
-        await session.flush()
-        logger.info("🔗 [Auth] claimed install for player %s", player.id)
+    if player is not None and install_id:
+        if player.install_id is None:
+            # Signed in without a password before, or created before this column existed:
+            # claim the install so every later launch lands on this account.
+            player.install_id = install_id
+            await session.flush()
+            logger.info("🔗 [Auth] claimed install for player %s", player.id)
+        elif player.install_id != install_id:
+            # The identity presented here belongs to another install of the same build -- a
+            # copied or shared token. The account is not this install's to use, so the claim
+            # is dropped and this install resolves on its own (its own account, or a new one).
+            logger.warning(
+                "🔒 [Auth] identity for %s belongs to another install (%s… != %s…); "
+                "resolving this install separately",
+                player.id,
+                player.install_id[:8],
+                install_id[:8],
+            )
+            user_id = None
+            player, matched_by = await find_player(
+                session, user_id=None, device_account=device_account, install_id=install_id
+            )
 
     if player is None:
         player = await _create_with_retry(
