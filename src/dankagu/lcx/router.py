@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.config import settings
 from dankagu.core.database import get_db_session
-from dankagu.core.identity import find_player, normalise_device_account, resolve_or_create_player
+from dankagu.core.identity import (
+    find_player,
+    install_identity,
+    normalise_device_account,
+    resolve_or_create_player,
+)
 from dankagu.core.session import (
     invalidate_player_sessions,
     invalidate_session,
@@ -147,6 +152,7 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
     """
     user_id: str | None = None
     device_account: str | None = None
+    device_password: str | None = None
     presented_token: str | None = None
 
     auth_header = request.headers.get("authorization", "")
@@ -154,6 +160,9 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         presented_token = auth_header[7:].strip()
 
     device_account = request.headers.get("deviceAccount") or request.headers.get("x-device-account")
+    device_password = request.headers.get("devicePassword") or request.headers.get(
+        "x-device-password"
+    )
 
     try:
         body = await request.json()
@@ -173,12 +182,25 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
             device_account = body.get("deviceAccount")
         if not device_account and body.get("verificationToken"):
             device_account = _device_from_verification_token(str(body["verificationToken"]))
+        if not device_password:
+            device_password = body.get("devicePassword") or body.get("device_password")
+
+    # A build whose every install reports the same device identifier cannot be told apart by
+    # it, so the token binds to the *install* instead: the identifier plus the per-install
+    # password. Unique identifiers keep working exactly as before.
+    effective_device = install_identity(device_account, device_password)
+    if effective_device:
+        logger.info(
+            "🔗 [Auth] install identity %s… for shared device %r",
+            effective_device[:8],
+            device_account,
+        )
 
     payload = decode_token_payload(presented_token) if presented_token else None
     if payload is not None:
         user_id = user_id_from_payload(payload)
         bound_device = token_device_hash(payload)
-        request_device = normalise_device_account(device_account)
+        request_device = effective_device or normalise_device_account(device_account)
         expires_at = payload.get("exp")
         expired_claim = isinstance(expires_at, int | float) and float(expires_at) < time.time()
 
@@ -195,15 +217,24 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
             )
 
         # An unbound or expired claim proves nothing about the account it names, so it is
-        # checked against the database: the account must belong to this device already, or
-        # have no device yet.
+        # checked against the database: the account must belong to this device (or install)
+        # already, or have neither yet.
         if (
             request_device
             and settings.require_device_bound_tokens
             and (not bound_device or expired_claim)
         ):
             owner, _matched = await find_player(db, user_id=user_id, device_account=None)
-            if owner is None or (owner.device_account and owner.device_account != request_device):
+            if effective_device:
+                owns = owner is not None and owner.install_id == effective_device
+                owns_what = owner.install_id if owner is not None else None
+            else:
+                owns = owner is not None and (
+                    not owner.device_account or owner.device_account == request_device
+                )
+                owns_what = owner.device_account if owner is not None else None
+
+            if not owns:
                 # Not this device's account: register a new player instead of refusing, or
                 # the client re-presents the same token forever. The user id is dropped, so
                 # the account it named can never be reached from here.
@@ -214,16 +245,21 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                     state,
                     request_device,
                     user_id,
-                    "unknown" if owner is None else f"bound to {owner.device_account!r}",
+                    "unknown" if owner is None else f"bound to {owns_what!r}",
                 )
                 user_id = None
             else:
-                # This device owns the account: accept it and claim the binding if free.
-                if not owner.device_account:
+                # This device (or install) owns the account: accept it and claim the binding
+                # if it is still free.
+                if effective_device:
+                    if not owner.install_id:
+                        owner.install_id = effective_device
+                        await db.commit()
+                elif not owner.device_account:
                     owner.device_account = request_device
                     await db.commit()
                 logger.info(
-                    "🔗 [Auth] Accepted %s token for player %s on device %r",
+                    "🔗 [Auth] Accepted %s token for player %s on %r",
                     "expired" if expired_claim else "pre-binding",
                     owner.id,
                     request_device,
@@ -253,9 +289,13 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
             user_id = None
 
     player, _matched_by = await resolve_or_create_player(
-        db, user_id=user_id, device_account=device_account
+        db,
+        user_id=user_id,
+        device_account=device_account,
+        device_password=device_password,
     )
-    request.state.device_account = normalise_device_account(device_account)
+    # Tokens bind to the install when the device identifier cannot identify one.
+    request.state.device_account = effective_device or normalise_device_account(device_account)
     return player
 
 
