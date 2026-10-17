@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -55,6 +56,11 @@ class MySpaceLikeRecord(Base):
     """Stores likes sent to a player's MySpace."""
 
     __tablename__ = "my_space_likes"
+    __table_args__ = (
+        Index("ix_myspace_likes_from_to_time", "from_player_id", "to_player_id", "liked_at"),
+        Index("ix_myspace_likes_to_time", "to_player_id", "liked_at", "id"),
+        Index("ix_myspace_likes_from_time", "from_player_id", "liked_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     from_player_id: Mapped[str] = mapped_column(

@@ -1,11 +1,12 @@
-"""Takasho MySpace servicer for personal space visits and likes."""
+"""Takasho MySpace servicer for personal space visits, weighted drawing, and likes."""
 
+import base64
 import logging
 import random
 import time
 
 import grpc
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
@@ -15,11 +16,31 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     my_space_pb2_grpc,
 )
 from dankagu.models.player import Player
-from dankagu.models.social import MySpaceLikeRecord
+from dankagu.models.social import FriendRelation, MySpaceLikeRecord
+from dankagu.models.storage import PlayerStorageEntry
 from dankagu.services.fes_player import query_player_storage_by_keys
 from dankagu.services.system import get_jst_game_day
 
 logger = logging.getLogger("dankagu.services.my_space")
+
+
+def _encode_cursor(liked_at: int, record_id: int) -> str:
+    """Encode Keyset cursor to base64 string."""
+    return base64.b64encode(f"{liked_at}:{record_id}".encode("ascii")).decode("ascii")
+
+
+def _decode_cursor(token: str | None) -> tuple[int, int] | None:
+    """Decode base64 Keyset cursor to (liked_at, record_id)."""
+    if not token:
+        return None
+    try:
+        raw = base64.b64decode(token.encode("ascii")).decode("ascii")
+        parts = raw.split(":", 1)
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return None
 
 
 class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
@@ -36,13 +57,47 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            res = await session.execute(select(Player).where(Player.id != current_pid).limit(50))
-            candidates = list(res.scalars().all())
+            # Only consider players who have unlocked/initialized their space (MySpotStatus--1 exists)
+            stmt = (
+                select(Player)
+                .join(PlayerStorageEntry, PlayerStorageEntry.player_id == Player.id)
+                .where(
+                    Player.id != current_pid,
+                    PlayerStorageEntry.key == "MySpotStatus--1",
+                )
+                .distinct()
+            )
+            candidates = list((await session.execute(stmt)).scalars().all())
+
             if candidates:
-                chosen = random.choice(candidates)
+                # Query social relationship for weighted sampling
+                rel_stmt = select(FriendRelation).where(
+                    or_(
+                        FriendRelation.follower_id == current_pid,
+                        FriendRelation.target_id == current_pid,
+                    )
+                )
+                relations = list((await session.execute(rel_stmt)).scalars().all())
+                following_ids = {r.target_id for r in relations if r.follower_id == current_pid}
+                follower_ids = {r.follower_id for r in relations if r.target_id == current_pid}
+                mutual_ids = following_ids & follower_ids
+
+                weights: list[int] = []
+                for c in candidates:
+                    if c.id in mutual_ids:
+                        weights.append(50)  # Mutual follow
+                    elif c.id in following_ids:
+                        weights.append(25)  # Current player follows candidate
+                    elif c.id in follower_ids:
+                        weights.append(15)  # Candidate follows current player
+                    else:
+                        weights.append(10)  # Stranger
+
+                chosen = random.choices(candidates, weights=weights, k=1)[0]
                 response.player_id = chosen.id
                 response.nickname = chosen.nickname or chosen.name or "DanKagu"
             else:
+                # Fallback to self (visit self's space in read-only visit mode)
                 self_player = await session.get(Player, current_pid)
                 response.player_id = current_pid
                 response.nickname = (
@@ -61,17 +116,35 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
         current_pid = get_current_player_id() or "dankagu-reborn-user"
         target_pid = request.player_id or current_pid
         now = int(time.time())
-        logger.info("🏠 [MySpace] LikeV1 (from=%s, to=%s)", current_pid, target_pid)
+        today_jst = get_jst_game_day(now)
+        logger.info(
+            "🏠 [MySpace] LikeV1 (from=%s, to=%s, jst_day=%d)", current_pid, target_pid, today_jst
+        )
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            record = MySpaceLikeRecord(
-                from_player_id=current_pid,
-                to_player_id=target_pid,
-                liked_at=now,
+            # Check if already liked on the current JST game day (04:00 reset)
+            stmt = (
+                select(MySpaceLikeRecord)
+                .where(
+                    MySpaceLikeRecord.from_player_id == current_pid,
+                    MySpaceLikeRecord.to_player_id == target_pid,
+                )
+                .order_by(MySpaceLikeRecord.liked_at.desc(), MySpaceLikeRecord.id.desc())
+                .limit(1)
             )
-            session.add(record)
-            await session.commit()
+            latest = (await session.execute(stmt)).scalars().first()
+
+            if latest is None or get_jst_game_day(latest.liked_at) < today_jst:
+                record = MySpaceLikeRecord(
+                    from_player_id=current_pid,
+                    to_player_id=target_pid,
+                    liked_at=now,
+                )
+                session.add(record)
+                await session.commit()
+            else:
+                logger.info("🏠 [MySpace] LikeV1 idempotent hit (already liked today)")
 
         response = my_space_pb2.MySpaceLikeV1.Response()
         response.player_id = target_pid
@@ -87,9 +160,10 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
         now = int(time.time())
         today_jst = get_jst_game_day(now)
         logger.info(
-            "🏠 [MySpace] GetPlayerLikeStatusV1 (from=%s, to=%s)",
+            "🏠 [MySpace] GetPlayerLikeStatusV1 (from=%s, to=%s, jst_day=%d)",
             current_pid,
             target_pid,
+            today_jst,
         )
 
         is_liked = False
@@ -101,7 +175,7 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
                     MySpaceLikeRecord.from_player_id == current_pid,
                     MySpaceLikeRecord.to_player_id == target_pid,
                 )
-                .order_by(MySpaceLikeRecord.liked_at.desc())
+                .order_by(MySpaceLikeRecord.liked_at.desc(), MySpaceLikeRecord.id.desc())
                 .limit(1)
             )
             latest = (await session.execute(stmt)).scalars().first()
@@ -119,20 +193,45 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
         context: grpc.aio.ServicerContext,
     ) -> my_space_pb2.MySpaceGetSentLikesHistoryV1.Response:
         current_pid = get_current_player_id() or "dankagu-reborn-user"
-        limit = int(request.max_results) if request.max_results > 0 else 50
+        limit = min(max(int(request.max_results), 1), 50) if request.max_results > 0 else 50
         storage_keys = list(request.player_storage_keys)
-        logger.info("🏠 [MySpace] GetSentLikesHistoryV1 (player=%s)", current_pid)
+        cursor = _decode_cursor(request.page_token)
+        logger.info(
+            "🏠 [MySpace] GetSentLikesHistoryV1 (player=%s, limit=%d, cursor=%s)",
+            current_pid,
+            limit,
+            cursor,
+        )
 
         response = my_space_pb2.MySpaceGetSentLikesHistoryV1.Response()
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            conditions = [MySpaceLikeRecord.from_player_id == current_pid]
+            if cursor is not None:
+                cursor_time, cursor_id = cursor
+                conditions.append(
+                    or_(
+                        MySpaceLikeRecord.liked_at < cursor_time,
+                        and_(
+                            MySpaceLikeRecord.liked_at == cursor_time,
+                            MySpaceLikeRecord.id < cursor_id,
+                        ),
+                    )
+                )
+
             stmt = (
                 select(MySpaceLikeRecord)
-                .where(MySpaceLikeRecord.from_player_id == current_pid)
-                .order_by(MySpaceLikeRecord.liked_at.desc())
-                .limit(limit)
+                .where(*conditions)
+                .order_by(MySpaceLikeRecord.liked_at.desc(), MySpaceLikeRecord.id.desc())
+                .limit(limit + 1)
             )
             records = list((await session.execute(stmt)).scalars().all())
+
+            if len(records) > limit:
+                last_included = records[limit - 1]
+                response.next_page_token = _encode_cursor(last_included.liked_at, last_included.id)
+                records = records[:limit]
+
             for rec in records:
                 like_item = response.likes.add()
                 like_item.liked_at = rec.liked_at
@@ -161,20 +260,45 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
         context: grpc.aio.ServicerContext,
     ) -> my_space_pb2.MySpaceGetReceivedLikesHistoryV1.Response:
         current_pid = get_current_player_id() or "dankagu-reborn-user"
-        limit = int(request.max_results) if request.max_results > 0 else 50
+        limit = min(max(int(request.max_results), 1), 50) if request.max_results > 0 else 50
         storage_keys = list(request.player_storage_keys)
-        logger.info("🏠 [MySpace] GetReceivedLikesHistoryV1 (player=%s)", current_pid)
+        cursor = _decode_cursor(request.page_token)
+        logger.info(
+            "🏠 [MySpace] GetReceivedLikesHistoryV1 (player=%s, limit=%d, cursor=%s)",
+            current_pid,
+            limit,
+            cursor,
+        )
 
         response = my_space_pb2.MySpaceGetReceivedLikesHistoryV1.Response()
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            conditions = [MySpaceLikeRecord.to_player_id == current_pid]
+            if cursor is not None:
+                cursor_time, cursor_id = cursor
+                conditions.append(
+                    or_(
+                        MySpaceLikeRecord.liked_at < cursor_time,
+                        and_(
+                            MySpaceLikeRecord.liked_at == cursor_time,
+                            MySpaceLikeRecord.id < cursor_id,
+                        ),
+                    )
+                )
+
             stmt = (
                 select(MySpaceLikeRecord)
-                .where(MySpaceLikeRecord.to_player_id == current_pid)
-                .order_by(MySpaceLikeRecord.liked_at.desc())
-                .limit(limit)
+                .where(*conditions)
+                .order_by(MySpaceLikeRecord.liked_at.desc(), MySpaceLikeRecord.id.desc())
+                .limit(limit + 1)
             )
             records = list((await session.execute(stmt)).scalars().all())
+
+            if len(records) > limit:
+                last_included = records[limit - 1]
+                response.next_page_token = _encode_cursor(last_included.liked_at, last_included.id)
+                records = records[:limit]
+
             for rec in records:
                 like_item = response.likes.add()
                 like_item.liked_at = rec.liked_at

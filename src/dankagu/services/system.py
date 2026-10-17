@@ -5,6 +5,7 @@ import time
 import uuid
 
 import grpc
+from sqlalchemy import select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.growth import create_daily_reward_mail_items
@@ -94,10 +95,31 @@ class SystemService(system_pb2_grpc.SystemServicer):
             if matched_by != "created":
                 process_player_login(session, player, now)
                 # Only an identifier that names one device may be bound here: a shared one is
-                # represented by the install identity the resolver stored instead.
+                # represented by the install identity the resolver stored instead. The column is
+                # unique, so a device that already belongs to somebody else (a guest left behind
+                # by the install that ran the transfer, for instance) must not be claimed here --
+                # doing so raised IntegrityError and surfaced to the player as error 20027.
                 usable_device = normalise_device_account(device_account)
                 if usable_device and not player.device_account:
-                    player.device_account = usable_device
+                    owner = (
+                        (
+                            await session.execute(
+                                select(Player.id).where(Player.device_account == usable_device)
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
+                    if owner is None:
+                        player.device_account = usable_device
+                    else:
+                        logger.info(
+                            "🔗 [AuthorizeV3] leaving device %r with player %s; player %s keeps its "
+                            "own binding",
+                            usable_device,
+                            owner,
+                            player.id,
+                        )
                 await session.commit()
 
             player_id = player.id

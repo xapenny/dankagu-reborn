@@ -618,7 +618,22 @@ async def post_transfer_execute(
             )
             await _delete_player_account(db, resident)
 
-        target_player.device_account = device_account
+    # The account is moving to another device, so whatever device (or install) held it before
+    # no longer applies. Leaving the old binding in place is what made a transfer useless for
+    # normal players: the very next login came from the new device, failed the binding check
+    # and registered a fresh account instead of restoring theirs.
+    old_device = target_player.device_account
+    old_install = target_player.install_id
+    target_player.device_account = device_account or None
+    target_player.install_id = None
+    if old_device or old_install:
+        logger.info(
+            "🎫 [Transfer] id=%s released the old binding of player=%s (device=%r install=%r)",
+            transfer_id,
+            target_player.id,
+            old_device,
+            old_install,
+        )
 
     try:
         await db.commit()
