@@ -59,6 +59,7 @@ certs/
 # See THIRD_PARTY_NOTICES.md for the source and its license.
 protos/
 vendor-protos/
+vendor-supplemental-protos/
 
 # Generated protobuf/gRPC stubs are build output, not source. They are
 # recreated by: python scripts/compile_protos.py

@@ -347,8 +347,8 @@ These are intentionally not distributed and are git-ignored:
 
 This project would not have been possible without the work of others.
 
-- **[dankagu-local](https://github.com/RainbowUnicorn7297/dankagu-local)** by
-  RainbowUnicorn7297 (MIT) — the Takasho Protocol Buffers definitions that this
+- **[dankagu-local](https://github.com/xapenny/dankagu-local)** (upstream by
+  RainbowUnicorn7297, MIT) — the Takasho Protocol Buffers definitions that this
   server's gRPC surface is built against. They are not redistributed here; see
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - **[unity-texture-toolkit](https://github.com/esterTion/unity-texture-toolkit)**
