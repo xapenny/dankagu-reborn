@@ -38,6 +38,11 @@ STARTER_STORAGE_ENTRIES = {
     "PlayerSetting--1": bytes.fromhex(
         "08014207b28d0600000000520500000000005a050000000000600a7a0601efd39ca40f8001efd39ca40f8801efd39ca40f90010e"
     ),
+    # Active Event Initial Statuses (Events 38, 39, 40, 41)
+    "EventInfoStatus-V38-38": bytes.fromhex("08261000180032040101010138ca84d1d60658ca84d1d60670037803"),
+    "EventInfoStatus-V39-39": bytes.fromhex("08271000180032040101010138ca84d1d60658ca84d1d60670037803"),
+    "EventInfoStatus-V40-40": bytes.fromhex("08281000180032040101010138ca84d1d60658ca84d1d60670037803"),
+    "EventInfoStatus-V41-41": bytes.fromhex("08291000180032040101010138ca84d1d60658ca84d1d60670037803"),
 }
 
 

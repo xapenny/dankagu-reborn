@@ -384,6 +384,116 @@ service LikePublishedPhoto {
   rpc DeleteLikeV1(LikePublishedPhotoDeleteLikeV1.Request) returns (LikePublishedPhotoDeleteLikeV1.Response) {}
 }
 """,
+    "takasho/schema/fes/resource/ranking/v1.proto": """syntax = "proto3";
+
+package takasho.schema.fes.resource.ranking.v1;
+
+message RankingEvent {
+  enum Status {
+    NONE = 0;
+    OPEN = 1;
+    CLOSE = 2;
+  }
+  string id = 1;
+  int64 opened_at = 2;
+  int64 finished_at = 3;
+  int64 closed_at = 4;
+  Status status = 5;
+}
+
+message PlayerRankInfo {
+  string ranking_event_id = 1;
+  string player_id = 2;
+  int64 score = 3;
+  int64 rank = 4;
+  string nickname = 5;
+}
+""",
+    "takasho/schema/fes/player_api/ranking.proto": """syntax = "proto3";
+
+package takasho.schema.fes.player_api;
+
+import "takasho/schema/fes/resource/ranking/v1.proto";
+
+message RankingGetAvailableEventV1 {
+  message Request {}
+  message Response {
+    repeated takasho.schema.fes.resource.ranking.v1.RankingEvent ranking_events = 1;
+  }
+}
+
+message RankingRegisterV1 {
+  message Request {
+    string ranking_event_id = 1;
+    int64 score = 2;
+  }
+  message Response {
+    int64 score = 1;
+  }
+}
+
+message RankingGetMyRankV1 {
+  message Request {
+    string ranking_event_id = 1;
+  }
+  message Response {
+    bool is_registered = 1;
+    int64 score = 2;
+    int64 rank = 3;
+  }
+}
+
+message RankingGetRankInfosV1 {
+  message Request {
+    string ranking_event_id = 1;
+    int64 start = 2;
+    int64 count = 3;
+  }
+  message Response {
+    repeated takasho.schema.fes.resource.ranking.v1.PlayerRankInfo player_rank_infos = 1;
+  }
+}
+
+message RankingGetRankInfosAroundMeV1 {
+  message Request {
+    string ranking_event_id = 1;
+    int64 count = 2;
+  }
+  message Response {
+    repeated takasho.schema.fes.resource.ranking.v1.PlayerRankInfo player_rank_infos = 1;
+  }
+}
+
+message RankingGetMyCommittedRankV1 {
+  message Request {
+    string ranking_event_id = 1;
+  }
+  message Response {
+    bool is_committed = 1;
+    int64 score = 2;
+    int64 rank = 3;
+  }
+}
+
+message RankingGetTotalRegisteredCountV1 {
+  message Request {
+    string ranking_event_id = 1;
+  }
+  message Response {
+    int64 count = 1;
+  }
+}
+
+service Ranking {
+  rpc GetAvailableEventV1(RankingGetAvailableEventV1.Request) returns (RankingGetAvailableEventV1.Response) {}
+  rpc RegisterV1(RankingRegisterV1.Request) returns (RankingRegisterV1.Response) {}
+  rpc GetMyRankV1(RankingGetMyRankV1.Request) returns (RankingGetMyRankV1.Response) {}
+  rpc GetRankInfosV1(RankingGetRankInfosV1.Request) returns (RankingGetRankInfosV1.Response) {}
+  rpc GetRankInfosAroundMeV1(RankingGetRankInfosAroundMeV1.Request) returns (RankingGetRankInfosAroundMeV1.Response) {}
+  rpc GetMyCommittedRankV1(RankingGetMyCommittedRankV1.Request) returns (RankingGetMyCommittedRankV1.Response) {}
+  rpc GetTotalRegisteredCount(RankingGetTotalRegisteredCountV1.Request) returns (RankingGetTotalRegisteredCountV1.Response) {}
+}
+""",
 }
 
 

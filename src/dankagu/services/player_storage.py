@@ -229,6 +229,22 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             "ExpeditionManageStatus--1",
             bytes.fromhex("080110914e18002000"),
         )
+        self.template_entries.setdefault(
+            "EventInfoStatus-V38-38",
+            bytes.fromhex("08261000180032040101010138ca84d1d60658ca84d1d60670037803"),
+        )
+        self.template_entries.setdefault(
+            "EventInfoStatus-V39-39",
+            bytes.fromhex("08271000180032040101010138ca84d1d60658ca84d1d60670037803"),
+        )
+        self.template_entries.setdefault(
+            "EventInfoStatus-V40-40",
+            bytes.fromhex("08281000180032040101010138ca84d1d60658ca84d1d60670037803"),
+        )
+        self.template_entries.setdefault(
+            "EventInfoStatus-V41-41",
+            bytes.fromhex("08291000180032040101010138ca84d1d60658ca84d1d60670037803"),
+        )
         self._templates_loaded = True
 
     @fail_internal_on_error("Failed to read player storage entries")

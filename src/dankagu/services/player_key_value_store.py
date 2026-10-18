@@ -2,6 +2,7 @@ import logging
 import time
 
 import grpc
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
@@ -12,7 +13,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_key_value_store_pb2,
     player_key_value_store_pb2_grpc,
 )
-from dankagu.models.storage import PlayerStorageEntry
+from dankagu.models.storage import PlayerKeyValue, PlayerStorageEntry
 
 logger = logging.getLogger("dankagu.services.player_key_value_store")
 
@@ -25,27 +26,59 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         request: player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response:
-        logger.info("🔑 [PKVS] GetPlayerKeyValuesV1 (%d keys)", len(request.keys))
-        return player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response()
+        current_pid = get_current_player_id() or "dankagu-reborn-user"
+        logger.info("🔑 [PKVS] GetPlayerKeyValuesV1 (%d keys, player=%s)", len(request.key), current_pid)
+        response = player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response()
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            stmt = select(PlayerKeyValue).where(PlayerKeyValue.player_id == current_pid)
+            if request.key:
+                stmt = stmt.where(PlayerKeyValue.key.in_(request.key))
+            res = await session.execute(stmt)
+            for row in res.scalars().all():
+                pkv = response.player_key_values.add()
+                pkv.key = row.key
+                pkv.value = row.value
+                pkv.expired_at = row.expired_at
+        return response
 
     async def IncrementPlayerKeyValuesV1(
         self,
         request: player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response:
-        logger.info("🔑 [PKVS] IncrementPlayerKeyValuesV1")
-        response = (
-            player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
-        )
-        for item in request.player_key_values:
-            pkv = response.player_key_values.add()
-            pkv.key = item.key
-            # The request carries a delta (PlayerKeyValueIncrementInfo.delta);
-            # the response reports the resulting value (PlayerKeyValue.value).
-            # Reading `item.amount` here raised AttributeError - there is no
-            # such field - which the client surfaces as gRPC UNKNOWN.
-            pkv.value = item.delta
-            pkv.expired_at = 4102412400
+        current_pid = get_current_player_id() or "dankagu-reborn-user"
+        now = int(time.time())
+        logger.info("🔑 [PKVS] IncrementPlayerKeyValuesV1 (%d items, player=%s)", len(request.player_key_values), current_pid)
+        response = player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            for item in request.player_key_values:
+                stmt = pg_insert(PlayerKeyValue).values(
+                    player_id=current_pid,
+                    key=item.key,
+                    value=item.delta,
+                    expired_at=4102412400,
+                    updated_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[PlayerKeyValue.player_id, PlayerKeyValue.key],
+                    set_={
+                        "value": PlayerKeyValue.value + stmt.excluded.value,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                ).returning(PlayerKeyValue.value, PlayerKeyValue.expired_at)
+                res = await session.execute(stmt)
+                row = res.first()
+
+                pkv = response.player_key_values.add()
+                pkv.key = item.key
+                pkv.value = row[0] if row else item.delta
+                pkv.expired_at = row[1] if row else 4102412400
+            await session.commit()
+
         return response
 
     async def IncrementPlayerKeyValuesAndSavePlayerStorageV1(
@@ -53,41 +86,64 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         request: player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesAndSavePlayerStorageV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesAndSavePlayerStorageV1.Response:
-        logger.info("🔑 [PKVS] IncrementPlayerKeyValuesAndSavePlayerStorageV1")
-        response = player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesAndSavePlayerStorageV1.Response()
-        for item in request.player_key_values:
-            pkv = response.player_key_values.add()
-            pkv.key = item.key
-            # See IncrementPlayerKeyValuesV1: the field is `delta`, not `amount`.
-            pkv.value = item.delta
-            pkv.expired_at = 4102412400
-
-        now = int(time.time())
         current_pid = get_current_player_id()
         if not current_pid:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
             return player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesAndSavePlayerStorageV1.Response()
 
-        if request.entries:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
+        now = int(time.time())
+        logger.info(
+            "🔑 [PKVS] IncrementPlayerKeyValuesAndSavePlayerStorageV1 (pkvs=%d, entries=%d, player=%s)",
+            len(request.player_key_values),
+            len(request.entries),
+            current_pid,
+        )
+        response = player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesAndSavePlayerStorageV1.Response()
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            for item in request.player_key_values:
+                stmt = pg_insert(PlayerKeyValue).values(
+                    player_id=current_pid,
+                    key=item.key,
+                    value=item.delta,
+                    expired_at=4102412400,
+                    updated_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[PlayerKeyValue.player_id, PlayerKeyValue.key],
+                    set_={
+                        "value": PlayerKeyValue.value + stmt.excluded.value,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                ).returning(PlayerKeyValue.value, PlayerKeyValue.expired_at)
+                res = await session.execute(stmt)
+                row = res.first()
+
+                pkv = response.player_key_values.add()
+                pkv.key = item.key
+                pkv.value = row[0] if row else item.delta
+                pkv.expired_at = row[1] if row else 4102412400
+
+            if request.entries:
                 for proto_entry in request.entries:
-                    stmt = pg_insert(PlayerStorageEntry).values(
+                    s_stmt = pg_insert(PlayerStorageEntry).values(
                         player_id=current_pid,
                         key=proto_entry.key,
                         value=proto_entry.value,
                         created_at=proto_entry.created_at or now,
                         updated_at=now,
                     )
-                    stmt = stmt.on_conflict_do_update(
+                    s_stmt = s_stmt.on_conflict_do_update(
                         index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
                         set_={
-                            "value": stmt.excluded.value,
-                            "updated_at": stmt.excluded.updated_at,
+                            "value": s_stmt.excluded.value,
+                            "updated_at": s_stmt.excluded.updated_at,
                         },
                     )
-                    await session.execute(stmt)
-                await session.commit()
+                    await session.execute(s_stmt)
+
+            await session.commit()
 
         response.entries.extend(request.entries)
         for entry in response.entries:
@@ -105,35 +161,65 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         request: player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Response:
-        logger.info("🔑 [PKVS] UpdatePlayerKeyValuesAndSavePlayerStorageV1")
-        now = int(time.time())
         current_pid = get_current_player_id()
         if not current_pid:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
             return player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Response()
 
-        if request.entries:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
+        now = int(time.time())
+        logger.info(
+            "🔑 [PKVS] UpdatePlayerKeyValuesAndSavePlayerStorageV1 (pkvs=%d, entries=%d, player=%s)",
+            len(request.player_key_values),
+            len(request.entries),
+            current_pid,
+        )
+        response = player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Response()
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            for item in request.player_key_values:
+                stmt = pg_insert(PlayerKeyValue).values(
+                    player_id=current_pid,
+                    key=item.key,
+                    value=item.value,
+                    expired_at=4102412400,
+                    updated_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[PlayerKeyValue.player_id, PlayerKeyValue.key],
+                    set_={
+                        "value": stmt.excluded.value,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                ).returning(PlayerKeyValue.value, PlayerKeyValue.expired_at)
+                res = await session.execute(stmt)
+                row = res.first()
+
+                pkv = response.player_key_values.add()
+                pkv.key = item.key
+                pkv.value = row[0] if row else item.value
+                pkv.expired_at = row[1] if row else 4102412400
+
+            if request.entries:
                 for proto_entry in request.entries:
-                    stmt = pg_insert(PlayerStorageEntry).values(
+                    s_stmt = pg_insert(PlayerStorageEntry).values(
                         player_id=current_pid,
                         key=proto_entry.key,
                         value=proto_entry.value,
                         created_at=proto_entry.created_at or now,
                         updated_at=now,
                     )
-                    stmt = stmt.on_conflict_do_update(
+                    s_stmt = s_stmt.on_conflict_do_update(
                         index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
                         set_={
-                            "value": stmt.excluded.value,
-                            "updated_at": stmt.excluded.updated_at,
+                            "value": s_stmt.excluded.value,
+                            "updated_at": s_stmt.excluded.updated_at,
                         },
                     )
-                    await session.execute(stmt)
-                await session.commit()
+                    await session.execute(s_stmt)
 
-        response = player_key_value_store_pb2.PlayerKeyValueStoreUpdatePlayerKeyValuesAndSavePlayerStorageV1.Response()
+            await session.commit()
+
         response.entries.extend(request.entries)
         for entry in response.entries:
             entry.player_id = current_pid
