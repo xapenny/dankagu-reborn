@@ -100,26 +100,32 @@ class SystemService(system_pb2_grpc.SystemServicer):
                 # by the install that ran the transfer, for instance) must not be claimed here --
                 # doing so raised IntegrityError and surfaced to the player as error 20027.
                 usable_device = normalise_device_account(device_account)
-                if usable_device and not player.device_account:
-                    owner = (
+                if usable_device and player.device_account != usable_device:
+                    former = (
                         (
                             await session.execute(
-                                select(Player.id).where(Player.device_account == usable_device)
+                                select(Player).where(
+                                    Player.device_account == usable_device,
+                                    Player.id != player.id,
+                                )
                             )
                         )
                         .scalars()
                         .first()
                     )
-                    if owner is None:
-                        player.device_account = usable_device
-                    else:
+                    if former:
+                        former.device_account = None
                         logger.info(
-                            "🔗 [AuthorizeV3] leaving device %r with player %s; player %s keeps its "
-                            "own binding",
+                            "🔗 [AuthorizeV3] released device %r from former player %s",
                             usable_device,
-                            owner,
-                            player.id,
+                            former.id,
                         )
+                    player.device_account = usable_device
+                    logger.info(
+                        "🔗 [AuthorizeV3] bound device %r to player %s",
+                        usable_device,
+                        player.id,
+                    )
                 await session.commit()
 
             player_id = player.id

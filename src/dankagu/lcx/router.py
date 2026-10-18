@@ -403,11 +403,10 @@ async def post_transfer_register(
 
     player = await _resolve_or_create_player(db, request)
 
-    # Check if active unused transfer already exists with this ID
+    # Check if this transfer ID is already claimed by another player
     stmt = select(AccountTransfer).where(
         AccountTransfer.transfer_id == transfer_id,
-        AccountTransfer.is_used.is_(False),
-        AccountTransfer.expires_at > now,
+        AccountTransfer.player_id != player.id,
     )
     res = await db.execute(stmt)
     existing = res.scalars().first()
@@ -420,41 +419,15 @@ async def post_transfer_register(
             },
         )
 
-    # Registering a new code invalidates this player's older unused ones: a player who
-    # has screenshotted a code several times should not leave a trail of live
-    # credentials behind, and "generate a fresh one" is the revocation they have.
-    revoked = await db.execute(
+    # Re-registering or updating the player's transfer code replaces existing codes
+    await db.execute(
         delete(AccountTransfer).where(
-            AccountTransfer.player_id == player.id,
-            AccountTransfer.is_used.is_(False),
+            (AccountTransfer.player_id == player.id) | (AccountTransfer.transfer_id == transfer_id)
         )
     )
-    if revoked.rowcount:
-        logger.info(
-            "🎫 [Transfer] Replaced %d older unused code(s) for player %s",
-            revoked.rowcount,
-            player.id,
-        )
 
-    # A spent or expired row with this id is only a leftover, and ``transfer_id`` is the
-    # primary key: re-registering a code the player has already used collided with it and
-    # answered a bare 500. Anything still here is not active (checked above), so it is
-    # replaced.
-    replaced = await db.execute(
-        delete(AccountTransfer).where(AccountTransfer.transfer_id == transfer_id)
-    )
-    if replaced.rowcount:
-        logger.info(
-            "🎫 [Transfer] Replaced %d spent/expired row(s) holding id %r",
-            replaced.rowcount,
-            transfer_id,
-        )
-
-    # ``0`` means no expiry at all; the rest of the codebase treats 4102498799 as
-    # "far future", which also keeps ``expires_at`` a plain ascending integer.
-    expires_at = (
-        now + settings.transfer_ttl_days * 86400 if settings.transfer_ttl_days > 0 else FAR_FUTURE
-    )
+    # Codes are permanently valid (FAR_FUTURE) and do not expire after use
+    expires_at = FAR_FUTURE
     transfer = AccountTransfer(
         transfer_id=transfer_id,
         player_id=player.id,
@@ -560,26 +533,6 @@ async def post_transfer_execute(
             },
         )
 
-    if transfer.is_used:
-        logger.warning("🎫 [Transfer] Transfer id %r was already used", transfer_id)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "code": "LCX_TRANSFER_ID_ALREADY_USED",
-                "message": "Transfer ID has already been used",
-            },
-        )
-
-    if transfer.expires_at < now:
-        logger.warning("🎫 [Transfer] Transfer id %r expired", transfer_id)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "code": "LCX_TRANSFER_ID_EXPIRED",
-                "message": "Transfer ID has expired",
-            },
-        )
-
     target_player = await db.get(Player, transfer.player_id)
     if target_player is None:
         logger.warning(
@@ -595,8 +548,8 @@ async def post_transfer_execute(
             },
         )
 
-    # Transfer succeeds: single use.
-    transfer.is_used = True
+    # Transfer code remains permanently valid; do not mark as used or expire.
+    transfer.is_used = False
 
     device_account = normalise_device_account(
         request.headers.get("deviceAccount")
@@ -624,7 +577,7 @@ async def post_transfer_execute(
     # and registered a fresh account instead of restoring theirs.
     old_device = target_player.device_account
     old_install = target_player.install_id
-    target_player.device_account = device_account or None
+    target_player.device_account = None
     target_player.install_id = None
     if old_device or old_install:
         logger.info(
@@ -666,7 +619,7 @@ async def post_transfer_execute(
     )
 
     tokens = generate_lcx_tokens(
-        target_player.user_id, target_player.registered_at, device_hash=device_account
+        target_player.user_id, target_player.registered_at, device_hash=None
     )
     return {
         "accessToken": tokens["accessToken"],
