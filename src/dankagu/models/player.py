@@ -76,10 +76,6 @@ class Player(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     device_account: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
-    #: Identity of one *install* when the build reports a device identifier every install
-    #: shares: derived from that identifier plus the per-install ``device_password``. Null for
-    #: installs whose device identifier is unique on its own.
-    install_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     short_id: Mapped[str] = mapped_column(
         String(16), unique=True, index=True, default=generate_short_id
     )

@@ -1,12 +1,11 @@
 """FastAPI router implementing LCX Authentication & Identity endpoints."""
 
-import base64
 import gzip
+import hashlib
 import logging
 import time
 from typing import Annotated, Any
 
-import jwt
 from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -18,7 +17,6 @@ from dankagu.config import settings
 from dankagu.core.database import get_db_session
 from dankagu.core.identity import (
     find_player,
-    install_identity,
     normalise_device_account,
     resolve_or_create_player,
 )
@@ -122,27 +120,6 @@ async def post_user_access_token(
     }
 
 
-def _device_from_verification_token(verification_token: str) -> str | None:
-    """Best-effort device hint from an LCX verification token.
-
-    The token is signed by the platform, not by us, so it can only ever be a
-    *hint*: it never grants access to an existing account on its own (see
-    :mod:`dankagu.core.identity`).
-    """
-    try:
-        payload = jwt.decode(verification_token, options={"verify_signature": False})
-    except Exception:
-        return None
-    iss = str(payload.get("iss", ""))
-    if not iss:
-        return None
-    try:
-        # Typically base64 encoded bundle_id:device_identifier
-        return base64.b64decode(iss).decode("utf-8")
-    except Exception:
-        return iss
-
-
 async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Player:
     """Retrieve player matching client credentials or register a distinct new player.
 
@@ -152,7 +129,6 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
     """
     user_id: str | None = None
     device_account: str | None = None
-    device_password: str | None = None
     presented_token: str | None = None
 
     auth_header = request.headers.get("authorization", "")
@@ -160,9 +136,6 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         presented_token = auth_header[7:].strip()
 
     device_account = request.headers.get("deviceAccount") or request.headers.get("x-device-account")
-    device_password = request.headers.get("devicePassword") or request.headers.get(
-        "x-device-password"
-    )
 
     try:
         body = await request.json()
@@ -176,31 +149,22 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                     presented_token = str(body[key])
                     break
         if not device_account:
-            # NOTE: ``storeAccountIdHash`` is deliberately *not* accepted as a
-            # device identifier. This server mints it (per player), so treating it
-            # as one used to make every install look like the same device.
+            # NOTE: ``storeAccountIdHash`` and ``verificationToken`` are deliberately
+            # *not* accepted as a ``device_account``. ``storeAccountIdHash`` is minted
+            # by this server, and ``verificationToken`` decodes to ``bundleId:sha1``
+            # which is identical across Android devices and differs in format from the
+            # 32-character ``device_account`` sent to Takasho ``System.AuthorizeV3``.
             device_account = body.get("deviceAccount")
-        if not device_account and body.get("verificationToken"):
-            device_account = _device_from_verification_token(str(body["verificationToken"]))
-        if not device_password:
-            device_password = body.get("devicePassword") or body.get("device_password")
 
-    # A build whose every install reports the same device identifier cannot be told apart by
-    # it, so the token binds to the *install* instead: the identifier plus the per-install
-    # password. Unique identifiers keep working exactly as before.
-    effective_device = install_identity(device_account, device_password)
-    if effective_device:
-        logger.info(
-            "🔗 [Auth] install identity %s… for shared device %r",
-            effective_device[:8],
-            device_account,
-        )
-
+    request_device = normalise_device_account(device_account)
     payload = decode_token_payload(presented_token) if presented_token else None
+    original_user_id: str | None = None
+    token_redirect_key: str | None = None
+
     if payload is not None:
         user_id = user_id_from_payload(payload)
+        original_user_id = user_id
         bound_device = token_device_hash(payload)
-        request_device = effective_device or normalise_device_account(device_account)
         expires_at = payload.get("exp")
         expired_claim = isinstance(expires_at, int | float) and float(expires_at) < time.time()
 
@@ -216,23 +180,42 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 "Session token was issued to another device",
             )
 
-        # An unbound or expired claim proves nothing about the account it names, so it is
-        # checked against the database: the account must belong to this device (or install)
-        # already, or have neither yet.
-        if (
-            request_device
-            and settings.require_device_bound_tokens
-            and (not bound_device or expired_claim)
-        ):
-            owner, _matched = await find_player(db, user_id=user_id, device_account=None)
-            if effective_device:
-                owns = owner is not None and owner.install_id == effective_device
-                owns_what = owner.install_id if owner is not None else None
-            else:
-                owns = owner is not None and (
-                    not owner.device_account or owner.device_account == request_device
+        # If this token previously named a deleted or device-conflicting account and was
+        # assigned a replacement player on /auth/user-access-token (which cannot overwrite
+        # the client's stored signInSessionToken), resolve directly to that replacement
+        # player across subsequent game restarts.
+        if presented_token:
+            redir_scope = (
+                f"{request_device}:{presented_token}" if request_device else presented_token
+            )
+            token_redirect_key = (
+                "lcx_redir:" + hashlib.sha256(redir_scope.encode("utf-8")).hexdigest()[:32]
+            )
+            now_ts = int(time.time())
+            redir_sess = (
+                await db.execute(
+                    select(Session).where(
+                        Session.session_token == token_redirect_key,
+                        Session.expires_at > now_ts,
+                    )
                 )
-                owns_what = owner.device_account if owner is not None else None
+            ).scalar_one_or_none()
+            if redir_sess is not None:
+                redir_player = await db.get(Player, redir_sess.player_id)
+                if redir_player is not None:
+                    request.state.device_account = request_device
+                    return redir_player
+
+        # An unbound claim proves nothing about the account it names, so it is checked
+        # against the database: the account must belong to this device already, or have
+        # no device bound yet. (When bound_device is set and matches request_device,
+        # device ownership is already verified even if the token is expired.)
+        if request_device and settings.require_device_bound_tokens and not bound_device:
+            owner, _matched = await find_player(db, user_id=user_id, device_account=None)
+            owns = owner is not None and (
+                not owner.device_account or owner.device_account == request_device
+            )
+            owns_what = owner.device_account if owner is not None else None
 
             if not owns:
                 # Not this device's account: register a new player instead of refusing, or
@@ -249,13 +232,8 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 )
                 user_id = None
             else:
-                # This device (or install) owns the account: accept it and claim the binding
-                # if it is still free.
-                if effective_device:
-                    if not owner.install_id:
-                        owner.install_id = effective_device
-                        await db.commit()
-                elif not owner.device_account:
+                # This device owns the account: accept it and claim the binding if still free.
+                if not owner.device_account:
                     owner.device_account = request_device
                     await db.commit()
                 logger.info(
@@ -264,7 +242,7 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                     owner.id,
                     request_device,
                 )
-        elif expired_claim:
+        elif expired_claim and not bound_device:
             # Nothing to verify the claim against; refusing here would lock out any
             # client that does not send device information at all.
             logger.warning(
@@ -284,7 +262,7 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
                 "🆕 [Auth] Token names unknown user_id=%s from device %r; "
                 "registering a new player instead",
                 user_id,
-                normalise_device_account(device_account),
+                request_device,
             )
             user_id = None
 
@@ -292,10 +270,30 @@ async def _resolve_or_create_player(db: AsyncSession, request: Request) -> Playe
         db,
         user_id=user_id,
         device_account=device_account,
-        device_password=device_password,
+        allow_onboarded_device_match=(payload is not None),
     )
-    # Tokens bind to the install when the device identifier cannot identify one.
-    request.state.device_account = effective_device or normalise_device_account(device_account)
+    if token_redirect_key and original_user_id and player.user_id != original_user_id:
+        now_ts = int(time.time())
+        existing_redir = (
+            await db.execute(select(Session).where(Session.session_token == token_redirect_key))
+        ).scalar_one_or_none()
+        if existing_redir is None:
+            db.add(
+                Session(
+                    session_token=token_redirect_key,
+                    player_id=player.id,
+                    user_id=player.user_id,
+                    created_at=now_ts,
+                    expires_at=FAR_FUTURE,
+                )
+            )
+        else:
+            existing_redir.player_id = player.id
+            existing_redir.user_id = player.user_id
+            existing_redir.expires_at = FAR_FUTURE
+        await db.commit()
+
+    request.state.device_account = request_device
     return player
 
 
@@ -553,8 +551,8 @@ async def post_transfer_execute(
 
     device_account = normalise_device_account(
         request.headers.get("deviceAccount")
+        or request.headers.get("x-device-account")
         or body.get("deviceAccount")
-        or _device_from_verification_token(str(body.get("verificationToken", "")))
     )
     if device_account:
         # The device belongs to the account being moved, so the account living on it is
@@ -570,22 +568,20 @@ async def post_transfer_execute(
                 resident.user_id,
             )
             await _delete_player_account(db, resident)
+            await db.flush()
 
-    # The account is moving to another device, so whatever device (or install) held it before
-    # no longer applies. Leaving the old binding in place is what made a transfer useless for
-    # normal players: the very next login came from the new device, failed the binding check
-    # and registered a fresh account instead of restoring theirs.
+    # The account is moving to another device: bind it to the explicit target device when
+    # provided, or clear the old binding so System.AuthorizeV3 can bind the new device's
+    # Takasho device_account on the immediately following login call.
     old_device = target_player.device_account
-    old_install = target_player.install_id
-    target_player.device_account = None
-    target_player.install_id = None
-    if old_device or old_install:
+    target_player.device_account = device_account
+    if old_device and old_device != device_account:
         logger.info(
-            "🎫 [Transfer] id=%s released the old binding of player=%s (device=%r install=%r)",
+            "🎫 [Transfer] id=%s updated device binding of player=%s (%r -> %r)",
             transfer_id,
             target_player.id,
             old_device,
-            old_install,
+            device_account,
         )
 
     try:
@@ -619,7 +615,7 @@ async def post_transfer_execute(
     )
 
     tokens = generate_lcx_tokens(
-        target_player.user_id, target_player.registered_at, device_hash=None
+        target_player.user_id, target_player.registered_at, device_hash=device_account
     )
     return {
         "accessToken": tokens["accessToken"],

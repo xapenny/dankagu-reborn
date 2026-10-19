@@ -275,10 +275,14 @@ async def test_account_transfer_full_lifecycle() -> None:
         assert reg_data["id"] == transfer_id
         assert reg_data["expiresAt"] > int(time.time())
 
-        # Duplicate registration with same active ID should fail
+        # Duplicate registration with same ID by ANOTHER player should fail
+        other_sign_in = await client.post(
+            "/identity/sign-in", json={"storeAccountIdHash": f"other-{uuid.uuid4()}"}
+        )
+        other_headers = {"Authorization": f"Bearer {other_sign_in.json()['accessToken']}"}
         dup_res = await client.post(
             "/identity/transfer",
-            headers=headers_a,
+            headers=other_headers,
             json={"id": transfer_id, "password": password},
         )
         assert dup_res.status_code == 400
@@ -302,14 +306,13 @@ async def test_account_transfer_full_lifecycle() -> None:
         assert exec_data["user"]["id"] == user_a_id
         dev_b_id_token = exec_data["lcxUserIdToken"]
 
-        # 6. Re-executing already-used transfer code must be rejected, and say why:
-        #    the client shows one generic string, so the server has to be specific.
+        # 6. Re-executing the permanent transfer code succeeds as well.
         reuse_res = await client.post(
             f"/identity/transfer/{transfer_id}/execute",
             json={"password": password},
         )
-        assert reuse_res.status_code == 400
-        assert reuse_res.json()["code"] == "LCX_TRANSFER_ID_ALREADY_USED"
+        assert reuse_res.status_code == 200
+        assert reuse_res.json()["user"]["id"] == user_a_id
 
         # 7. Device B logs into gRPC with the new credentials -> gets original player profile!
         system_service = SystemService()

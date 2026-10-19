@@ -135,10 +135,11 @@ async def test_transfer_moves_the_account_and_kills_the_old_device_session() -> 
         assert moved.status_code == 200
         assert moved.json()["user"]["id"] == code["user"]["id"]
 
-        # The code is single use.
-        again = await _execute(client, code["id"], "smoke-pass-1", f"dst-{uuid.uuid4()}")
-        assert again.status_code == 400
-        assert again.json()["code"] == "LCX_TRANSFER_ID_ALREADY_USED"
+        # Transfer codes remain reusable across future migrations.
+        device_c = f"dst-{uuid.uuid4()}"
+        again = await _execute(client, code["id"], "smoke-pass-1", device_c)
+        assert again.status_code == 200
+        assert again.json()["user"]["id"] == code["user"]["id"]
 
     # The old device cannot keep using its session.
     assert await resolve_session_player_id(old_session) is None
@@ -146,7 +147,7 @@ async def test_transfer_moves_the_account_and_kills_the_old_device_session() -> 
     async with get_sessionmaker()() as session:
         player = await session.get(Player, player_id)
     assert player is not None
-    assert player.device_account == device_b
+    assert player.device_account == device_c
 
 
 @pytest.mark.asyncio
@@ -328,12 +329,9 @@ async def _player_id(session, user_id: str) -> str:
 
 @pytest.mark.asyncio
 async def test_a_spent_code_id_can_be_registered_again() -> None:
-    """Re-using an id that was already spent must issue a new code, not a 500.
-
-    ``transfer_id`` is the primary key, so the spent row left behind by a used code made
-    the insert collide.
-    """
+    """Re-registering an existing transfer id by its owner updates the password cleanly."""
     device = f"reuse-id-{uuid.uuid4()}"
+    dst_device = f"dst-{uuid.uuid4()}"
     transfer_id = f"DK{uuid.uuid4().hex[:6].upper()}"
     async with _client() as client:
         await _sign_in(client, device)
@@ -343,12 +341,12 @@ async def test_a_spent_code_id_can_be_registered_again() -> None:
             json={"id": transfer_id, "password": "smoke-pass-1"},
         )
         assert first.status_code == 200, first.text
-        spent = await _execute(client, transfer_id, "smoke-pass-1", f"dst-{uuid.uuid4()}")
+        spent = await _execute(client, transfer_id, "smoke-pass-1", dst_device)
         assert spent.status_code == 200
 
         again = await client.post(
             "/identity/transfer",
-            headers={"deviceAccount": device},
+            headers={"deviceAccount": dst_device},
             json={"id": transfer_id, "password": "smoke-pass-2"},
         )
         assert again.status_code == 200, again.text

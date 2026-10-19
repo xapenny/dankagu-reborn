@@ -119,129 +119,40 @@ async def _onboarded_device(device: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_reinstall_without_a_token_returns_the_same_account() -> None:
-    """A device that names one device keeps the account bound to it.
+async def test_a_fresh_install_without_a_token_never_claims_an_onboarded_account() -> None:
+    """A tokenless request (fresh install) must never enter an already-onboarded account.
 
-    Opening the game again on the same device is the same player: the registration flow must
-    not reappear and the account must not drift. Builds whose every install reports the same
-    identifier are handled by the install identity instead (see the tests below).
+    Android builds that share a hardware identifier across devices would otherwise hand
+    the first player's onboarded account to every subsequent fresh install.
     """
-    device = f"reinstall-{uuid.uuid4()}"
+    device = f"shared-hw-{uuid.uuid4()}"
     user_id = await _onboarded_device(device)
 
     async with _client() as client:
-        again = await client.post("/identity/sign-in", headers={"deviceAccount": device})
-    assert again.status_code == 200
-    assert again.json()["user"]["id"] == user_id
+        fresh = await client.post("/identity/sign-in", headers={"deviceAccount": device})
+    assert fresh.status_code == 200
+    fresh_user_id = fresh.json()["user"]["id"]
+    assert fresh_user_id != user_id
 
-
-@pytest.mark.asyncio
-async def test_a_shared_device_identifier_keeps_one_account_per_install(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every install reports the same identifier; the per-install password separates them."""
-    shared = f"com.example.shared:{uuid.uuid4().hex}"
-    monkeypatch.setattr(settings, "shared_device_ids", shared)
-
+    # And the fresh install's new account solidifies across restarts via its issued token.
+    fresh_token = fresh.json()["signInSessionToken"]
     async with _client() as client:
-        first = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-a"},
-        )
-        again = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-a"},
-        )
-        other = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-b"},
-        )
-
-    assert first.status_code == again.status_code == other.status_code == 200
-    # Same install: fixed on one account, launch after launch.
-    assert first.json()["user"]["id"] == again.json()["user"]["id"]
-    # A different install of the same build stays a different player.
-    assert other.json()["user"]["id"] != first.json()["user"]["id"]
-
-
-@pytest.mark.asyncio
-async def test_a_token_for_one_install_is_rejected_on_another(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Replaying a shared-build token from another install must not reach the account."""
-    shared = f"com.example.shared:{uuid.uuid4().hex}"
-    monkeypatch.setattr(settings, "shared_device_ids", shared)
-
-    async with _client() as client:
-        sign_in = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-a"},
-        )
-        assert sign_in.status_code == 200
-        user_a = sign_in.json()["user"]["id"]
-        token = sign_in.json()["signInSessionToken"]
-
-        # Same install, same password: the refresh is honoured.
-        same = await client.post(
+        restarted = await client.post(
             "/auth/user-access-token",
-            headers={"deviceAccount": shared, "devicePassword": "install-a"},
-            json={"signInSessionToken": token},
+            headers={"deviceAccount": device},
+            json={"signInSessionToken": fresh_token},
         )
-        assert same.status_code == 200
-        assert same.json()["userId"] == user_a
-
-        # Another install of the same build: the token belongs to a different install.
-        other = await client.post(
-            "/auth/user-access-token",
-            headers={"deviceAccount": shared, "devicePassword": "install-b"},
-            json={"signInSessionToken": token},
-        )
-        assert other.status_code == 401
-        assert other.json()["code"] == "LCX_INVALID_SESSION_DEVICE"
+    assert restarted.status_code == 200
+    assert restarted.json()["userId"] == fresh_user_id
 
 
 @pytest.mark.asyncio
-async def test_one_install_cannot_take_another_installs_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A shared/copied identity must not move an account to another install.
-
-    This is the case the online log showed: a second device presenting the first device's
-    LCX identity reached the first device's account. It may be refused outright, but it must
-    never end up on that account.
-    """
-    shared = f"com.example.shared:{uuid.uuid4().hex}"
-    monkeypatch.setattr(settings, "shared_device_ids", shared)
-
-    async with _client() as client:
-        first = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-a"},
-        )
-        assert first.status_code == 200
-        user_a = first.json()["user"]["id"]
-        identity_a = first.json()["signInSessionToken"]
-
-        # Install B presents install A's identity, as a copied token would.
-        second = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-b"},
-            json={"signInSessionToken": identity_a},
-        )
-
-    if second.status_code == 200:
-        assert second.json()["user"]["id"] != user_a
-    else:
-        assert second.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_an_unbound_identity_does_not_move_between_devices() -> None:
+async def test_an_unbound_identity_does_not_move_between_devices_and_solidifies() -> None:
     """Two phones, one LCX identity, different device values: this is the operator's log.
 
-    The devices report *different* identifiers, so the install identity does not apply. The
-    identity they share was minted before device binding, so it carries no device claim and
-    the binding has to be enforced from the account instead.
+    When Device B presents an unbound token naming Device A's account, Device B receives
+    its own new account AND keeps that exact account across subsequent restarts (even
+    after completing onboarding), rather than creating a new account on every launch.
     """
     device_a = f"phone-a-{uuid.uuid4()}"
     device_b = f"phone-b-{uuid.uuid4()}"
@@ -255,37 +166,39 @@ async def test_an_unbound_identity_does_not_move_between_devices() -> None:
 
         # An identity with no device claim, exactly like the ones the log showed.
         unbound = generate_lcx_tokens(user_a, player_a.registered_at)["signInSessionToken"]
-        second = await client.post(
+        launch_1 = await client.post(
             "/auth/user-access-token",
             headers={"deviceAccount": device_b},
             json={"signInSessionToken": unbound},
         )
+        assert launch_1.status_code == 200
+        user_b = launch_1.json()["userId"]
+        assert user_b != user_a
 
-    if second.status_code == 200:
-        assert second.json()["userId"] != user_a
-    else:
-        assert second.status_code == 401
+        # Mark Device B's new account as onboarded (nickname + ToS set).
+        async with get_sessionmaker()() as session:
+            player_b = (
+                await session.execute(select(Player).where(Player.user_id == user_b))
+            ).scalar_one()
+            player_b.nickname = "SolidifiedPlayerB"
+            player_b.consented_tos_version = "v2.1.0"
+            await session.commit()
 
-
-@pytest.mark.asyncio
-async def test_an_install_identity_is_recorded_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The install is stored on the player, so later launches match it directly."""
-    shared = f"com.example.shared:{uuid.uuid4().hex}"
-    monkeypatch.setattr(settings, "shared_device_ids", shared)
-
-    async with _client() as client:
-        res = await client.post(
-            "/identity/sign-in",
-            headers={"deviceAccount": shared, "devicePassword": "install-a"},
+        # Launch 2 & Launch 3 on Device B (still presenting the same signInSessionToken on disk):
+        # must land on the exact same solidified account user_b!
+        launch_2 = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device_b},
+            json={"signInSessionToken": unbound},
         )
-    assert res.status_code == 200
-    player = await _load_player(res.json()["user"]["id"])
-    assert player is not None
-    assert player.install_id
-    # A shared identifier must never be stored as if it named one device.
-    assert player.device_account is None
+        launch_3 = await client.post(
+            "/auth/user-access-token",
+            headers={"deviceAccount": device_b},
+            json={"signInSessionToken": unbound},
+        )
+        assert launch_2.status_code == 200 and launch_3.status_code == 200
+        assert launch_2.json()["userId"] == user_b
+        assert launch_3.json()["userId"] == user_b
 
 
 @pytest.mark.asyncio
@@ -668,3 +581,186 @@ def test_store_account_hash_is_per_player() -> None:
     )
     assert payload["data"]["storeAccountIdHash"] == one
     assert payload["data"]["storeAccountIdHash"] != "dankagu-local-account-hash"
+
+
+@pytest.mark.asyncio
+async def test_android_fresh_installs_with_identical_verification_token_never_collide() -> None:
+    """Two Android fresh installs without tokens reporting identical verificationToken and
+    device_account must never enter the first player's onboarded account, and each must
+    solidify on its own device across restarts.
+    """
+    import base64
+
+    from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import system_pb2
+    from dankagu.services.system import SystemService
+
+    class _DummyContext:
+        def invocation_metadata(self):
+            return []
+
+    shared_iss = base64.b64encode(f"com.dena.a12026801:{uuid.uuid4().hex}".encode()).decode("utf-8")
+    vt = jwt.encode(
+        {"iss": shared_iss, "aud": _BASE},
+        "dummy-platform-secret-at-least-32-bytes",
+        algorithm="HS256",
+    )
+    shared_takasho_device = f"TAKASHO-SHARED-{uuid.uuid4().hex[:16].upper()}"
+    system_service = SystemService()
+    ctx = _DummyContext()
+
+    async with _client() as client:
+        # 1. Android Device 1 fresh install: LCX sign-in + AuthorizeV3 + Onboarding
+        sign_in_1 = await client.post("/identity/sign-in", json={"verificationToken": vt})
+        assert sign_in_1.status_code == 200
+        data_1 = sign_in_1.json()
+        auth_1 = await system_service.AuthorizeV3(
+            system_pb2.SystemAuthorizeV3.Request(
+                id_token=data_1["lcxUserIdToken"],
+                device_account=shared_takasho_device,
+            ),
+            ctx,  # type: ignore[arg-type]
+        )
+        player_1_id = auth_1.player_id
+
+        async with get_sessionmaker()() as session:
+            p1 = await session.get(Player, player_1_id)
+            assert p1 is not None
+            p1.nickname = "AndroidPlayerOne"
+            p1.consented_tos_version = "v2.1.0"
+            await session.commit()
+
+        # 2. Android Device 2 fresh install (no token, identical verificationToken & device_account)
+        sign_in_2 = await client.post("/identity/sign-in", json={"verificationToken": vt})
+        assert sign_in_2.status_code == 200
+        data_2 = sign_in_2.json()
+        assert data_2["user"]["id"] != data_1["user"]["id"]
+
+        auth_2 = await system_service.AuthorizeV3(
+            system_pb2.SystemAuthorizeV3.Request(
+                id_token=data_2["lcxUserIdToken"],
+                device_account=shared_takasho_device,
+            ),
+            ctx,  # type: ignore[arg-type]
+        )
+        player_2_id = auth_2.player_id
+        assert player_2_id != player_1_id
+
+        # Mark Device 2 onboarded as well
+        async with get_sessionmaker()() as session:
+            p2 = await session.get(Player, player_2_id)
+            assert p2 is not None
+            assert p2.nickname == ""
+            p2.nickname = "AndroidPlayerTwo"
+            p2.consented_tos_version = "v2.1.0"
+            await session.commit()
+
+        # 3. Both devices restart multiple times -> each stays on its own account!
+        for _ in range(2):
+            refresh_1 = await client.post(
+                "/auth/user-access-token",
+                json={"signInSessionToken": data_1["signInSessionToken"], "verificationToken": vt},
+            )
+            id_tok_1 = (
+                await client.post(f"/identity/user-id-token/{refresh_1.json()['userId']}")
+            ).json()["lcxUserIdToken"]
+            re_auth_1 = await system_service.AuthorizeV3(
+                system_pb2.SystemAuthorizeV3.Request(
+                    id_token=id_tok_1, device_account=shared_takasho_device
+                ),
+                ctx,  # type: ignore[arg-type]
+            )
+            assert re_auth_1.player_id == player_1_id
+
+            refresh_2 = await client.post(
+                "/auth/user-access-token",
+                json={"signInSessionToken": data_2["signInSessionToken"], "verificationToken": vt},
+            )
+            id_tok_2 = (
+                await client.post(f"/identity/user-id-token/{refresh_2.json()['userId']}")
+            ).json()["lcxUserIdToken"]
+            re_auth_2 = await system_service.AuthorizeV3(
+                system_pb2.SystemAuthorizeV3.Request(
+                    id_token=id_tok_2, device_account=shared_takasho_device
+                ),
+                ctx,  # type: ignore[arg-type]
+            )
+            assert re_auth_2.player_id == player_2_id
+
+
+@pytest.mark.asyncio
+async def test_authorize_v3_device_conflict_solidifies_replacement_account_across_restarts() -> (
+    None
+):
+    """When Device B presents a copied signInSessionToken belonging to Device A's bound
+    account, AuthorizeV3 separates Device B into a new account AND solidifies that account
+    on Device B across all subsequent restarts (even after onboarding).
+    """
+    from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import system_pb2
+    from dankagu.services.system import SystemService
+
+    class _DummyContext:
+        def invocation_metadata(self):
+            return []
+
+    system_service = SystemService()
+    ctx = _DummyContext()
+    takasho_a = f"TAKASHO-A-{uuid.uuid4().hex[:20].upper()}"
+    takasho_b = f"TAKASHO-B-{uuid.uuid4().hex[:20].upper()}"
+
+    async with _client() as client:
+        # 1. Device A creates and binds its account in AuthorizeV3
+        sign_in_a = await client.post("/identity/sign-in", json={})
+        data_a = sign_in_a.json()
+        auth_a = await system_service.AuthorizeV3(
+            system_pb2.SystemAuthorizeV3.Request(
+                id_token=data_a["lcxUserIdToken"],
+                device_account=takasho_a,
+            ),
+            ctx,  # type: ignore[arg-type]
+        )
+        player_a_id = auth_a.player_id
+
+        # 2. Device B boots with a copied signInSessionToken from Device A, but reports takasho_b
+        refresh_b1 = await client.post(
+            "/auth/user-access-token",
+            json={"signInSessionToken": data_a["signInSessionToken"]},
+        )
+        id_tok_b1 = (
+            await client.post(f"/identity/user-id-token/{refresh_b1.json()['userId']}")
+        ).json()["lcxUserIdToken"]
+        auth_b1 = await system_service.AuthorizeV3(
+            system_pb2.SystemAuthorizeV3.Request(
+                id_token=id_tok_b1,
+                device_account=takasho_b,
+            ),
+            ctx,  # type: ignore[arg-type]
+        )
+        player_b_id = auth_b1.player_id
+        assert player_b_id != player_a_id
+
+        # Complete onboarding on Device B's new account
+        async with get_sessionmaker()() as session:
+            pb = await session.get(Player, player_b_id)
+            assert pb is not None
+            assert pb.device_account == takasho_b
+            pb.nickname = "SolidifiedOnDeviceB"
+            pb.consented_tos_version = "v2.1.0"
+            await session.commit()
+
+        # 3. Device B restarts the game multiple times -> always lands on player_b_id!
+        for _ in range(3):
+            refresh_b_next = await client.post(
+                "/auth/user-access-token",
+                json={"signInSessionToken": data_a["signInSessionToken"]},
+            )
+            id_tok_b_next = (
+                await client.post(f"/identity/user-id-token/{refresh_b_next.json()['userId']}")
+            ).json()["lcxUserIdToken"]
+            auth_b_next = await system_service.AuthorizeV3(
+                system_pb2.SystemAuthorizeV3.Request(
+                    id_token=id_tok_b_next,
+                    device_account=takasho_b,
+                ),
+                ctx,  # type: ignore[arg-type]
+            )
+            assert auth_b_next.player_id == player_b_id

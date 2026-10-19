@@ -9,7 +9,11 @@ from sqlalchemy import select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.growth import create_daily_reward_mail_items
-from dankagu.core.identity import normalise_device_account, resolve_or_create_player
+from dankagu.core.identity import (
+    is_onboarded,
+    normalise_device_account,
+    resolve_or_create_player,
+)
 from dankagu.core.session import create_session, get_current_player_id, set_current_player
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
@@ -18,6 +22,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 )
 from dankagu.lcx.tokens import decode_token_user_id
 from dankagu.models.player import Player
+from dankagu.models.transfer import AccountTransfer
 
 logger = logging.getLogger("dankagu.services.system")
 
@@ -89,16 +94,11 @@ class SystemService(system_pb2_grpc.SystemServicer):
                 session,
                 user_id=user_id,
                 device_account=device_account,
-                device_password=request.device_password or None,
+                allow_onboarded_device_match=bool(user_id),
             )
 
             if matched_by != "created":
                 process_player_login(session, player, now)
-                # Only an identifier that names one device may be bound here: a shared one is
-                # represented by the install identity the resolver stored instead. The column is
-                # unique, so a device that already belongs to somebody else (a guest left behind
-                # by the install that ran the transfer, for instance) must not be claimed here --
-                # doing so raised IntegrityError and surfaced to the player as error 20027.
                 usable_device = normalise_device_account(device_account)
                 if usable_device and player.device_account != usable_device:
                     former = (
@@ -113,19 +113,38 @@ class SystemService(system_pb2_grpc.SystemServicer):
                         .scalars()
                         .first()
                     )
-                    if former:
-                        former.device_account = None
+                    if former is None:
+                        player.device_account = usable_device
                         logger.info(
-                            "🔗 [AuthorizeV3] released device %r from former player %s",
+                            "🔗 [AuthorizeV3] bound device %r to player %s",
                             usable_device,
-                            former.id,
+                            player.id,
                         )
-                    player.device_account = usable_device
-                    logger.info(
-                        "🔗 [AuthorizeV3] bound device %r to player %s",
-                        usable_device,
-                        player.id,
-                    )
+                    else:
+                        has_transfer = (
+                            await session.execute(
+                                select(AccountTransfer).where(
+                                    AccountTransfer.player_id == player.id
+                                )
+                            )
+                        ).scalars().first() is not None
+                        if not is_onboarded(former) or has_transfer:
+                            former.device_account = None
+                            player.device_account = usable_device
+                            logger.info(
+                                "🔗 [AuthorizeV3] transferred device %r from former player %s to player %s",
+                                usable_device,
+                                former.id,
+                                player.id,
+                            )
+                        else:
+                            logger.warning(
+                                "🔒 [AuthorizeV3] device %r is already bound to onboarded player %s; "
+                                "keeping player %s unbound to prevent device collision",
+                                usable_device,
+                                former.id,
+                                player.id,
+                            )
                 await session.commit()
 
             player_id = player.id
