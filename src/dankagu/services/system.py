@@ -49,8 +49,7 @@ def process_player_login(session, player: Player, now: int) -> bool:
             player_id=player.id,
             total_login_days=player.total_login_days,
         )
-        for item in mail_items:
-            session.add(item)
+        session.add_all(mail_items)
 
         logger.info(
             "🎁 Player %s logged in on new JST game day (total_login_days=%d, %d daily reward mails queued)",
@@ -145,13 +144,15 @@ class SystemService(system_pb2_grpc.SystemServicer):
                                 former.id,
                                 player.id,
                             )
-                await session.commit()
 
             player_id = player.id
             p_user_id = player.user_id
+            # Generate persistent session token within the same DB transaction
+            session_token = await create_session(
+                player_id=player_id, user_id=p_user_id, session=session
+            )
+            await session.commit()
 
-        # Generate persistent session token
-        session_token = await create_session(player_id=player_id, user_id=p_user_id)
         set_current_player(player_id, session_token)
 
         response = system_pb2.SystemAuthorizeV3.Response()

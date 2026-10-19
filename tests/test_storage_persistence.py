@@ -150,10 +150,14 @@ async def test_pkvs_increment_echoes_delta_as_value() -> None:
     item.key = "SomeCounter"
     item.delta = 7
 
-    response = await service.IncrementPlayerKeyValuesV1(request, MockContext())  # type: ignore[arg-type]
+    tokens = set_current_player(await ensure_player("pkvs-delta-player"))
+    try:
+        response = await service.IncrementPlayerKeyValuesV1(request, MockContext())  # type: ignore[arg-type]
 
-    assert len(response.player_key_values) == 1
-    assert response.player_key_values[0].key == "SomeCounter"
-    # The request carries a delta; the response carries the resulting value.
-    assert response.player_key_values[0].value == 7
-    assert response.player_key_values[0].expired_at > 0
+        assert len(response.player_key_values) == 1
+        assert response.player_key_values[0].key == "SomeCounter"
+        # The request carries a delta; the response carries the resulting value.
+        assert response.player_key_values[0].value == 7
+        assert response.player_key_values[0].expired_at > 0
+    finally:
+        reset_current_player(tokens)

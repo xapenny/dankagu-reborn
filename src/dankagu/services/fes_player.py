@@ -4,7 +4,7 @@ import logging
 import time
 
 import grpc
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
@@ -60,6 +60,20 @@ async def query_player_storage_by_criteria(
     return list(res.scalars().all())
 
 
+def _build_key_conditions(keys: list[str]) -> list:
+    conditions = []
+    exact_keys = []
+    for k in keys:
+        if k.endswith("--"):
+            conditions.append(PlayerStorageEntry.key.startswith(k))
+        else:
+            exact_keys.append(k)
+            conditions.append(PlayerStorageEntry.key.startswith(k))
+    if exact_keys:
+        conditions.append(PlayerStorageEntry.key.in_(exact_keys))
+    return conditions
+
+
 async def query_player_storage_by_keys(
     session: AsyncSession,
     player_id: str,
@@ -69,13 +83,9 @@ async def query_player_storage_by_keys(
     if not keys:
         return []
 
-    conditions = []
-    for k in keys:
-        if k.endswith("--"):
-            conditions.append(PlayerStorageEntry.key.startswith(k))
-        else:
-            conditions.append(PlayerStorageEntry.key == k)
-            conditions.append(PlayerStorageEntry.key.startswith(k))
+    conditions = _build_key_conditions(keys)
+    if not conditions:
+        return []
 
     stmt = select(PlayerStorageEntry).where(
         PlayerStorageEntry.player_id == player_id,
@@ -83,6 +93,30 @@ async def query_player_storage_by_keys(
     )
     res = await session.execute(stmt)
     return list(res.scalars().all())
+
+
+async def query_multi_player_storage_by_keys(
+    session: AsyncSession,
+    player_ids: list[str],
+    keys: list[str],
+) -> dict[str, list[PlayerStorageEntry]]:
+    """Batch-query storage entries for multiple players in a single SQL round-trip."""
+    if not player_ids or not keys:
+        return {}
+
+    conditions = _build_key_conditions(keys)
+    if not conditions:
+        return {}
+
+    stmt = select(PlayerStorageEntry).where(
+        PlayerStorageEntry.player_id.in_(player_ids),
+        or_(*conditions),
+    )
+    res = await session.execute(stmt)
+    grouped: dict[str, list[PlayerStorageEntry]] = {}
+    for row in res.scalars().all():
+        grouped.setdefault(row.player_id, []).append(row)
+    return grouped
 
 
 class FesPlayerService(player_pb2_grpc.FesPlayerServicer):
@@ -120,20 +154,27 @@ class FesPlayerService(player_pb2_grpc.FesPlayerServicer):
                 p_proto.last_logged_in_at = now
 
             if current_pid != target_pid:
-                following_res = await session.execute(
-                    select(FriendRelation.id).where(
-                        FriendRelation.follower_id == current_pid,
-                        FriendRelation.target_id == target_pid,
+                rels_res = await session.execute(
+                    select(FriendRelation.follower_id, FriendRelation.target_id).where(
+                        or_(
+                            and_(
+                                FriendRelation.follower_id == current_pid,
+                                FriendRelation.target_id == target_pid,
+                            ),
+                            and_(
+                                FriendRelation.follower_id == target_pid,
+                                FriendRelation.target_id == current_pid,
+                            ),
+                        )
                     )
                 )
-                followed_res = await session.execute(
-                    select(FriendRelation.id).where(
-                        FriendRelation.follower_id == target_pid,
-                        FriendRelation.target_id == current_pid,
-                    )
+                rels = rels_res.all()
+                p_proto.is_following = any(
+                    f_id == current_pid and t_id == target_pid for f_id, t_id in rels
                 )
-                p_proto.is_following = following_res.scalar() is not None
-                p_proto.is_followed = followed_res.scalar() is not None
+                p_proto.is_followed = any(
+                    f_id == target_pid and t_id == current_pid for f_id, t_id in rels
+                )
             else:
                 p_proto.is_following = False
                 p_proto.is_followed = False

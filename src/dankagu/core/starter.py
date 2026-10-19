@@ -63,25 +63,29 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
         )
         session.add(wallet)
 
-    # 2. Seed Starter Storage Entries
-    for key, val in STARTER_STORAGE_ENTRIES.items():
-        stmt = pg_insert(PlayerStorageEntry).values(
-            player_id=player.id,
-            key=key,
-            value=val,
-            created_at=now,
-            updated_at=now,
-        )
-        stmt = stmt.on_conflict_do_nothing(
-            index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
-        )
-        await session.execute(stmt)
+    # 2. Seed Starter Storage Entries in a single batch statement
+    storage_rows = [
+        {
+            "player_id": player.id,
+            "key": key,
+            "value": val,
+            "created_at": now,
+            "updated_at": now,
+        }
+        for key, val in STARTER_STORAGE_ENTRIES.items()
+    ]
+    stmt = pg_insert(PlayerStorageEntry).values(storage_rows).on_conflict_do_nothing(
+        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
+    )
+    await session.execute(stmt)
 
     # 3. Seed Starter Welcome Gift and Day 1 Daily Cultivation Materials in Mailbox
     inv_res = await session.execute(
-        select(PlayerInventoryItem).where(PlayerInventoryItem.player_id == player.id)
+        select(PlayerInventoryItem.id)
+        .where(PlayerInventoryItem.player_id == player.id)
+        .limit(1)
     )
-    if inv_res.scalars().first() is None:
+    if inv_res.scalar() is None:
         from dankagu.core.growth import create_daily_reward_mail_items
 
         welcome_gift = PlayerInventoryItem(
@@ -100,13 +104,11 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
             is_claimed=False,
             created_at=now,
         )
-        session.add(welcome_gift)
-
-        for item in create_daily_reward_mail_items(
+        daily_items = create_daily_reward_mail_items(
             player_id=player.id,
             total_login_days=1,
-        ):
-            session.add(item)
+        )
+        session.add_all([welcome_gift, *daily_items])
 
     StorageRevisionManager.set_revision("1", player_id=player.id)
     logger.info("🌱 Seeded starter data for player %s (%s)", player.id, player.user_id)

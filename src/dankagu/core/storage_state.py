@@ -3,6 +3,7 @@
 import logging
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.models.player import Player
@@ -70,22 +71,28 @@ class StorageRevisionManager:
 
     @classmethod
     async def set_revision_and_save(
-        cls, next_revision: str | None, player_id: str | None = None
+        cls,
+        next_revision: str | None,
+        player_id: str | None = None,
+        session: AsyncSession | None = None,
     ) -> str:
         if not next_revision:
             return cls.get_revision(player_id)
         cls.set_revision(next_revision, player_id=player_id)
         if player_id:
-            try:
-                session_factory = get_sessionmaker()
-                async with session_factory() as session:
-                    stmt = (
-                        update(Player)
-                        .where(Player.id == player_id)
-                        .values(storage_revision=str(next_revision))
-                    )
-                    await session.execute(stmt)
-                    await session.commit()
-            except Exception as e:
-                logger.warning("Could not persist storage revision to DB: %s", e)
+            stmt = (
+                update(Player)
+                .where(Player.id == player_id)
+                .values(storage_revision=str(next_revision))
+            )
+            if session is not None:
+                await session.execute(stmt)
+            else:
+                try:
+                    session_factory = get_sessionmaker()
+                    async with session_factory() as new_session:
+                        await new_session.execute(stmt)
+                        await new_session.commit()
+                except Exception as e:
+                    logger.warning("Could not persist storage revision to DB: %s", e)
         return cls.get_revision(player_id)

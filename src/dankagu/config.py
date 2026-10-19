@@ -133,6 +133,9 @@ class Settings(BaseSettings):
 
     # Database
     db_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu"
+    db_pool_size: int = 20
+    db_max_overflow: int = 40
+    db_pool_recycle: int = 1800
 
     # Schema versioning (Alembic). See src/dankagu/db/README.md.
     #: Apply pending migrations during startup, before any listener binds

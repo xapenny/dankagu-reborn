@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 import grpc
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,22 +82,47 @@ PERSONAL_STORAGE_PREFIXES = (
 )
 
 
+async def batch_upsert_storage_entries(
+    session: AsyncSession, rows: list[dict[str, Any]]
+) -> None:
+    """Upsert multiple PlayerStorageEntry rows in a single PostgreSQL statement.
+
+    Deduplicates by ``(player_id, key)`` (keeping the last occurrence) so PostgreSQL
+    never raises ``CardinalityViolationError`` when a request repeats a key.
+    """
+    if not rows:
+        return
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        deduped[(row["player_id"], row["key"])] = row
+    values = list(deduped.values())
+    stmt = pg_insert(PlayerStorageEntry).values(values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
+        set_={
+            "value": stmt.excluded.value,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    )
+    await session.execute(stmt)
+
+
 async def _upsert_entry(
     session: AsyncSession, player_id: str, key: str, value: bytes, now: int
 ) -> None:
     """Write one storage entry, replacing whatever was there."""
-    stmt = pg_insert(PlayerStorageEntry).values(
-        player_id=player_id,
-        key=key,
-        value=value,
-        created_at=now,
-        updated_at=now,
+    await batch_upsert_storage_entries(
+        session,
+        [
+            {
+                "player_id": player_id,
+                "key": key,
+                "value": value,
+                "created_at": now,
+                "updated_at": now,
+            }
+        ],
     )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-        set_={"value": stmt.excluded.value, "updated_at": stmt.excluded.updated_at},
-    )
-    await session.execute(stmt)
 
 
 async def _plan_card_merge(
@@ -260,6 +285,9 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             return player_storage_pb2.PlayerStorageGetEntriesV2.Response()
 
         await StorageRevisionManager.initialize()
+        criteria_list = list(request.criteria)
+        db_entry_map: dict[str, PlayerStorageEntry] = {}
+
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             if current_pid not in StorageRevisionManager._player_revisions:
@@ -268,10 +296,38 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     StorageRevisionManager.set_revision(
                         player.storage_revision, player_id=current_pid
                     )
-            stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id == current_pid)
-            result = await session.execute(stmt)
-            db_entries = result.scalars().all()
-            db_entry_map = {e.key: e for e in db_entries}
+            if criteria_list:
+                stmt = select(PlayerStorageEntry).where(
+                    PlayerStorageEntry.player_id == current_pid
+                )
+                # Push down key/prefix filters when the client asks for a bounded subset
+                # of keys instead of the ~40-prefix full boot sync.
+                has_empty_prefix = any(
+                    c.matching_type != Criterion.MatchingType.EXACT and not c.key
+                    for c in criteria_list
+                )
+                if not has_empty_prefix and len(criteria_list) <= 25:
+                    exact_keys = [
+                        c.key
+                        for c in criteria_list
+                        if c.matching_type == Criterion.MatchingType.EXACT and c.key
+                    ]
+                    prefix_keys = [
+                        c.key
+                        for c in criteria_list
+                        if c.matching_type != Criterion.MatchingType.EXACT and c.key
+                    ]
+                    conditions = []
+                    if exact_keys:
+                        conditions.append(PlayerStorageEntry.key.in_(exact_keys))
+                    for prefix in prefix_keys:
+                        conditions.append(PlayerStorageEntry.key.startswith(prefix))
+                    if conditions:
+                        stmt = stmt.where(or_(*conditions))
+
+                result = await session.execute(stmt)
+                db_entries = result.scalars().all()
+                db_entry_map = {e.key: e for e in db_entries}
 
         response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
         response.revision = StorageRevisionManager.get_revision(current_pid)
@@ -280,7 +336,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         served_keys: set[str] = set()
         fallback_templates = self.template_entries
 
-        for criterion in request.criteria:
+        for criterion in criteria_list:
             if criterion.matching_type == Criterion.MatchingType.EXACT:
                 k = criterion.key
                 # An empty stored value means the client cleared this key. Never
@@ -356,9 +412,20 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             card_plan = await _plan_card_merge(session, current_pid, request, now)
 
             written_keys: set[str] = set()
+            rows_to_upsert: list[dict[str, Any]] = []
+            keys_to_delete: list[str] = []
+
             if card_plan is not None:
                 for key, value in card_plan.writes:
-                    await _upsert_entry(session, current_pid, key, value, now)
+                    rows_to_upsert.append(
+                        {
+                            "player_id": current_pid,
+                            "key": key,
+                            "value": value,
+                            "created_at": now,
+                            "updated_at": now,
+                        }
+                    )
                     written_keys.add(key)
 
                 if card_plan.drop_keys:
@@ -387,51 +454,61 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 # key (construction sites, inventory history, ...). Storing the
                 # empty blob poisons every later GetEntriesV2, so delete instead.
                 if not proto_entry.value:
-                    await session.execute(
-                        delete(PlayerStorageEntry).where(
-                            PlayerStorageEntry.player_id == current_pid,
-                            PlayerStorageEntry.key == proto_entry.key,
-                        )
-                    )
+                    keys_to_delete.append(proto_entry.key)
                     continue
 
-                stmt = pg_insert(PlayerStorageEntry).values(
-                    player_id=current_pid,
-                    key=proto_entry.key,
-                    value=proto_entry.value,
-                    created_at=proto_entry.created_at or now,
-                    updated_at=now,
+                rows_to_upsert.append(
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
                 )
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                    set_={
-                        "value": stmt.excluded.value,
-                        "updated_at": stmt.excluded.updated_at,
-                    },
+
+            if keys_to_delete:
+                await session.execute(
+                    delete(PlayerStorageEntry).where(
+                        PlayerStorageEntry.player_id == current_pid,
+                        PlayerStorageEntry.key.in_(keys_to_delete),
+                    )
                 )
-                await session.execute(stmt)
+
+            if rows_to_upsert:
+                await batch_upsert_storage_entries(session, rows_to_upsert)
 
             # Auto-grant expedition dropped building materials if passing tutorial
             if has_tut_10:
-                for mat_key, mat_val in [
-                    ("ItemStockStatus--1000", bytes.fromhex("08e807108827")),  # 5000 wood
-                    ("ItemStockStatus--2000", bytes.fromhex("08d00f108827")),  # 5000 stone
-                ]:
-                    mat_stmt = (
-                        pg_insert(PlayerStorageEntry)
-                        .values(
-                            player_id=current_pid,
-                            key=mat_key,
-                            value=mat_val,
-                            created_at=now,
-                            updated_at=now,
-                        )
-                        .on_conflict_do_nothing(
-                            index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
-                        )
+                mat_stmt = (
+                    pg_insert(PlayerStorageEntry)
+                    .values(
+                        [
+                            {
+                                "player_id": current_pid,
+                                "key": "ItemStockStatus--1000",
+                                "value": bytes.fromhex("08e807108827"),  # 5000 wood
+                                "created_at": now,
+                                "updated_at": now,
+                            },
+                            {
+                                "player_id": current_pid,
+                                "key": "ItemStockStatus--2000",
+                                "value": bytes.fromhex("08d00f108827"),  # 5000 stone
+                                "created_at": now,
+                                "updated_at": now,
+                            },
+                        ]
                     )
-                    await session.execute(mat_stmt)
+                    .on_conflict_do_nothing(
+                        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
+                    )
+                )
+                await session.execute(mat_stmt)
 
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
 
         response = player_storage_pb2.PlayerStorageSetEntriesV2.Response()
@@ -443,9 +520,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             resp_entry.created_at = proto_entry.created_at or now
             resp_entry.updated_at = now
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
+        response.revision = revision
         return response
 
     async def GetOtherPlayerEntriesV2(
@@ -455,19 +530,43 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
     ) -> player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Response:
         response = player_storage_pb2.PlayerStorageGetOtherPlayerEntriesV2.Response()
         target_pids = list(request.player_ids)
-        if not target_pids:
+        criteria_list = list(request.criteria)
+        if not target_pids or not criteria_list:
             return response
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id.in_(target_pids))
+            has_empty_prefix = any(
+                c.matching_type != Criterion.MatchingType.EXACT and not c.key
+                for c in criteria_list
+            )
+            if not has_empty_prefix and len(criteria_list) <= 25:
+                exact_keys = [
+                    c.key
+                    for c in criteria_list
+                    if c.matching_type == Criterion.MatchingType.EXACT and c.key
+                ]
+                prefix_keys = [
+                    c.key
+                    for c in criteria_list
+                    if c.matching_type != Criterion.MatchingType.EXACT and c.key
+                ]
+                conditions = []
+                if exact_keys:
+                    conditions.append(PlayerStorageEntry.key.in_(exact_keys))
+                for prefix in prefix_keys:
+                    conditions.append(PlayerStorageEntry.key.startswith(prefix))
+                if conditions:
+                    stmt = stmt.where(or_(*conditions))
+
             result = await session.execute(stmt)
             db_entries = result.scalars().all()
             db_entry_map = {(e.player_id, e.key): e for e in db_entries}
 
         served_pairs: set[tuple[str, str]] = set()
         for pid in target_pids:
-            for criterion in request.criteria:
+            for criterion in criteria_list:
                 if criterion.matching_type == Criterion.MatchingType.EXACT:
                     k = criterion.key
                     pair = (pid, k)

@@ -6,6 +6,7 @@ import time
 import uuid
 
 from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.models.session import Session
@@ -64,6 +65,7 @@ async def create_session(
     user_id: str,
     ttl_seconds: int = 86400 * 30,
     session_token: str | None = None,
+    session: AsyncSession | None = None,
 ) -> str:
     """Create a new session token, save to DB, and cache it."""
     token = session_token or str(uuid.uuid4())
@@ -73,17 +75,20 @@ async def create_session(
     # Cache locally
     _session_cache[token] = (player_id, user_id, expires_at)
 
-    session_factory = get_sessionmaker()
-    async with session_factory() as session:
-        db_session = Session(
-            session_token=token,
-            player_id=player_id,
-            user_id=user_id,
-            created_at=now,
-            expires_at=expires_at,
-        )
+    db_session = Session(
+        session_token=token,
+        player_id=player_id,
+        user_id=user_id,
+        created_at=now,
+        expires_at=expires_at,
+    )
+    if session is not None:
         session.add(db_session)
-        await session.commit()
+    else:
+        session_factory = get_sessionmaker()
+        async with session_factory() as new_session:
+            new_session.add(db_session)
+            await new_session.commit()
 
     return token
 

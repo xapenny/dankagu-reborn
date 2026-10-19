@@ -4,7 +4,6 @@ import logging
 import time
 
 import grpc
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
@@ -21,7 +20,7 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     player_preference_pb2_grpc as fes_player_preference_pb2_grpc,
 )
 from dankagu.models.player import Player
-from dankagu.models.storage import PlayerStorageEntry
+from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.player_preference")
 
@@ -97,7 +96,6 @@ class PlayerPreferenceService(player_preference_pb2_grpc.PlayerPreferenceService
                     player.consented_tos_version = req_pref.consented_tos_version
 
                 await session.commit()
-                await session.refresh(player)
 
                 pref.birth_year = player.birth_year
                 pref.birth_month = player.birth_month
@@ -153,25 +151,22 @@ class PlayerPreferenceService(player_preference_pb2_grpc.PlayerPreferenceService
                     player.consented_tos_version = req_pref.consented_tos_version
 
             if request.entries:
-                for proto_entry in request.entries:
-                    stmt = pg_insert(PlayerStorageEntry).values(
-                        player_id=current_pid,
-                        key=proto_entry.key,
-                        value=proto_entry.value,
-                        created_at=proto_entry.created_at or now,
-                        updated_at=now,
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                        set_={
-                            "value": stmt.excluded.value,
-                            "updated_at": stmt.excluded.updated_at,
-                        },
-                    )
-                    await session.execute(stmt)
+                rows_to_upsert = [
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
+                    for proto_entry in request.entries
+                ]
+                await batch_upsert_storage_entries(session, rows_to_upsert)
 
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
-            await session.refresh(player)
 
         response = (
             player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response()
@@ -195,9 +190,7 @@ class PlayerPreferenceService(player_preference_pb2_grpc.PlayerPreferenceService
             entry.created_at = entry.created_at or now
             entry.updated_at = now
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
+        response.revision = revision
         return response
 
     async def GetMonthlyBillingLimitV1(
@@ -325,25 +318,22 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
                 player.level = int(request.player_preference.player_level)
 
             if request.entries:
-                for proto_entry in request.entries:
-                    stmt = pg_insert(PlayerStorageEntry).values(
-                        player_id=current_pid,
-                        key=proto_entry.key,
-                        value=proto_entry.value,
-                        created_at=proto_entry.created_at or now,
-                        updated_at=now,
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                        set_={
-                            "value": stmt.excluded.value,
-                            "updated_at": stmt.excluded.updated_at,
-                        },
-                    )
-                    await session.execute(stmt)
+                rows_to_upsert = [
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
+                    for proto_entry in request.entries
+                ]
+                await batch_upsert_storage_entries(session, rows_to_upsert)
 
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
-            await session.refresh(player)
 
         response = fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Response()
         pref = response.player_preference
@@ -357,7 +347,5 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
             entry.created_at = entry.created_at or now
             entry.updated_at = now
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
+        response.revision = revision
         return response

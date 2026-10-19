@@ -18,7 +18,7 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
 from dankagu.models.player import Player
 from dankagu.models.social import FriendRelation, MySpaceLikeRecord
 from dankagu.models.storage import PlayerStorageEntry
-from dankagu.services.fes_player import query_player_storage_by_keys
+from dankagu.services.fes_player import query_multi_player_storage_by_keys
 from dankagu.services.system import get_jst_game_day
 
 logger = logging.getLogger("dankagu.services.my_space")
@@ -232,25 +232,31 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
                 response.next_page_token = _encode_cursor(last_included.liked_at, last_included.id)
                 records = records[:limit]
 
+            target_pids = list({rec.to_player_id for rec in records})
+            players_by_id: dict[str, Player] = {}
+            storage_by_pid: dict[str, list[PlayerStorageEntry]] = {}
+            if target_pids:
+                p_res = await session.execute(select(Player).where(Player.id.in_(target_pids)))
+                players_by_id = {p.id: p for p in p_res.scalars().all()}
+                storage_by_pid = await query_multi_player_storage_by_keys(
+                    session, target_pids, storage_keys
+                )
+
             for rec in records:
                 like_item = response.likes.add()
                 like_item.liked_at = rec.liked_at
-                target = await session.get(Player, rec.to_player_id)
+                target = players_by_id.get(rec.to_player_id)
                 like_item.player.player_id = rec.to_player_id
                 like_item.player.nickname = (
                     (target.nickname or target.name or "DanKagu") if target else "DanKagu"
                 )
-                if storage_keys:
-                    entries = await query_player_storage_by_keys(
-                        session, rec.to_player_id, storage_keys
-                    )
-                    for row in entries:
-                        e = like_item.player.player_storage_entries.add()
-                        e.player_id = row.player_id
-                        e.key = row.key
-                        e.value = row.value
-                        e.created_at = row.created_at
-                        e.updated_at = row.updated_at
+                for row in storage_by_pid.get(rec.to_player_id, []):
+                    e = like_item.player.player_storage_entries.add()
+                    e.player_id = row.player_id
+                    e.key = row.key
+                    e.value = row.value
+                    e.created_at = row.created_at
+                    e.updated_at = row.updated_at
 
         return response
 
@@ -299,25 +305,31 @@ class MySpaceService(my_space_pb2_grpc.MySpaceServicer):
                 response.next_page_token = _encode_cursor(last_included.liked_at, last_included.id)
                 records = records[:limit]
 
+            sender_pids = list({rec.from_player_id for rec in records})
+            players_by_id: dict[str, Player] = {}
+            storage_by_pid: dict[str, list[PlayerStorageEntry]] = {}
+            if sender_pids:
+                p_res = await session.execute(select(Player).where(Player.id.in_(sender_pids)))
+                players_by_id = {p.id: p for p in p_res.scalars().all()}
+                storage_by_pid = await query_multi_player_storage_by_keys(
+                    session, sender_pids, storage_keys
+                )
+
             for rec in records:
                 like_item = response.likes.add()
                 like_item.liked_at = rec.liked_at
-                sender = await session.get(Player, rec.from_player_id)
+                sender = players_by_id.get(rec.from_player_id)
                 like_item.player.player_id = rec.from_player_id
                 like_item.player.nickname = (
                     (sender.nickname or sender.name or "DanKagu") if sender else "DanKagu"
                 )
-                if storage_keys:
-                    entries = await query_player_storage_by_keys(
-                        session, rec.from_player_id, storage_keys
-                    )
-                    for row in entries:
-                        e = like_item.player.player_storage_entries.add()
-                        e.player_id = row.player_id
-                        e.key = row.key
-                        e.value = row.value
-                        e.created_at = row.created_at
-                        e.updated_at = row.updated_at
+                for row in storage_by_pid.get(rec.from_player_id, []):
+                    e = like_item.player.player_storage_entries.add()
+                    e.player_id = row.player_id
+                    e.key = row.key
+                    e.value = row.value
+                    e.created_at = row.created_at
+                    e.updated_at = row.updated_at
 
         return response
 

@@ -4,7 +4,6 @@ import logging
 import time
 
 import grpc
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import InsufficientFundsError, deduct_stones
@@ -18,7 +17,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 from dankagu.grpc.generated.takasho.schema.common_featureset.resource.game_product.v1_pb2 import (
     GameProduct as ProtoGameProduct,
 )
-from dankagu.models.storage import PlayerStorageEntry
+from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.game_product")
 
@@ -250,24 +249,17 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
                 )
                 return game_product_pb2.GameProductPurchaseAndSavePlayerStorageV1.Response()
 
-            # Save entries
+            rows_to_upsert = []
             for proto_entry in request.entries:
-                upsert_stmt = pg_insert(PlayerStorageEntry).values(
-                    player_id=current_pid,
-                    key=proto_entry.key,
-                    value=proto_entry.value,
-                    created_at=proto_entry.created_at or now,
-                    updated_at=now,
+                rows_to_upsert.append(
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
                 )
-                upsert_stmt = upsert_stmt.on_conflict_do_update(
-                    index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                    set_={
-                        "value": upsert_stmt.excluded.value,
-                        "updated_at": upsert_stmt.excluded.updated_at,
-                    },
-                )
-                await session.execute(upsert_stmt)
-
                 resp_entry = response.entries.add()
                 resp_entry.player_id = current_pid
                 resp_entry.key = proto_entry.key
@@ -275,6 +267,12 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
                 resp_entry.created_at = proto_entry.created_at or now
                 resp_entry.updated_at = now
 
+            if rows_to_upsert:
+                await batch_upsert_storage_entries(session, rows_to_upsert)
+
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
 
         vc_free = response.wallet.virtual_currencies.add()
@@ -285,9 +283,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         vc_paid.virtual_currency_name = "PAID_STONE"
         vc_paid.amount = paid_remaining
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
+        response.revision = revision
 
         prod = self._find_product(request.game_product_id)
         if prod:
@@ -331,24 +327,17 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
                 )
                 return game_product_pb2.GameProductPurchaseAndSavePlayerStorageV2.Response()
 
-            # Save entries
+            rows_to_upsert = []
             for proto_entry in request.entries:
-                upsert_stmt = pg_insert(PlayerStorageEntry).values(
-                    player_id=current_pid,
-                    key=proto_entry.key,
-                    value=proto_entry.value,
-                    created_at=proto_entry.created_at or now,
-                    updated_at=now,
+                rows_to_upsert.append(
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
                 )
-                upsert_stmt = upsert_stmt.on_conflict_do_update(
-                    index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                    set_={
-                        "value": upsert_stmt.excluded.value,
-                        "updated_at": upsert_stmt.excluded.updated_at,
-                    },
-                )
-                await session.execute(upsert_stmt)
-
                 resp_entry = response.entries.add()
                 resp_entry.player_id = current_pid
                 resp_entry.key = proto_entry.key
@@ -356,6 +345,12 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
                 resp_entry.created_at = proto_entry.created_at or now
                 resp_entry.updated_at = now
 
+            if rows_to_upsert:
+                await batch_upsert_storage_entries(session, rows_to_upsert)
+
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
 
         vc_free = response.wallet.virtual_currencies.add()
@@ -366,9 +361,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
         vc_paid.virtual_currency_name = "PAID_STONE"
         vc_paid.amount = paid_remaining
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
+        response.revision = revision
 
         prod = self._find_product(request.game_product_id)
         if prod:

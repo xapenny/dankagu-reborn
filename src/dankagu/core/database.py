@@ -36,9 +36,10 @@ def get_engine() -> AsyncEngine:
             settings.db_url,
             echo=False,
             future=True,
-            pool_pre_ping=True,
-            pool_size=10,
-            max_overflow=20,
+            pool_pre_ping=False,
+            pool_recycle=settings.db_pool_recycle,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
         )
     return _engine
 
@@ -86,14 +87,18 @@ async def create_all_tables() -> None:
 
 
 async def seed_runtime_data() -> None:
-    """Populate master/gacha rows when their tables are empty (idempotent)."""
+    """Populate master/gacha rows when their tables are empty (idempotent) and warm caches."""
     from dankagu.core.gacha_seed import seed_gacha_data_if_empty
     from dankagu.core.master_seed import seed_master_data_if_empty
+    from dankagu.core.storage_state import StorageRevisionManager
+    from dankagu.services.loot_box import ensure_gacha_cache_loaded
 
     session_factory = get_sessionmaker()
     async with session_factory() as session:
         await seed_gacha_data_if_empty(session)
         await seed_master_data_if_empty(session)
+        await ensure_gacha_cache_loaded(session)
+    await StorageRevisionManager.initialize()
 
 
 async def init_db() -> None:
