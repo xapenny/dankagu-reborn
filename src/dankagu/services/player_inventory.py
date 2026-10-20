@@ -3,11 +3,12 @@
 import json
 import logging
 import time
+from typing import Any
 
 import grpc
 from google.protobuf.internal.decoder import _DecodeVarint
 from google.protobuf.internal.encoder import _EncodeVarint
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import add_stones, get_or_create_wallet
@@ -27,7 +28,10 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 )
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.storage import PlayerStorageEntry
-from dankagu.services.player_storage import batch_upsert_storage_entries
+from dankagu.services.player_storage import (
+    _plan_card_merge_from_entries,
+    batch_upsert_storage_entries,
+)
 
 logger = logging.getLogger("dankagu.services.player_inventory")
 
@@ -258,9 +262,48 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            # 1. Save any storage entries sent by client first (from client-side ItemReceiver)
-            rows_to_upsert = []
+            # 1. Canonicalise any card entries and plan storage writes
+
+            incoming_entries = [(e.key, e.value) for e in request.entries if e.value]
+
+            card_plan = await _plan_card_merge_from_entries(
+                session, current_pid, incoming_entries, now
+            )
+
+            written_keys: set[str] = set()
+
+            rows_to_upsert: list[dict[str, Any]] = []
+
+            keys_to_delete: list[str] = []
+
+            if card_plan is not None:
+                for key, value in card_plan.writes:
+                    rows_to_upsert.append(
+                        {
+                            "player_id": current_pid,
+                            "key": key,
+                            "value": value,
+                            "created_at": now,
+                            "updated_at": now,
+                        }
+                    )
+
+                    written_keys.add(key)
+
+                if card_plan.drop_keys:
+                    keys_to_delete.extend(card_plan.drop_keys)
+
             for proto_entry in request.entries:
+                if proto_entry.key in written_keys or (
+                    card_plan is not None and proto_entry.key in card_plan.drop_keys
+                ):
+                    continue
+
+                if not proto_entry.value:
+                    keys_to_delete.append(proto_entry.key)
+
+                    continue
+
                 rows_to_upsert.append(
                     {
                         "player_id": current_pid,
@@ -270,15 +313,32 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                         "updated_at": now,
                     }
                 )
-                resp_entry = response.entries.add()
-                resp_entry.player_id = current_pid
-                resp_entry.key = proto_entry.key
-                resp_entry.value = proto_entry.value
-                resp_entry.created_at = proto_entry.created_at or now
-                resp_entry.updated_at = now
+
+            if keys_to_delete:
+                await session.execute(
+                    delete(PlayerStorageEntry).where(
+                        PlayerStorageEntry.player_id == current_pid,
+                        PlayerStorageEntry.key.in_(keys_to_delete),
+                    )
+                )
 
             if rows_to_upsert:
                 await batch_upsert_storage_entries(session, rows_to_upsert)
+
+            written_map = {row["key"]: row for row in rows_to_upsert}
+
+            for key, row in written_map.items():
+                resp_entry = response.entries.add()
+
+                resp_entry.player_id = current_pid
+
+                resp_entry.key = key
+
+                resp_entry.value = row["value"]
+
+                resp_entry.created_at = row["created_at"]
+
+                resp_entry.updated_at = row["updated_at"]
 
             # 2. Claim items and apply server-side wallet / bonus storage updates
             if ids_to_claim:

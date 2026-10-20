@@ -3,6 +3,7 @@
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -144,14 +145,36 @@ def _encode_varint(field_num: int, val: int) -> bytes:
 
 CARD_STATUS_PREFIX = "CardStatus--"
 
-#: CardStatus payload fields, as the client's own schema numbers them.
+#: CardStatus payload fields, matching client CardStatusProto wire schema.
+
 CARD_FIELD_INSTANCE_ID = 1
 CARD_FIELD_CARD_ID = 2
 CARD_FIELD_CREATED_AT = 3
-CARD_FIELD_BLOSSOM = 5
+CARD_FIELD_UPDATED_AT = 4
+
+CARD_FIELD_AWAKE_LV = 5
+
 CARD_FIELD_EXP = 6
-CARD_FIELD_STATUS = 8
-CARD_FIELD_DUPLICATE = 11
+CARD_FIELD_DANMAKU_EXP = 7
+
+CARD_FIELD_FAVORITE = 8
+
+CARD_FIELD_USE_AWK_IMAGE = 9
+
+CARD_FIELD_NEW = 10
+
+CARD_FIELD_USE_PREMIUM_IMAGE = 11
+
+
+# Aliases for backward compatibility
+
+CARD_FIELD_BLOSSOM = CARD_FIELD_AWAKE_LV
+
+CARD_FIELD_STATUS = CARD_FIELD_FAVORITE
+
+CARD_FIELD_DUPLICATE = CARD_FIELD_AWAKE_LV
+
+MAX_AWAKE_LV = 5
 
 
 @dataclass
@@ -164,17 +187,19 @@ class CardCanonicalisation:
     collapsed: dict[int, int]
 
 
-def card_progress(fields: dict[int, int]) -> tuple[int, int, int]:
-    """How far a card has been developed: (status, blossom, exp), strongest last.
+def card_progress(fields: dict[int, int]) -> tuple[int, int, int, int]:
+    """How far a card has been developed: (favorite, awake_lv, exp, danmaku_exp).
+
 
     Used to pick which of several copies of one card survives a merge, and to carry the
     highest development into the surviving entry, so folding duplicates can never discard
     a level or a limit break the player earned.
     """
     return (
-        fields.get(CARD_FIELD_STATUS, 0) or 0,
-        fields.get(CARD_FIELD_BLOSSOM, 0) or 0,
+        fields.get(CARD_FIELD_FAVORITE, 0) or 0,
+        fields.get(CARD_FIELD_AWAKE_LV, 0) or 0,
         fields.get(CARD_FIELD_EXP, 0) or 0,
+        fields.get(CARD_FIELD_DANMAKU_EXP, 0) or 0,
     )
 
 
@@ -182,22 +207,48 @@ def merge_card_payload(
     card_id: int,
     survivor: dict[int, int],
     others: list[dict[int, int]],
-    duplicate: int,
+    awake_lv: int,
     now: int,
 ) -> bytes:
     """Build the surviving payload, keeping the strongest development of every copy."""
-    strongest = max([survivor, *others], key=card_progress)
-    created = [fields.get(CARD_FIELD_CREATED_AT) for fields in [survivor, *others]]
+    all_copies = [survivor, *others]
+
+    strongest = max(all_copies, key=card_progress)
+
+    created = [fields.get(CARD_FIELD_CREATED_AT) for fields in all_copies]
+
     created = [value for value in created if value]
+
+    max_exp = max((fields.get(CARD_FIELD_EXP, 0) or 0) for fields in all_copies)
+
+    max_danmaku_exp = max((fields.get(CARD_FIELD_DANMAKU_EXP, 0) or 0) for fields in all_copies)
+
+    fav = 1 if any((fields.get(CARD_FIELD_FAVORITE, 0) or 0) > 0 for fields in all_copies) else 0
+
+    use_prem = (
+        1
+        if any((fields.get(CARD_FIELD_USE_PREMIUM_IMAGE, 0) or 0) > 0 for fields in all_copies)
+        else 0
+    )
+
+    use_awk = (
+        1
+        if any((fields.get(CARD_FIELD_USE_AWK_IMAGE, 0) or 0) > 0 for fields in all_copies)
+        else (1 if awake_lv >= 1 else 0)
+    )
+
     return encode_card_status(
         instance_id=survivor.get(CARD_FIELD_INSTANCE_ID, 0),
         card_id=card_id,
         created_at=min(created) if created else now,
         updated_at=now,
-        blossom=strongest.get(CARD_FIELD_BLOSSOM, 1) or 1,
-        exp=strongest.get(CARD_FIELD_EXP, 0) or 0,
-        duplicate=duplicate,
-        status=strongest.get(CARD_FIELD_STATUS, 1) or 1,
+        awake_lv=min(MAX_AWAKE_LV, awake_lv),
+        exp=max_exp,
+        danmaku_exp=max_danmaku_exp,
+        favorite=fav,
+        use_awk_image=use_awk,
+        is_new=strongest.get(CARD_FIELD_NEW, 0) or 0,
+        use_premium_image=use_prem,
     )
 
 
@@ -209,10 +260,10 @@ def canonicalise_card_entries(
     """Fold the client's per-copy card entries into one entry per card.
 
     The client writes one ``CardStatus--<instance id>`` entry **per drawn copy**, so two
-    copies of a card in a single ten-pull became two collection entries (the live
-    database shows cards occupying up to four), instead of one entry whose ``duplicate``
-    field counts the copies -- which is what this project's own merge helper always
-    assumed, and what the client's limit-break logic reads.
+    copies of a card in a single ten-pull became two collection entries, instead of one
+
+    entry whose ``awake_lv`` (Field 5) reflects the card's limit-break progression.
+
 
     Returns ``None`` when the request carries no card entries at all, so the caller can
     keep its fast path.
@@ -228,29 +279,34 @@ def canonicalise_card_entries(
     copies: dict[int, int] = {}
     collapsed: dict[int, int] = {}
 
-    # Group the request by card id, keeping the order the client sent them in.
     grouped: dict[int, list[tuple[str, bytes]]] = {}
     for key, value in card_incoming:
         fields = _parse_card_fields(value)
         card_id = fields.get(CARD_FIELD_CARD_ID)
         if not card_id:
-            # Not a card we can read; store it verbatim rather than losing the write.
             writes.append((key, value))
             continue
         grouped.setdefault(int(card_id), []).append((key, value))
 
     for card_id, entries in grouped.items():
         stored = existing.get(card_id)
-        # One copy means one increment; an entry without the field still counts as one.
-        increment = sum(
-            _parse_card_fields(value).get(CARD_FIELD_DUPLICATE, 1) or 1 for _, value in entries
+        # Each entry represents at least 1 copy (plus any previous AwakeLv if non-zero)
+
+        incoming_copies = sum(
+            max(1, (_parse_card_fields(value).get(CARD_FIELD_AWAKE_LV, 0) or 0) + 1)
+            for _, value in entries
         )
 
         if stored is not None:
             stored_key, stored_value = stored
             stored_fields = _parse_card_fields(stored_value)
             incoming_fields = [_parse_card_fields(value) for _key, value in entries]
-            total = (stored_fields.get(CARD_FIELD_DUPLICATE, 1) or 1) + increment
+            stored_copies = max(1, (stored_fields.get(CARD_FIELD_AWAKE_LV, 0) or 0) + 1)
+
+            total_copies = stored_copies + incoming_copies
+
+            new_awake = min(MAX_AWAKE_LV, max(0, total_copies - 1))
+
             writes.append(
                 (
                     stored_key,
@@ -258,35 +314,41 @@ def canonicalise_card_entries(
                         card_id=card_id,
                         survivor=stored_fields,
                         others=incoming_fields,
-                        duplicate=total,
+                        awake_lv=new_awake,
                         now=now,
                     ),
                 )
             )
-            # Every key the client just sent is redundant: the card lives under the key
-            # it already had. Drop them, including copies stored by earlier writes.
             for key, _value in entries:
                 if key != stored_key:
                     drop_keys.append(key)
+            copies[card_id] = total_copies
+
         else:
             keep_key, keep_value = entries[0]
             keep_fields = _parse_card_fields(keep_value)
+            other_fields = [_parse_card_fields(value) for _key, value in entries[1:]]
+
+            total_copies = incoming_copies
+
+            new_awake = min(MAX_AWAKE_LV, max(0, total_copies - 1))
+
             writes.append(
                 (
                     keep_key,
                     merge_card_payload(
                         card_id=card_id,
                         survivor=keep_fields,
-                        others=[_parse_card_fields(value) for _key, value in entries[1:]],
-                        duplicate=increment,
+                        others=other_fields,
+                        awake_lv=new_awake,
                         now=now,
                     ),
                 )
             )
             for key, _value in entries[1:]:
                 drop_keys.append(key)
+            copies[card_id] = total_copies
 
-        copies[card_id] = increment
         if len(entries) > 1:
             collapsed[card_id] = len(entries)
 
@@ -331,24 +393,64 @@ def encode_card_status(
     card_id: int,
     created_at: int,
     updated_at: int,
-    blossom: int = 1,
+    awake_lv: int = 0,
     exp: int = 0,
-    duplicate: int = 1,
-    status: int = 1,
+    danmaku_exp: int = 0,
+    favorite: int = 0,
+    use_awk_image: int = 0,
+    is_new: int = 0,
+    use_premium_image: int = 0,
+    **kwargs: Any,
 ) -> bytes:
     """Construct authentic CardStatus binary protobuf matching iOS/Android client schema."""
+    if "blossom" in kwargs and kwargs["blossom"] is not None and not awake_lv:
+        awake_lv = kwargs["blossom"]
+
+    if "duplicate" in kwargs and kwargs["duplicate"] is not None and not awake_lv:
+        # Backward compatibility for tests passing duplicate:
+
+        # 1 copy -> awake_lv 0; N copies -> awake_lv N - 1
+
+        dup = kwargs["duplicate"]
+
+        awake_lv = max(0, dup - 1) if dup > 0 else 0
+
+    if "status" in kwargs and kwargs["status"] is not None and not favorite:
+        favorite = kwargs["status"]
+
     res = bytearray()
-    res.extend(_encode_varint(1, instance_id))
-    res.extend(_encode_varint(2, card_id))
-    res.extend(_encode_varint(3, created_at))
-    res.extend(_encode_varint(4, updated_at))
-    if blossom > 1:
-        res.extend(_encode_varint(5, blossom))
+    if instance_id:
+        res.extend(_encode_varint(1, instance_id))
+
+    if card_id:
+        res.extend(_encode_varint(2, card_id))
+
+    if created_at:
+        res.extend(_encode_varint(3, created_at))
+
+    if updated_at:
+        res.extend(_encode_varint(4, updated_at))
+
+    if awake_lv > 0:
+        res.extend(_encode_varint(5, awake_lv))
+
     if exp > 0:
         res.extend(_encode_varint(6, exp))
-    res.extend(_encode_varint(8, status))
-    res.extend(_encode_varint(10, 1))
-    res.extend(_encode_varint(11, duplicate))
+    if danmaku_exp > 0:
+        res.extend(_encode_varint(7, danmaku_exp))
+
+    if favorite > 0:
+        res.extend(_encode_varint(8, favorite))
+
+    if use_awk_image > 0:
+        res.extend(_encode_varint(9, use_awk_image))
+
+    if is_new > 0:
+        res.extend(_encode_varint(10, is_new))
+
+    if use_premium_image > 0:
+        res.extend(_encode_varint(11, use_premium_image))
+
     return bytes(res)
 
 
@@ -376,7 +478,8 @@ async def persist_cards_to_storage(
     card_map: dict[int, tuple[PlayerStorageEntry, dict[int, int]]] = {}
     for entry in entries:
         fields = _parse_card_fields(entry.value)
-        cid = fields.get(2)
+        cid = fields.get(CARD_FIELD_CARD_ID)
+
         if cid:
             card_map[cid] = (entry, fields)
 
@@ -392,29 +495,33 @@ async def persist_cards_to_storage(
                 except ValueError:
                     inst_id_val = base_inst_id + idx
 
-            created_at = fields.get(3, now)
-            blossom = fields.get(5, 1)
-            exp = fields.get(6, 0)
-            dup = fields.get(11, fields.get(7, 1)) + 1
-            status = fields.get(8, 1)
+            created_at = fields.get(CARD_FIELD_CREATED_AT, now)
+
+            awake_lv = fields.get(CARD_FIELD_AWAKE_LV, 0) or 0
+
+            exp = fields.get(CARD_FIELD_EXP, 0) or 0
+
+            favorite = fields.get(CARD_FIELD_FAVORITE, 1) or 1
+
+            new_awake = min(MAX_AWAKE_LV, awake_lv + 1)
 
             entry.value = encode_card_status(
                 instance_id=inst_id_val,
                 card_id=card_id,
                 created_at=created_at,
                 updated_at=now,
-                blossom=blossom,
+                awake_lv=new_awake,
                 exp=exp,
-                duplicate=dup,
-                status=status,
+                favorite=favorite,
             )
             entry.updated_at = now
-            fields[11] = dup
+            fields[CARD_FIELD_AWAKE_LV] = new_awake
+
             logger.info(
-                "🎴 Increment duplicate for card %d (player %s, new dup count=%d)",
+                "🎴 Increment AwakeLv for card %d (player %s, new AwakeLv=%d)",
                 card_id,
                 player_id,
-                dup,
+                new_awake,
             )
         else:
             new_inst_id = base_inst_id + idx
@@ -423,10 +530,9 @@ async def persist_cards_to_storage(
                 card_id=card_id,
                 created_at=now,
                 updated_at=now,
-                blossom=1,
+                awake_lv=0,
                 exp=0,
-                duplicate=1,
-                status=1,
+                favorite=1,
             )
             new_entry = PlayerStorageEntry(
                 player_id=player_id,
@@ -439,14 +545,13 @@ async def persist_cards_to_storage(
             card_map[card_id] = (
                 new_entry,
                 {
-                    1: new_inst_id,
-                    2: card_id,
-                    3: now,
-                    4: now,
-                    5: 1,
-                    6: 0,
-                    8: 1,
-                    11: 1,
+                    CARD_FIELD_INSTANCE_ID: new_inst_id,
+                    CARD_FIELD_CARD_ID: card_id,
+                    CARD_FIELD_CREATED_AT: now,
+                    CARD_FIELD_UPDATED_AT: now,
+                    CARD_FIELD_AWAKE_LV: 0,
+                    CARD_FIELD_EXP: 0,
+                    CARD_FIELD_FAVORITE: 1,
                 },
             )
             logger.info(

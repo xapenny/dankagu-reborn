@@ -9,6 +9,8 @@ from sqlalchemy import select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import (
+    CARD_FIELD_AWAKE_LV,
+    CARD_FIELD_CARD_ID,
     InsufficientFundsError,
     _parse_card_fields,
     add_stones,
@@ -168,8 +170,9 @@ async def test_card_persistence_and_duplicate_breakthrough(sample_player: Player
         entry1 = await session.get(PlayerStorageEntry, (sample_player.id, key1))
         assert entry1 is not None
         fields1 = _parse_card_fields(entry1.value)
-        assert fields1[2] == test_card_id  # card_id
-        assert fields1[11] == 1  # duplicate count
+        assert fields1[CARD_FIELD_CARD_ID] == test_card_id  # card_id
+
+        assert fields1.get(CARD_FIELD_AWAKE_LV, 0) == 0  # initial AwakeLv is 0
 
         # 2. Second pull: duplicate of same card
         key2, is_new2 = await persist_card_to_storage(
@@ -180,12 +183,14 @@ async def test_card_persistence_and_duplicate_breakthrough(sample_player: Player
         await session.commit()
 
     async with session_factory() as session:
-        # Verify duplicate count incremented
+        # Verify AwakeLv incremented to 1
+
         entry2 = await session.get(PlayerStorageEntry, (sample_player.id, key1))
         assert entry2 is not None
         fields2 = _parse_card_fields(entry2.value)
-        assert fields2[2] == test_card_id
-        assert fields2[11] == 2  # incremented to 2!
+        assert fields2[CARD_FIELD_CARD_ID] == test_card_id
+
+        assert fields2.get(CARD_FIELD_AWAKE_LV, 0) == 1  # AwakeLv incremented to 1!
 
 
 @pytest.mark.asyncio

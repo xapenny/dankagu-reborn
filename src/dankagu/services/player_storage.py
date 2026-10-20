@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import grpc
@@ -11,9 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import (
+    CARD_FIELD_AWAKE_LV,
     CARD_FIELD_CARD_ID,
-    CARD_FIELD_DUPLICATE,
     CARD_STATUS_PREFIX,
+    MAX_AWAKE_LV,
     CardCanonicalisation,
     _parse_card_fields,
     canonicalise_card_entries,
@@ -123,12 +125,15 @@ async def _upsert_entry(
     )
 
 
-async def _plan_card_merge(
-    session: AsyncSession, player_id: str, request: Any, now: int
+async def _plan_card_merge_from_entries(
+    session: AsyncSession,
+    player_id: str,
+    incoming: Sequence[tuple[str, bytes]],
+    now: int,
 ) -> CardCanonicalisation | None:
-    """Work out how this request's card entries should be folded together."""
-    incoming = [(entry.key, entry.value) for entry in request.entries if entry.value]
-    if not any(key.startswith(CARD_STATUS_PREFIX) for key, _ in incoming):
+    """Work out how a set of client-supplied entries should be folded together."""
+
+    if not any(key.startswith(CARD_STATUS_PREFIX) for key, _value in incoming):
         return None
 
     stored = await session.execute(
@@ -160,36 +165,62 @@ async def _plan_card_merge(
             if survivor_key != keep_key:
                 duplicates.setdefault(card_id, []).append(keep_key)
             duplicates.setdefault(card_id, []).append(entry.key)
+
+            cur_awk = survivor_fields.get(CARD_FIELD_AWAKE_LV, 0) or 0
+
+            other_fields = keep_fields if survivor_key != keep_key else fields
+
+            other_awk = other_fields.get(CARD_FIELD_AWAKE_LV, 0) or 0
+
+            total_copies = (cur_awk + 1) + (other_awk + 1)
+
+            merged_awk = min(MAX_AWAKE_LV, max(0, total_copies - 1))
+
             existing[card_id] = (
                 survivor_key,
                 merge_card_payload(
                     card_id=card_id,
                     survivor=survivor_fields,
-                    others=[keep_fields if survivor_key != keep_key else fields],
-                    duplicate=(keep_fields.get(CARD_FIELD_DUPLICATE, 1) or 1)
-                    + (fields.get(CARD_FIELD_DUPLICATE, 1) or 1),
+                    others=[other_fields],
+                    awake_lv=merged_awk,
                     now=now,
                 ),
             )
             continue
         existing[card_id] = (entry.key, entry.value)
 
-    plan = canonicalise_card_entries(existing, incoming, now)
-    if plan is not None and duplicates:
-        # Only drop the redundant keys of cards this request actually rewrites: the
-        # survivor's counter is carried over when it is written, so deleting a duplicate
-        # of a card the request does not mention would silently lose the copies it stood
-        # for. Those rows stay until that card is next written.
-        doomed = [
-            key for card_id, keys in duplicates.items() if card_id in plan.copies for key in keys
-        ]
-        plan.drop_keys.extend(doomed)
+    plan = canonicalise_card_entries(existing, list(incoming), now)
+
+    if duplicates:
+        if plan is None:
+            plan = CardCanonicalisation(writes=[], drop_keys=[], copies={}, collapsed={})
+
+        for card_id, keys in duplicates.items():
+            survivor_key, survivor_value = existing[card_id]
+
+            if not any(k == survivor_key for k, _ in plan.writes):
+                plan.writes.append((survivor_key, survivor_value))
+
+            for k in keys:
+                if k not in plan.drop_keys:
+                    plan.drop_keys.append(k)
+
         logger.info(
             "🎴 [Storage] Repairing %d pre-existing duplicate card entr(ies) for player %s",
-            len(doomed),
+            len(plan.drop_keys),
             player_id,
         )
     return plan
+
+
+async def _plan_card_merge(
+    session: AsyncSession, player_id: str, request: Any, now: int
+) -> CardCanonicalisation | None:
+    """Work out how this request's card entries should be folded together."""
+
+    incoming = [(entry.key, entry.value) for entry in request.entries if entry.value]
+
+    return await _plan_card_merge_from_entries(session, player_id, incoming, now)
 
 
 class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
@@ -358,8 +389,100 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             else:  # FORWARD
                 prefix = criterion.key
                 # 1. DB entries first
-                for k, e in db_entry_map.items():
-                    if k.startswith(prefix) and k not in served_keys and e.value:
+                matching_entries = [
+                    (k, e)
+                    for k, e in db_entry_map.items()
+                    if k.startswith(prefix) and k not in served_keys and e.value
+                ]
+
+                if prefix.startswith(CARD_STATUS_PREFIX):
+                    cards_by_id: dict[
+                        int, list[tuple[str, PlayerStorageEntry, dict[int, int]]]
+                    ] = {}
+
+                    non_cards: list[tuple[str, PlayerStorageEntry]] = []
+
+                    for k, e in matching_entries:
+                        fields = _parse_card_fields(e.value)
+
+                        cid = fields.get(CARD_FIELD_CARD_ID)
+
+                        if cid:
+                            cards_by_id.setdefault(int(cid), []).append((k, e, fields))
+
+                        else:
+                            non_cards.append((k, e))
+
+                    for cid, c_entries in cards_by_id.items():
+                        c_entries.sort(key=lambda item: item[0])
+
+                        survivor = max(c_entries, key=lambda item: card_progress(item[2]))
+
+                        survivor_k, survivor_e, survivor_fields = survivor
+
+                        if len(c_entries) > 1:
+                            other_fields = [f for k, e, f in c_entries if k != survivor_k]
+
+                            total_copies = sum(
+                                max(1, (f.get(CARD_FIELD_AWAKE_LV, 0) or 0) + 1)
+                                for _, _, f in c_entries
+                            )
+
+                            merged_awk = min(MAX_AWAKE_LV, max(0, total_copies - 1))
+
+                            merged_val = merge_card_payload(
+                                card_id=cid,
+                                survivor=survivor_fields,
+                                others=other_fields,
+                                awake_lv=merged_awk,
+                                now=now,
+                            )
+
+                            proto = response.entries.add()
+
+                            proto.player_id = current_pid
+
+                            proto.key = survivor_k
+
+                            proto.value = merged_val
+
+                            proto.created_at = survivor_e.created_at
+
+                            proto.updated_at = survivor_e.updated_at
+
+                        else:
+                            proto = response.entries.add()
+
+                            proto.player_id = current_pid
+
+                            proto.key = survivor_k
+
+                            proto.value = survivor_e.value
+
+                            proto.created_at = survivor_e.created_at
+
+                            proto.updated_at = survivor_e.updated_at
+
+                        for k, _, _ in c_entries:
+                            served_keys.add(k)
+
+                    for k, e in non_cards:
+                        proto = response.entries.add()
+
+                        proto.player_id = current_pid
+
+                        proto.key = e.key
+
+                        proto.value = e.value
+
+                        proto.created_at = e.created_at
+
+                        proto.updated_at = e.updated_at
+
+                        served_keys.add(k)
+
+                else:
+                    for k, e in matching_entries:
                         proto = response.entries.add()
                         proto.player_id = current_pid
                         proto.key = e.key
@@ -508,13 +631,18 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             await session.commit()
 
         response = player_storage_pb2.PlayerStorageSetEntriesV2.Response()
-        for proto_entry in request.entries:
+        written_map = {row["key"]: row for row in rows_to_upsert}
+
+        for key, row in written_map.items():
             resp_entry = response.entries.add()
             resp_entry.player_id = current_pid
-            resp_entry.key = proto_entry.key
-            resp_entry.value = proto_entry.value
-            resp_entry.created_at = proto_entry.created_at or now
-            resp_entry.updated_at = now
+            resp_entry.key = key
+
+            resp_entry.value = row["value"]
+
+            resp_entry.created_at = row["created_at"]
+
+            resp_entry.updated_at = row["updated_at"]
 
         response.revision = revision
         return response
