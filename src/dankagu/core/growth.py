@@ -236,9 +236,15 @@ async def add_growth_items(
     max_cap: int | None = None,
 ) -> None:
     """Add growth materials directly to player's PlayerStorageEntry records."""
+    if not item_ids:
+        return
     now = int(time.time())
-    keys = [f"GrowthItemStock--{iid}" for iid in item_ids]
+    # Accumulate counts if the same item_id appears more than once in item_ids
+    added_by_id: dict[int, int] = {}
+    for iid in item_ids:
+        added_by_id[iid] = added_by_id.get(iid, 0) + count
 
+    keys = [f"GrowthItemStock--{iid}" for iid in added_by_id]
     stmt = select(PlayerStorageEntry).where(
         PlayerStorageEntry.player_id == player_id,
         PlayerStorageEntry.key.in_(keys),
@@ -246,35 +252,40 @@ async def add_growth_items(
     res = await session.execute(stmt)
     existing_map = {entry.key: entry for entry in res.scalars().all()}
 
-    for iid in item_ids:
+    rows: list[dict[str, object]] = []
+    for iid, add_cnt in added_by_id.items():
         key = f"GrowthItemStock--{iid}"
         existing = existing_map.get(key)
-        new_count = count
+        new_count = add_cnt
         if existing and existing.value:
             try:
                 _, cur_count = decode_growth_item(existing.value)
-                new_count = cur_count + count
+                new_count = cur_count + add_cnt
             except Exception:
                 pass
         if max_cap is not None and new_count > max_cap:
             new_count = max_cap
 
         val_bytes = encode_growth_item(iid, new_count, now)
-        upsert_stmt = pg_insert(PlayerStorageEntry).values(
-            player_id=player_id,
-            key=key,
-            value=val_bytes,
-            created_at=now,
-            updated_at=now,
+        rows.append(
+            {
+                "player_id": player_id,
+                "key": key,
+                "value": val_bytes,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        upsert_stmt = upsert_stmt.on_conflict_do_update(
-            index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-            set_={
-                "value": upsert_stmt.excluded.value,
-                "updated_at": upsert_stmt.excluded.updated_at,
-            },
-        )
-        await session.execute(upsert_stmt)
+
+    upsert_stmt = pg_insert(PlayerStorageEntry).values(rows)
+    upsert_stmt = upsert_stmt.on_conflict_do_update(
+        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
+        set_={
+            "value": upsert_stmt.excluded.value,
+            "updated_at": upsert_stmt.excluded.updated_at,
+        },
+    )
+    await session.execute(upsert_stmt)
 
 
 async def add_generic_item_stocks(
@@ -285,10 +296,15 @@ async def add_generic_item_stocks(
     count: int = 200,
 ) -> None:
     """Add GenericItemStockStatus entries (ItemStockStatus--{prefix_id * 1_000_000 + id})."""
+    if not item_ids:
+        return
     now = int(time.time())
-    composite_ids = [prefix_id * 1_000_000 + iid for iid in item_ids]
-    keys = [f"ItemStockStatus--{cid}" for cid in composite_ids]
+    added_by_cid: dict[int, int] = {}
+    for iid in item_ids:
+        cid = prefix_id * 1_000_000 + iid
+        added_by_cid[cid] = added_by_cid.get(cid, 0) + count
 
+    keys = [f"ItemStockStatus--{cid}" for cid in added_by_cid]
     stmt = select(PlayerStorageEntry).where(
         PlayerStorageEntry.player_id == player_id,
         PlayerStorageEntry.key.in_(keys),
@@ -296,33 +312,38 @@ async def add_generic_item_stocks(
     res = await session.execute(stmt)
     existing_map = {entry.key: entry for entry in res.scalars().all()}
 
-    for cid in composite_ids:
+    rows: list[dict[str, object]] = []
+    for cid, add_cnt in added_by_cid.items():
         key = f"ItemStockStatus--{cid}"
         existing = existing_map.get(key)
-        new_count = count
+        new_count = add_cnt
         if existing and existing.value:
             try:
                 _, cur_count = decode_growth_item(existing.value)
-                new_count = cur_count + count
+                new_count = cur_count + add_cnt
             except Exception:
                 pass
 
         val_bytes = encode_item_stock_status(cid, new_count)
-        upsert_stmt = pg_insert(PlayerStorageEntry).values(
-            player_id=player_id,
-            key=key,
-            value=val_bytes,
-            created_at=now,
-            updated_at=now,
+        rows.append(
+            {
+                "player_id": player_id,
+                "key": key,
+                "value": val_bytes,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        upsert_stmt = upsert_stmt.on_conflict_do_update(
-            index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-            set_={
-                "value": upsert_stmt.excluded.value,
-                "updated_at": upsert_stmt.excluded.updated_at,
-            },
-        )
-        await session.execute(upsert_stmt)
+
+    upsert_stmt = pg_insert(PlayerStorageEntry).values(rows)
+    upsert_stmt = upsert_stmt.on_conflict_do_update(
+        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
+        set_={
+            "value": upsert_stmt.excluded.value,
+            "updated_at": upsert_stmt.excluded.updated_at,
+        },
+    )
+    await session.execute(upsert_stmt)
 
 
 def _make_mail_item(

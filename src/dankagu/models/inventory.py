@@ -3,7 +3,7 @@
 import time
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, LargeBinary, String
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from dankagu.core.database import Base
@@ -13,6 +13,14 @@ class PlayerInventoryItem(Base):
     """Player gifts / inventory items in the mailbox."""
 
     __tablename__ = "player_inventories"
+    __table_args__ = (
+        Index(
+            "ix_player_inventories_player_claimed_created",
+            "player_id",
+            "is_claimed",
+            "created_at",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
     player_id: Mapped[str] = mapped_column(

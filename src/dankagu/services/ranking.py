@@ -17,7 +17,9 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     score_ranking_pb2,
     score_ranking_pb2_grpc,
 )
-from dankagu.grpc.generated.takasho.schema.fes.resource.ranking import v1_pb2 as ranking_resource_pb2
+from dankagu.grpc.generated.takasho.schema.fes.resource.ranking import (
+    v1_pb2 as ranking_resource_pb2,
+)
 from dankagu.models.player import Player
 from dankagu.models.ranking import EventLeaderboard, SongLeaderboard
 
@@ -596,4 +598,3 @@ def register_ranking_servicers(server: grpc.aio.Server) -> None:
             ),
         )
     )
-

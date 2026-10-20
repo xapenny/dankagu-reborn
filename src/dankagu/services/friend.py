@@ -41,7 +41,10 @@ from dankagu.grpc.generated.takasho.schema.fes.resource.friend import (
 from dankagu.models.player import Player
 from dankagu.models.social import FriendRelation
 from dankagu.models.storage import PlayerStorageEntry
-from dankagu.services.fes_player import query_player_storage_by_keys
+from dankagu.services.fes_player import (
+    query_multi_player_storage_by_keys,
+    query_player_storage_by_keys,
+)
 
 logger = logging.getLogger("dankagu.services.friend")
 
@@ -70,15 +73,31 @@ async def resolve_player_pk(session: AsyncSession, raw_id: str) -> tuple[str | N
     if not raw:
         return None, "empty"
 
-    for label, condition in (
-        ("player_id", Player.id == raw),
-        ("player_id_ci", func.lower(Player.id) == raw.lower()),
-        ("short_id", Player.short_id == raw),
-        ("user_id", Player.user_id == raw),
-    ):
-        hit = (await session.execute(select(Player.id).where(condition).limit(1))).scalar()
-        if hit:
-            return hit, label
+    raw_lower = raw.lower()
+    stmt = select(Player).where(
+        or_(
+            Player.id == raw,
+            func.lower(Player.id) == raw_lower,
+            Player.short_id == raw,
+            Player.user_id == raw,
+        )
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    if not rows:
+        return None, "unresolved"
+
+    for p in rows:
+        if p.id == raw:
+            return p.id, "player_id"
+    for p in rows:
+        if p.id and p.id.lower() == raw_lower:
+            return p.id, "player_id_ci"
+    for p in rows:
+        if p.short_id == raw:
+            return p.id, "short_id"
+    for p in rows:
+        if p.user_id == raw:
+            return p.id, "user_id"
 
     return None, "unresolved"
 
@@ -97,21 +116,16 @@ async def resolve_players(
         return {}
 
     values = sorted(candidates)
+    lowered = sorted({value.lower() for value in candidates})
     stmt = select(Player).where(
         or_(
             Player.id.in_(values),
+            func.lower(Player.id).in_(lowered),
             Player.short_id.in_(values),
             Player.user_id.in_(values),
         )
     )
     players = list((await session.execute(stmt)).scalars().all())
-
-    # Second pass for UUIDs stored in a different case (cheap, and only needed
-    # when the exact match found nothing for some candidate).
-    lowered = sorted({value.lower() for value in candidates})
-    if lowered:
-        case_stmt = select(Player).where(func.lower(Player.id).in_(lowered))
-        players.extend((await session.execute(case_stmt)).scalars().all())
 
     lookup: dict[str, Player] = {}
     for player in players:
@@ -153,6 +167,47 @@ async def _own_reference_ids(session: AsyncSession, player_pk: str) -> list[str]
         if player.user_id:
             refs.add(player.user_id)
     return sorted(refs)
+
+
+async def _fetch_both_relation_pks(
+    session: AsyncSession, my_refs: list[str]
+) -> tuple[set[str], set[str]]:
+    """Return ``(following_pks, followed_pks)`` for ``my_refs`` in minimal SQL round-trips."""
+    if not my_refs:
+        return set(), set()
+
+    my_ref_set = set(my_refs)
+    rel_rows = (
+        await session.execute(
+            select(FriendRelation.follower_id, FriendRelation.target_id).where(
+                or_(
+                    FriendRelation.follower_id.in_(my_refs),
+                    FriendRelation.target_id.in_(my_refs),
+                )
+            )
+        )
+    ).all()
+
+    following_raw: list[str] = []
+    followed_raw: list[str] = []
+    for follower_id, target_id in rel_rows:
+        if follower_id in my_ref_set:
+            following_raw.append(target_id)
+        if target_id in my_ref_set:
+            followed_raw.append(follower_id)
+
+    all_raw = set(following_raw) | set(followed_raw)
+    if not all_raw:
+        return set(), set()
+
+    lookup = await resolve_players(session, all_raw)
+    following_pks = {
+        player.id for raw in following_raw if (player := _lookup_player(lookup, raw)) is not None
+    }
+    followed_pks = {
+        player.id for raw in followed_raw if (player := _lookup_player(lookup, raw)) is not None
+    }
+    return following_pks, followed_pks
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +302,7 @@ async def _populate_friend_player(
     is_following: bool,
     is_followed: bool,
     storage_keys: list[str],
+    preloaded_entries: list[PlayerStorageEntry] | None = None,
 ) -> None:
     """Populate a FriendPlayer protobuf message from database records."""
     proto_fp.player_id = target_player.id
@@ -259,7 +315,11 @@ async def _populate_friend_player(
     proto_fp.last_logged_in_at = target_player.last_login_at or int(time.time())
 
     if storage_keys:
-        entries = await query_player_storage_by_keys(session, target_player.id, storage_keys)
+        entries = (
+            preloaded_entries
+            if preloaded_entries is not None
+            else await query_player_storage_by_keys(session, target_player.id, storage_keys)
+        )
         for row in entries:
             entry = proto_fp.player_storage_entries.add()
             entry.player_id = row.player_id
@@ -287,32 +347,7 @@ class FriendService(friend_pb2_grpc.FriendServicer):
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             my_refs = await _own_reference_ids(session, current_pid)
-            # Who follows me, and whom I follow - both resolved to players.id.
-            follower_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.follower_id).where(
-                            FriendRelation.target_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            following_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.target_id).where(
-                            FriendRelation.follower_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
-            follower_pks = await _resolved_pks(session, follower_rows)
-            following_pks = await _resolved_pks(session, following_rows)
+            following_pks, follower_pks = await _fetch_both_relation_pks(session, my_refs)
             candidates = _apply_follow_filter(
                 follower_pks,
                 follow_filter=_follow_filter(criterion),
@@ -326,6 +361,9 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             ).limit(limit)
             players = list((await session.execute(stmt)).scalars().all())
 
+            storage_by_pid = await query_multi_player_storage_by_keys(
+                session, [p.id for p in players], storage_keys
+            )
             for p in players:
                 fp = response.players.add()
                 await _populate_friend_player(
@@ -335,6 +373,7 @@ class FriendService(friend_pb2_grpc.FriendServicer):
                     is_following=p.id in following_pks,
                     is_followed=True,
                     storage_keys=storage_keys,
+                    preloaded_entries=storage_by_pid.get(p.id, []),
                 )
 
         return response
@@ -354,31 +393,7 @@ class FriendService(friend_pb2_grpc.FriendServicer):
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             my_refs = await _own_reference_ids(session, current_pid)
-            following_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.target_id).where(
-                            FriendRelation.follower_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            followed_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.follower_id).where(
-                            FriendRelation.target_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
-            following_pks = await _resolved_pks(session, following_rows)
-            followed_pks = await _resolved_pks(session, followed_rows)
+            following_pks, followed_pks = await _fetch_both_relation_pks(session, my_refs)
             candidates = _apply_follow_filter(
                 following_pks,
                 follow_filter=_follow_filter(criterion),
@@ -392,6 +407,9 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             ).limit(limit)
             players = list((await session.execute(stmt)).scalars().all())
 
+            storage_by_pid = await query_multi_player_storage_by_keys(
+                session, [p.id for p in players], storage_keys
+            )
             for p in players:
                 fp = response.players.add()
                 await _populate_friend_player(
@@ -401,6 +419,7 @@ class FriendService(friend_pb2_grpc.FriendServicer):
                     is_following=True,
                     is_followed=p.id in followed_pks,
                     storage_keys=storage_keys,
+                    preloaded_entries=storage_by_pid.get(p.id, []),
                 )
 
         return response
@@ -432,31 +451,10 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             if not players:
                 return response
 
-            following_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.target_id).where(
-                            FriendRelation.follower_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
+            following_pks, followed_pks = await _fetch_both_relation_pks(session, my_refs)
+            storage_by_pid = await query_multi_player_storage_by_keys(
+                session, [p.id for p in players], storage_keys
             )
-            followed_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.follower_id).where(
-                            FriendRelation.target_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
-            following_pks = await _resolved_pks(session, following_rows)
-            followed_pks = await _resolved_pks(session, followed_rows)
 
             for p in players:
                 fp = response.players.add()
@@ -467,6 +465,7 @@ class FriendService(friend_pb2_grpc.FriendServicer):
                     is_following=p.id in following_pks,
                     is_followed=p.id in followed_pks,
                     storage_keys=storage_keys,
+                    preloaded_entries=storage_by_pid.get(p.id, []),
                 )
 
         return response
@@ -490,30 +489,7 @@ class FriendService(friend_pb2_grpc.FriendServicer):
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             my_refs = await _own_reference_ids(session, current_pid)
-            following_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.target_id).where(
-                            FriendRelation.follower_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            followed_rows = (
-                (
-                    await session.execute(
-                        select(FriendRelation.follower_id).where(
-                            FriendRelation.target_id.in_(my_refs)
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            following_pks = await _resolved_pks(session, following_rows)
-            followed_pks = await _resolved_pks(session, followed_rows)
+            following_pks, followed_pks = await _fetch_both_relation_pks(session, my_refs)
 
             # Resolve the requested references, but echo back the string the
             # client sent: it matches the response to its own request by value.
@@ -555,28 +531,32 @@ class FriendService(friend_pb2_grpc.FriendServicer):
                 return response
 
             my_refs = await _own_reference_ids(session, current_pid)
-            following = (
-                await session.execute(
-                    select(FriendRelation.id).where(
-                        FriendRelation.follower_id.in_(my_refs),
-                        FriendRelation.target_id.in_([target.id, target.short_id]),
+            target_refs = [r for r in (target.id, target.short_id) if r]
+            rels_res = await session.execute(
+                select(FriendRelation.follower_id, FriendRelation.target_id).where(
+                    or_(
+                        and_(
+                            FriendRelation.follower_id.in_(my_refs),
+                            FriendRelation.target_id.in_(target_refs),
+                        ),
+                        and_(
+                            FriendRelation.target_id.in_(my_refs),
+                            FriendRelation.follower_id.in_(target_refs),
+                        ),
                     )
                 )
-            ).scalar()
-            followed = (
-                await session.execute(
-                    select(FriendRelation.id).where(
-                        FriendRelation.target_id.in_(my_refs),
-                        FriendRelation.follower_id.in_([target.id, target.short_id]),
-                    )
-                )
-            ).scalar()
+            )
+            rels = rels_res.all()
+            my_ref_set = set(my_refs)
+            target_ref_set = set(target_refs)
+            is_following = any(f_id in my_ref_set and t_id in target_ref_set for f_id, t_id in rels)
+            is_followed = any(t_id in my_ref_set and f_id in target_ref_set for f_id, t_id in rels)
             await _populate_friend_player(
                 session,
                 response.player,
                 target,
-                is_following=following is not None,
-                is_followed=followed is not None,
+                is_following=is_following,
+                is_followed=is_followed,
                 storage_keys=list(request.player_storage_keys),
             )
 
@@ -639,11 +619,11 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             raw = (request.player_id or "").strip()
             if raw:
                 targets.add(raw)
-            for value in targets:
+            if targets:
                 await session.execute(
                     delete(FriendRelation).where(
                         FriendRelation.follower_id == current_pid,
-                        FriendRelation.target_id == value,
+                        FriendRelation.target_id.in_(targets),
                     )
                 )
             await session.commit()
@@ -669,10 +649,10 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             if raw:
                 followers.add(raw)
             my_refs = await _own_reference_ids(session, current_pid)
-            for value in followers:
+            if followers and my_refs:
                 await session.execute(
                     delete(FriendRelation).where(
-                        FriendRelation.follower_id == value,
+                        FriendRelation.follower_id.in_(followers),
                         FriendRelation.target_id.in_(my_refs),
                     )
                 )

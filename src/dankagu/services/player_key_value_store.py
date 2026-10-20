@@ -13,7 +13,8 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_key_value_store_pb2,
     player_key_value_store_pb2_grpc,
 )
-from dankagu.models.storage import PlayerKeyValue, PlayerStorageEntry
+from dankagu.models.storage import PlayerKeyValue
+from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.player_key_value_store")
 
@@ -27,7 +28,9 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response:
         current_pid = get_current_player_id() or "dankagu-reborn-user"
-        logger.info("🔑 [PKVS] GetPlayerKeyValuesV1 (%d keys, player=%s)", len(request.key), current_pid)
+        logger.info(
+            "🔑 [PKVS] GetPlayerKeyValuesV1 (%d keys, player=%s)", len(request.key), current_pid
+        )
         response = player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response()
 
         session_factory = get_sessionmaker()
@@ -50,8 +53,14 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response:
         current_pid = get_current_player_id() or "dankagu-reborn-user"
         now = int(time.time())
-        logger.info("🔑 [PKVS] IncrementPlayerKeyValuesV1 (%d items, player=%s)", len(request.player_key_values), current_pid)
-        response = player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+        logger.info(
+            "🔑 [PKVS] IncrementPlayerKeyValuesV1 (%d items, player=%s)",
+            len(request.player_key_values),
+            current_pid,
+        )
+        response = (
+            player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+        )
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
@@ -126,23 +135,21 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
                 pkv.expired_at = row[1] if row else 4102412400
 
             if request.entries:
-                for proto_entry in request.entries:
-                    s_stmt = pg_insert(PlayerStorageEntry).values(
-                        player_id=current_pid,
-                        key=proto_entry.key,
-                        value=proto_entry.value,
-                        created_at=proto_entry.created_at or now,
-                        updated_at=now,
-                    )
-                    s_stmt = s_stmt.on_conflict_do_update(
-                        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                        set_={
-                            "value": s_stmt.excluded.value,
-                            "updated_at": s_stmt.excluded.updated_at,
-                        },
-                    )
-                    await session.execute(s_stmt)
+                rows = [
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
+                    for proto_entry in request.entries
+                ]
+                await batch_upsert_storage_entries(session, rows)
 
+            response.revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
 
         response.entries.extend(request.entries)
@@ -151,9 +158,6 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
             entry.created_at = entry.created_at or now
             entry.updated_at = now
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
         return response
 
     async def UpdatePlayerKeyValuesAndSavePlayerStorageV1(
@@ -201,23 +205,21 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
                 pkv.expired_at = row[1] if row else 4102412400
 
             if request.entries:
-                for proto_entry in request.entries:
-                    s_stmt = pg_insert(PlayerStorageEntry).values(
-                        player_id=current_pid,
-                        key=proto_entry.key,
-                        value=proto_entry.value,
-                        created_at=proto_entry.created_at or now,
-                        updated_at=now,
-                    )
-                    s_stmt = s_stmt.on_conflict_do_update(
-                        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                        set_={
-                            "value": s_stmt.excluded.value,
-                            "updated_at": s_stmt.excluded.updated_at,
-                        },
-                    )
-                    await session.execute(s_stmt)
+                rows = [
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
+                    for proto_entry in request.entries
+                ]
+                await batch_upsert_storage_entries(session, rows)
 
+            response.revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
 
         response.entries.extend(request.entries)
@@ -226,9 +228,6 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
             entry.created_at = entry.created_at or now
             entry.updated_at = now
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
         return response
 
 

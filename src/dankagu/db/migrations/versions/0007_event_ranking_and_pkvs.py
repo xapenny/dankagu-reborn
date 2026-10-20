@@ -32,10 +32,15 @@ def upgrade() -> None:
             sa.Column("score", sa.BigInteger(), server_default="0", nullable=False),
             sa.Column("updated_at", sa.BigInteger(), nullable=False),
             sa.ForeignKeyConstraint(
-                ["player_id"], ["players.id"], name="fk_event_leaderboard_player", ondelete="CASCADE"
+                ["player_id"],
+                ["players.id"],
+                name="fk_event_leaderboard_player",
+                ondelete="CASCADE",
             ),
             sa.PrimaryKeyConstraint("id"),
-            sa.UniqueConstraint("ranking_event_id", "player_id", name="uq_event_leaderboard_id_player"),
+            sa.UniqueConstraint(
+                "ranking_event_id", "player_id", name="uq_event_leaderboard_id_player"
+            ),
         )
         op.create_index(
             "idx_event_leaderboard_rank",

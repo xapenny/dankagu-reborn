@@ -8,7 +8,6 @@ import grpc
 from google.protobuf.internal.decoder import _DecodeVarint
 from google.protobuf.internal.encoder import _EncodeVarint
 from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import add_stones, get_or_create_wallet
@@ -28,6 +27,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 )
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.storage import PlayerStorageEntry
+from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.player_inventory")
 
@@ -259,29 +259,26 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             # 1. Save any storage entries sent by client first (from client-side ItemReceiver)
+            rows_to_upsert = []
             for proto_entry in request.entries:
-                upsert_stmt = pg_insert(PlayerStorageEntry).values(
-                    player_id=current_pid,
-                    key=proto_entry.key,
-                    value=proto_entry.value,
-                    created_at=proto_entry.created_at or now,
-                    updated_at=now,
+                rows_to_upsert.append(
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
                 )
-                upsert_stmt = upsert_stmt.on_conflict_do_update(
-                    index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                    set_={
-                        "value": upsert_stmt.excluded.value,
-                        "updated_at": upsert_stmt.excluded.updated_at,
-                    },
-                )
-                await session.execute(upsert_stmt)
-
                 resp_entry = response.entries.add()
                 resp_entry.player_id = current_pid
                 resp_entry.key = proto_entry.key
                 resp_entry.value = proto_entry.value
                 resp_entry.created_at = proto_entry.created_at or now
                 resp_entry.updated_at = now
+
+            if rows_to_upsert:
+                await batch_upsert_storage_entries(session, rows_to_upsert)
 
             # 2. Claim items and apply server-side wallet / bonus storage updates
             if ids_to_claim:
@@ -293,8 +290,13 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                 res = await session.execute(stmt)
                 items = res.scalars().all()
 
+                total_stones_to_add = 0
+                total_coin_to_add = 0
+                top_up_kaleidoscopes = False
+                growth_by_count: dict[int, list[int]] = {}
+                generic_by_prefix_and_count: dict[tuple[int, int], list[int]] = {}
+
                 for item in items:
-                    stones_to_add = 0
                     parsed: dict = {}
                     try:
                         parsed = json.loads(item.value.decode("utf-8"))
@@ -319,10 +321,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                         or prefix in ("VC", "VirtualCurrency", "Stone")
                         or val == "FREE_STONE"
                     ):
-                        stones_to_add = count
-
-                    if stones_to_add > 0:
-                        await add_stones(session, current_pid, free_amount=stones_to_add)
+                        total_stones_to_add += count
 
                     # Server-side fallback for Growth items if client didn't send entries
                     if prefix in ("Growth", "GrowthItem"):
@@ -337,55 +336,73 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                                 if f"GrowthItemStock--{x}" not in client_entry_keys
                             ]
                         if growth_ids:
-                            await add_growth_items(session, current_pid, growth_ids, count=count)
+                            growth_by_count.setdefault(count, []).extend(growth_ids)
 
                     # Server-side fallback for GenericItem / HakoniwaMaterial / BoostHeal / HeroineFragment
                     elif prefix in PREFIX_NAME_TO_ID and isinstance(val, int) and val > 0:
                         prefix_id = PREFIX_NAME_TO_ID[prefix]
                         comp_id = prefix_id * 1_000_000 + val
                         if f"ItemStockStatus--{comp_id}" not in client_entry_keys:
-                            await add_generic_item_stocks(
-                                session, current_pid, prefix_id, [val], count=count
+                            generic_by_prefix_and_count.setdefault((prefix_id, count), []).append(
+                                val
                             )
 
                         # When claiming Kaleidoscope Shards (32005 / 32006), also top up full Kaleidoscopes (32003 / 32004) to 99
                         if prefix == "GenericItem" and val in (32005, 32006):
-                            await add_growth_items(
-                                session, current_pid, SKILL_ITEM_IDS, count=99, max_cap=99
-                            )
+                            top_up_kaleidoscopes = True
 
                     # Server-side fallback for Coin (HaveCoin in PlayerStatus--1)
                     elif prefix == "Coin":
                         if "PlayerStatus--1" not in client_entry_keys:
-                            ps_res = await session.execute(
-                                select(PlayerStorageEntry).where(
-                                    PlayerStorageEntry.player_id == current_pid,
-                                    PlayerStorageEntry.key == "PlayerStatus--1",
-                                )
-                            )
-                            ps_entry = ps_res.scalars().first()
-                            if ps_entry and ps_entry.value:
-                                fields = parse_player_status(ps_entry.value)
-                                fields[9] = min(fields.get(9, 0) + count, 999_999_999)
-                                new_val = encode_player_status(fields)
-                                ps_entry.value = new_val
-                                ps_entry.updated_at = now
-
-                                resp_entry = response.entries.add()
-                                resp_entry.player_id = current_pid
-                                resp_entry.key = "PlayerStatus--1"
-                                resp_entry.value = new_val
-                                resp_entry.created_at = ps_entry.created_at
-                                resp_entry.updated_at = now
+                            total_coin_to_add += count
 
                     item.is_claimed = True
                     item.received_at = now
 
-            # 3. Fetch latest wallet
+                if total_stones_to_add > 0:
+                    await add_stones(session, current_pid, free_amount=total_stones_to_add)
+
+                for cnt, g_ids in growth_by_count.items():
+                    await add_growth_items(session, current_pid, g_ids, count=cnt)
+
+                for (p_id, cnt), item_vals in generic_by_prefix_and_count.items():
+                    await add_generic_item_stocks(session, current_pid, p_id, item_vals, count=cnt)
+
+                if top_up_kaleidoscopes:
+                    await add_growth_items(
+                        session, current_pid, SKILL_ITEM_IDS, count=99, max_cap=99
+                    )
+
+                if total_coin_to_add > 0:
+                    ps_res = await session.execute(
+                        select(PlayerStorageEntry).where(
+                            PlayerStorageEntry.player_id == current_pid,
+                            PlayerStorageEntry.key == "PlayerStatus--1",
+                        )
+                    )
+                    ps_entry = ps_res.scalars().first()
+                    if ps_entry and ps_entry.value:
+                        fields = parse_player_status(ps_entry.value)
+                        fields[9] = min(fields.get(9, 0) + total_coin_to_add, 999_999_999)
+                        new_val = encode_player_status(fields)
+                        ps_entry.value = new_val
+                        ps_entry.updated_at = now
+
+                        resp_entry = response.entries.add()
+                        resp_entry.player_id = current_pid
+                        resp_entry.key = "PlayerStatus--1"
+                        resp_entry.value = new_val
+                        resp_entry.created_at = ps_entry.created_at
+                        resp_entry.updated_at = now
+
+            # 3. Fetch latest wallet and persist revision in the same transaction
             wallet = await get_or_create_wallet(session, current_pid)
             free_stones = wallet.free_stones
             paid_stones = wallet.paid_stones
 
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
             await session.commit()
 
         # Update wallet in response
@@ -397,9 +414,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
         vc_paid.virtual_currency_name = "PAID_STONE"
         vc_paid.amount = paid_stones
 
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=current_pid
-        )
+        response.revision = revision
         return response
 
 

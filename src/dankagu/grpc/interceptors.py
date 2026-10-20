@@ -35,6 +35,54 @@ def is_public_rpc(method_name: str) -> bool:
     return any(method_name.startswith(prefix) for prefix in PUBLIC_RPC_PREFIXES)
 
 
+def _format_proto_for_log(msg: Any) -> str:
+    """Format a Protobuf message for logging without stringifying multi-hundred-KB payloads."""
+    if msg is None:
+        return "(empty message)"
+
+    # Fast path for large messages (> 4 KB) to avoid blocking the event loop
+    # on full text serialization and regex scanning of binary blobs.
+    byte_size_fn = getattr(msg, "ByteSize", None)
+    if callable(byte_size_fn):
+        try:
+            bsize = byte_size_fn()
+            if bsize == 0:
+                return "(empty message)"
+            if bsize > 4096:
+                parts = [f"<{type(msg).__name__} {bsize}B"]
+                for attr in (
+                    "entries",
+                    "criteria",
+                    "game_products",
+                    "loot_box_products",
+                    "inventories",
+                    "received_inventories",
+                    "players",
+                ):
+                    val = getattr(msg, attr, None)
+                    if val is not None and hasattr(val, "__len__") and len(val) > 0:
+                        parts.append(f"{attr}={len(val)}")
+                for scalar in ("revision", "next_revision", "next_page_token"):
+                    sval = getattr(msg, scalar, None)
+                    if sval:
+                        parts.append(f"{scalar}={sval!r}")
+                return " ".join(parts) + ">"
+        except Exception:
+            pass
+
+    raw = str(msg).strip()
+    if not raw:
+        return "(empty message)"
+    # Keep a 500-char margin before redaction so a token straddling the 1000-char
+    # boundary still has its closing quote intact when redact_text runs.
+    if len(raw) > 1500:
+        raw = raw[:1500]
+    redacted = redact_text(raw)
+    if len(redacted) > 1000:
+        return redacted[:1000] + "... [truncated]"
+    return redacted
+
+
 class TakashoAsyncInterceptor(ServerInterceptor):
     """Async gRPC interceptor injecting Takasho and Envoy headers into metadata."""
 
@@ -138,14 +186,7 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                 server_timestamp = str(int(time.time()))
                 date_header = formatdate(timeval=None, localtime=False, usegmt=True)
 
-                # Redact before truncating: a token cut in half has no closing quote,
-                # so the remainder of it would be written out verbatim.
-                req_str = redact_text(str(request).strip())
-                if not req_str:
-                    req_str = "(empty message)"
-                elif len(req_str) > 1000:
-                    req_str = req_str[:1000] + "... [truncated]"
-
+                req_str = _format_proto_for_log(request)
                 logger.info("🎮 [gRPC REQ] ---> %s\n   Payload: %s", method_name, req_str)
 
                 await context.send_initial_metadata(
@@ -214,11 +255,7 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     )
                 )
 
-                resp_str = redact_text(str(response).strip())
-                if not resp_str:
-                    resp_str = "(empty message)"
-                elif len(resp_str) > 1000:
-                    resp_str = resp_str[:1000] + "... [truncated]"
+                resp_str = _format_proto_for_log(response)
 
                 logger.info(
                     "🎮 [gRPC RESP] <--- %s (%d ms)\n   Payload: %s",
