@@ -14,7 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import (
+    CARD_FIELD_CARD_ID,
+    CARD_STATUS_PREFIX,
     InsufficientFundsError,
+    _parse_card_fields,
     deduct_player_key_value,
     deduct_stones,
     get_or_create_wallet,
@@ -30,6 +33,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 from dankagu.models.gacha import GachaBanner, GachaCard
 from dankagu.models.master import MasterLootBoxProduct
 from dankagu.models.receipt import PurchaseReceipt
+from dankagu.models.storage import PlayerStorageEntry
 
 logger = logging.getLogger("dankagu.services.loot_box")
 
@@ -95,9 +99,13 @@ async def ensure_gacha_cache_loaded(session: AsyncSession) -> None:
 
 
 def _roll_card(
-    gacha_id: int, is_guaranteed_sr: bool = False, is_guaranteed_ssr: bool = False
+    gacha_id: int,
+    is_guaranteed_sr: bool = False,
+    is_guaranteed_ssr: bool = False,
+    exclude: set[int] | None = None,
+    owned: set[int] | None = None,
 ) -> int:
-    """Roll a card with authentic gacha rates and banner-specific pools.
+    """Roll a card with authentic gacha rates, banner-specific pools, and uniqueness deduplication.
 
     Rates:
       Normal pull: SSR=4%, SR=16%, R=80%
@@ -141,16 +149,51 @@ def _roll_card(
         if _CARDS_BY_ID.get(int(cid)) and _CARDS_BY_ID[int(cid)].rarity == rarity
     ]
 
+    # Filter out excluded cards (e.g. already drawn in the same multi-pull)
+    pickups_available = [cid for cid in rarity_pickups if not exclude or cid not in exclude]
+    pool_available = [cid for cid in candidate_pool if not exclude or cid not in exclude]
+
+    # If the unexcluded pool is exhausted in this rarity, try other rarities before repeating
+    if not pool_available:
+        for other_r in (3, 4, 2):
+            other_pool = _CARDS_BY_RARITY.get(other_r) or []
+            other_avail = [cid for cid in other_pool if not exclude or cid not in exclude]
+            if other_avail:
+                pool_available = other_avail
+                break
+        else:
+            pool_available = candidate_pool
+    if not pickups_available and rarity_pickups:
+        pickups_available = [
+            cid for cid in rarity_pickups if not exclude or cid not in exclude
+        ] or rarity_pickups
+
+    # Prioritize unowned cards to prevent duplicate card instances in RAM
+    pickups_unowned = [cid for cid in pickups_available if not owned or cid not in owned]
+    pool_unowned = [cid for cid in pool_available if not owned or cid not in owned]
+
     # 4. Rate-up application for pickups (70% for SSR pickup, 50% for SR pickup)
-    if rarity_pickups:
+    if pickups_available:
         rate_up_prob = 0.70 if rarity == 4 else 0.50
         if random.random() < rate_up_prob:
-            return random.choice(rarity_pickups)
+            target_pickups = pickups_unowned if pickups_unowned else pickups_available
+            return random.choice(target_pickups)
 
     # 5. Non-pickup roll from candidate pool
-    non_pickups = [cid for cid in candidate_pool if cid not in rarity_pickups]
-    if non_pickups:
-        return random.choice(non_pickups)
+    non_pickups_unowned = [cid for cid in pool_unowned if cid not in rarity_pickups]
+    if non_pickups_unowned:
+        return random.choice(non_pickups_unowned)
+
+    non_pickups_available = [cid for cid in pool_available if cid not in rarity_pickups]
+    if non_pickups_available:
+        return random.choice(non_pickups_available)
+
+    if pool_unowned:
+        return random.choice(pool_unowned)
+
+    if pool_available:
+        return random.choice(pool_available)
+
     if candidate_pool:
         return random.choice(candidate_pool)
 
@@ -458,6 +501,21 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                     or "ssrGachaTicket" in pid
                 )
 
+                # Query owned cards to prioritize unowned cards
+                owned_card_ids: set[int] = set()
+                stored_cards = await session.execute(
+                    select(PlayerStorageEntry.value).where(
+                        PlayerStorageEntry.player_id == current_pid,
+                        PlayerStorageEntry.key.like(f"{CARD_STATUS_PREFIX}%"),
+                    )
+                )
+                for (val,) in stored_cards.all():
+                    f = _parse_card_fields(val)
+                    cid = f.get(CARD_FIELD_CARD_ID)
+                    if cid:
+                        owned_card_ids.add(int(cid))
+
+                drawn_set: set[int] = set()
                 for i in range(pull_count):
                     is_last = i == pull_count - 1
                     is_guaranteed_ssr = (
@@ -470,8 +528,11 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                         gacha_id,
                         is_guaranteed_sr=is_guaranteed_sr,
                         is_guaranteed_ssr=is_guaranteed_ssr,
+                        exclude=drawn_set,
+                        owned=owned_card_ids,
                     )
                     drawn_cards.append(card_id)
+                    drawn_set.add(card_id)
 
                 if transaction_id:
                     # Same transaction as the charge: a crash leaves neither behind.

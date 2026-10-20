@@ -335,3 +335,58 @@ async def test_get_entries_v2_deduplicates_corrupted_db_rows() -> None:
         assert fields[CARD_FIELD_AWAKE_LV] == 2, "3 copies in DB -> merged AwakeLv 2"
     finally:
         reset_current_player(tokens)
+
+
+def test_roll_card_ten_pull_deduplicates_completely(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multi-pull (e.g. 10-pull) must never produce duplicate card IDs."""
+    import dankagu.services.loot_box as lb
+
+    # Mock candidate pool with SSR, SR, R cards
+    monkeypatch.setattr(
+        lb,
+        "_CARDS_BY_RARITY",
+        {
+            4: [100001, 100002, 100003, 100004],
+            3: [100101, 100102, 100103, 100104, 100105, 100106],
+            2: [100201, 100202, 100203, 100204, 100205, 100206, 100207, 100208],
+        },
+    )
+    monkeypatch.setattr(lb, "_BY_ELEMENT", {})
+    monkeypatch.setattr(lb, "_BANNERS", {})
+
+    for _ in range(50):
+        drawn: list[int] = []
+        drawn_set: set[int] = set()
+        for i in range(10):
+            is_last = i == 9
+            cid = lb._roll_card(159, is_guaranteed_sr=is_last, exclude=drawn_set)
+            drawn.append(cid)
+            drawn_set.add(cid)
+
+        assert len(drawn) == 10
+        assert len(set(drawn)) == 10, f"10-pull must be strictly deduplicated, got: {drawn}"
+
+
+def test_roll_card_prioritizes_unowned_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unowned cards are prioritized over already-owned cards."""
+    import dankagu.services.loot_box as lb
+
+    monkeypatch.setattr(
+        lb,
+        "_CARDS_BY_RARITY",
+        {
+            4: [100001, 100002],
+            3: [100101, 100102],
+            2: [100201, 100202],
+        },
+    )
+    monkeypatch.setattr(lb, "_BY_ELEMENT", {})
+    monkeypatch.setattr(lb, "_BANNERS", {})
+
+    # If 100001 is owned, rolling guaranteed SSR must pick unowned 100002
+    cid = lb._roll_card(159, is_guaranteed_ssr=True, owned={100001})
+    assert cid == 100002
+
+    # If all SSRs are owned, it still returns a card without failing
+    cid_owned = lb._roll_card(159, is_guaranteed_ssr=True, owned={100001, 100002})
+    assert cid_owned in (100001, 100002)
