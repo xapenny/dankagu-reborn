@@ -82,9 +82,7 @@ PERSONAL_STORAGE_PREFIXES = (
 )
 
 
-async def batch_upsert_storage_entries(
-    session: AsyncSession, rows: list[dict[str, Any]]
-) -> None:
+async def batch_upsert_storage_entries(session: AsyncSession, rows: list[dict[str, Any]]) -> None:
     """Upsert multiple PlayerStorageEntry rows in a single PostgreSQL statement.
 
     Deduplicates by ``(player_id, key)`` (keeping the last occurrence) so PostgreSQL
@@ -297,9 +295,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                         player.storage_revision, player_id=current_pid
                     )
             if criteria_list:
-                stmt = select(PlayerStorageEntry).where(
-                    PlayerStorageEntry.player_id == current_pid
-                )
+                stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id == current_pid)
                 # Push down key/prefix filters when the client asks for a bounded subset
                 # of keys instead of the ~40-prefix full boot sync.
                 has_empty_prefix = any(
@@ -538,8 +534,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         async with session_factory() as session:
             stmt = select(PlayerStorageEntry).where(PlayerStorageEntry.player_id.in_(target_pids))
             has_empty_prefix = any(
-                c.matching_type != Criterion.MatchingType.EXACT and not c.key
-                for c in criteria_list
+                c.matching_type != Criterion.MatchingType.EXACT and not c.key for c in criteria_list
             )
             if not has_empty_prefix and len(criteria_list) <= 25:
                 exact_keys = [

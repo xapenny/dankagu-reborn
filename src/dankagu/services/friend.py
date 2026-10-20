@@ -202,14 +202,10 @@ async def _fetch_both_relation_pks(
 
     lookup = await resolve_players(session, all_raw)
     following_pks = {
-        player.id
-        for raw in following_raw
-        if (player := _lookup_player(lookup, raw)) is not None
+        player.id for raw in following_raw if (player := _lookup_player(lookup, raw)) is not None
     }
     followed_pks = {
-        player.id
-        for raw in followed_raw
-        if (player := _lookup_player(lookup, raw)) is not None
+        player.id for raw in followed_raw if (player := _lookup_player(lookup, raw)) is not None
     }
     return following_pks, followed_pks
 
@@ -553,12 +549,8 @@ class FriendService(friend_pb2_grpc.FriendServicer):
             rels = rels_res.all()
             my_ref_set = set(my_refs)
             target_ref_set = set(target_refs)
-            is_following = any(
-                f_id in my_ref_set and t_id in target_ref_set for f_id, t_id in rels
-            )
-            is_followed = any(
-                t_id in my_ref_set and f_id in target_ref_set for f_id, t_id in rels
-            )
+            is_following = any(f_id in my_ref_set and t_id in target_ref_set for f_id, t_id in rels)
+            is_followed = any(t_id in my_ref_set and f_id in target_ref_set for f_id, t_id in rels)
             await _populate_friend_player(
                 session,
                 response.player,

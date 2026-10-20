@@ -598,4 +598,3 @@ def register_ranking_servicers(server: grpc.aio.Server) -> None:
             ),
         )
     )
-

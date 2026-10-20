@@ -39,10 +39,18 @@ STARTER_STORAGE_ENTRIES = {
         "08014207b28d0600000000520500000000005a050000000000600a7a0601efd39ca40f8001efd39ca40f8801efd39ca40f90010e"
     ),
     # Active Event Initial Statuses (Events 38, 39, 40, 41)
-    "EventInfoStatus-V38-38": bytes.fromhex("08261000180032040101010138ca84d1d60658ca84d1d60670037803"),
-    "EventInfoStatus-V39-39": bytes.fromhex("08271000180032040101010138ca84d1d60658ca84d1d60670037803"),
-    "EventInfoStatus-V40-40": bytes.fromhex("08281000180032040101010138ca84d1d60658ca84d1d60670037803"),
-    "EventInfoStatus-V41-41": bytes.fromhex("08291000180032040101010138ca84d1d60658ca84d1d60670037803"),
+    "EventInfoStatus-V38-38": bytes.fromhex(
+        "08261000180032040101010138ca84d1d60658ca84d1d60670037803"
+    ),
+    "EventInfoStatus-V39-39": bytes.fromhex(
+        "08271000180032040101010138ca84d1d60658ca84d1d60670037803"
+    ),
+    "EventInfoStatus-V40-40": bytes.fromhex(
+        "08281000180032040101010138ca84d1d60658ca84d1d60670037803"
+    ),
+    "EventInfoStatus-V41-41": bytes.fromhex(
+        "08291000180032040101010138ca84d1d60658ca84d1d60670037803"
+    ),
 }
 
 
@@ -74,16 +82,18 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
         }
         for key, val in STARTER_STORAGE_ENTRIES.items()
     ]
-    stmt = pg_insert(PlayerStorageEntry).values(storage_rows).on_conflict_do_nothing(
-        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
+    stmt = (
+        pg_insert(PlayerStorageEntry)
+        .values(storage_rows)
+        .on_conflict_do_nothing(
+            index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key]
+        )
     )
     await session.execute(stmt)
 
     # 3. Seed Starter Welcome Gift and Day 1 Daily Cultivation Materials in Mailbox
     inv_res = await session.execute(
-        select(PlayerInventoryItem.id)
-        .where(PlayerInventoryItem.player_id == player.id)
-        .limit(1)
+        select(PlayerInventoryItem.id).where(PlayerInventoryItem.player_id == player.id).limit(1)
     )
     if inv_res.scalar() is None:
         from dankagu.core.growth import create_daily_reward_mail_items

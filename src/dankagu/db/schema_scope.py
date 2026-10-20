@@ -22,6 +22,8 @@ UNMANAGED_TABLE_PREFIXES: tuple[str, ...] = (
     "friend_relations_repair_log",
     "friend_relations_orphans",
     "friend_relations_backup_",
+    "club_",
+    "clubs",
 )
 
 

@@ -28,11 +28,7 @@ MYSPACE_INDEXES = (
 
 def _index_names(table_name: str) -> set[str]:
     bind = op.get_bind()
-    return {
-        idx.get("name")
-        for idx in sa.inspect(bind).get_indexes(table_name)
-        if idx.get("name")
-    }
+    return {idx.get("name") for idx in sa.inspect(bind).get_indexes(table_name) if idx.get("name")}
 
 
 def upgrade() -> None:

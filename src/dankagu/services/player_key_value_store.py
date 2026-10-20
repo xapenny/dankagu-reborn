@@ -28,7 +28,9 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
         context: grpc.aio.ServicerContext,
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response:
         current_pid = get_current_player_id() or "dankagu-reborn-user"
-        logger.info("🔑 [PKVS] GetPlayerKeyValuesV1 (%d keys, player=%s)", len(request.key), current_pid)
+        logger.info(
+            "🔑 [PKVS] GetPlayerKeyValuesV1 (%d keys, player=%s)", len(request.key), current_pid
+        )
         response = player_key_value_store_pb2.PlayerKeyValueStoreGetPlayerKeyValuesV1.Response()
 
         session_factory = get_sessionmaker()
@@ -51,8 +53,14 @@ class PlayerKeyValueStoreService(player_key_value_store_pb2_grpc.PlayerKeyValueS
     ) -> player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response:
         current_pid = get_current_player_id() or "dankagu-reborn-user"
         now = int(time.time())
-        logger.info("🔑 [PKVS] IncrementPlayerKeyValuesV1 (%d items, player=%s)", len(request.player_key_values), current_pid)
-        response = player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+        logger.info(
+            "🔑 [PKVS] IncrementPlayerKeyValuesV1 (%d items, player=%s)",
+            len(request.player_key_values),
+            current_pid,
+        )
+        response = (
+            player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesV1.Response()
+        )
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
