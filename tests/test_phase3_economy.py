@@ -174,23 +174,22 @@ async def test_card_persistence_and_duplicate_breakthrough(sample_player: Player
 
         assert fields1.get(CARD_FIELD_AWAKE_LV, 0) == 0  # initial AwakeLv is 0
 
-        # 2. Second pull: duplicate of same card
+        # 2. Second pull: duplicate copy of same card is stored as independent entry
         key2, is_new2 = await persist_card_to_storage(
             session, sample_player.id, test_card_id, now + 10
         )
-        assert is_new2 is False
-        assert key2 == key1  # same storage key updated
+        assert is_new2 is True
+        assert key2.startswith("CardStatus--")
+        assert key2 != key1  # Distinct storage key
         await session.commit()
 
     async with session_factory() as session:
-        # Verify AwakeLv incremented to 1
-
-        entry2 = await session.get(PlayerStorageEntry, (sample_player.id, key1))
+        # Verify both card instances exist in database
+        entry2 = await session.get(PlayerStorageEntry, (sample_player.id, key2))
         assert entry2 is not None
         fields2 = _parse_card_fields(entry2.value)
         assert fields2[CARD_FIELD_CARD_ID] == test_card_id
-
-        assert fields2.get(CARD_FIELD_AWAKE_LV, 0) == 1  # AwakeLv incremented to 1!
+        assert fields2.get(CARD_FIELD_AWAKE_LV, 0) == 0
 
 
 @pytest.mark.asyncio

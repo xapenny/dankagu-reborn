@@ -459,107 +459,45 @@ async def persist_cards_to_storage(
     player_id: str,
     card_ids: list[int],
     now: int,
-) -> None:
+) -> list[str]:
     """Persist multiple drawn cards into PlayerStorage atomically.
 
-    Handles duplicate cards within the same pull and existing collection cleanly.
+    Each card gets its own independent storage entry with a unique snowflake ID.
     """
     if not card_ids:
-        return
-
-    stmt = select(PlayerStorageEntry).where(
-        PlayerStorageEntry.player_id == player_id,
-        PlayerStorageEntry.key.like("CardStatus--%"),
-    )
-    res = await session.execute(stmt)
-    entries = res.scalars().all()
-
-    # Map card_id -> (entry, parsed_fields)
-    card_map: dict[int, tuple[PlayerStorageEntry, dict[int, int]]] = {}
-    for entry in entries:
-        fields = _parse_card_fields(entry.value)
-        cid = fields.get(CARD_FIELD_CARD_ID)
-
-        if cid:
-            card_map[cid] = (entry, fields)
+        return []
 
     base_inst_id = int(time.time() * 10000)
+    created_keys: list[str] = []
 
     for idx, card_id in enumerate(card_ids):
-        if card_id in card_map:
-            entry, fields = card_map[card_id]
-            inst_id_val = fields.get(1)
-            if not inst_id_val:
-                try:
-                    inst_id_val = int(entry.key.removeprefix("CardStatus--"))
-                except ValueError:
-                    inst_id_val = base_inst_id + idx
+        new_inst_id = base_inst_id + idx
+        new_bytes = encode_card_status(
+            instance_id=new_inst_id,
+            card_id=card_id,
+            created_at=now,
+            updated_at=now,
+            awake_lv=0,
+            exp=0,
+            favorite=1,
+        )
+        new_entry = PlayerStorageEntry(
+            player_id=player_id,
+            key=f"CardStatus--{new_inst_id}",
+            value=new_bytes,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(new_entry)
+        created_keys.append(new_entry.key)
+        logger.info(
+            "🎴 Added card %d to player %s (key=%s)",
+            card_id,
+            player_id,
+            new_entry.key,
+        )
 
-            created_at = fields.get(CARD_FIELD_CREATED_AT, now)
-
-            awake_lv = fields.get(CARD_FIELD_AWAKE_LV, 0) or 0
-
-            exp = fields.get(CARD_FIELD_EXP, 0) or 0
-
-            favorite = fields.get(CARD_FIELD_FAVORITE, 1) or 1
-
-            new_awake = min(MAX_AWAKE_LV, awake_lv + 1)
-
-            entry.value = encode_card_status(
-                instance_id=inst_id_val,
-                card_id=card_id,
-                created_at=created_at,
-                updated_at=now,
-                awake_lv=new_awake,
-                exp=exp,
-                favorite=favorite,
-            )
-            entry.updated_at = now
-            fields[CARD_FIELD_AWAKE_LV] = new_awake
-
-            logger.info(
-                "🎴 Increment AwakeLv for card %d (player %s, new AwakeLv=%d)",
-                card_id,
-                player_id,
-                new_awake,
-            )
-        else:
-            new_inst_id = base_inst_id + idx
-            new_bytes = encode_card_status(
-                instance_id=new_inst_id,
-                card_id=card_id,
-                created_at=now,
-                updated_at=now,
-                awake_lv=0,
-                exp=0,
-                favorite=1,
-            )
-            new_entry = PlayerStorageEntry(
-                player_id=player_id,
-                key=f"CardStatus--{new_inst_id}",
-                value=new_bytes,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(new_entry)
-            card_map[card_id] = (
-                new_entry,
-                {
-                    CARD_FIELD_INSTANCE_ID: new_inst_id,
-                    CARD_FIELD_CARD_ID: card_id,
-                    CARD_FIELD_CREATED_AT: now,
-                    CARD_FIELD_UPDATED_AT: now,
-                    CARD_FIELD_AWAKE_LV: 0,
-                    CARD_FIELD_EXP: 0,
-                    CARD_FIELD_FAVORITE: 1,
-                },
-            )
-            logger.info(
-                "🎴 Added NEW card %d to player %s (key=%s)",
-                card_id,
-                player_id,
-                new_entry.key,
-            )
+    return created_keys
 
 
 async def persist_card_to_storage(
@@ -569,30 +507,8 @@ async def persist_card_to_storage(
     now: int,
 ) -> tuple[str, bool]:
     """Persist a single drawn card into PlayerStorage."""
-    stmt = select(PlayerStorageEntry).where(
-        PlayerStorageEntry.player_id == player_id,
-        PlayerStorageEntry.key.like("CardStatus--%"),
-    )
-    res = await session.execute(stmt)
-    entries = res.scalars().all()
-    existing_key = None
-    for entry in entries:
-        fields = _parse_card_fields(entry.value)
-        if fields.get(2) == card_id:
-            existing_key = entry.key
-            break
-
-    await persist_cards_to_storage(session, player_id, [card_id], now)
-    if existing_key:
-        return existing_key, False
-
-    res2 = await session.execute(stmt)
-    for entry in res2.scalars().all():
-        fields = _parse_card_fields(entry.value)
-        if fields.get(2) == card_id:
-            return entry.key, True
-
-    return f"CardStatus--{card_id}", True
+    keys = await persist_cards_to_storage(session, player_id, [card_id], now)
+    return (keys[0], True) if keys else ("", False)
 
 
 async def get_player_key_value(

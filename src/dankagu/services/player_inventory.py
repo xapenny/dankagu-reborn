@@ -28,10 +28,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 )
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.storage import PlayerStorageEntry
-from dankagu.services.player_storage import (
-    _plan_card_merge_from_entries,
-    batch_upsert_storage_entries,
-)
+from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.player_inventory")
 
@@ -262,46 +259,12 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            # 1. Canonicalise any card entries and plan storage writes
-
-            incoming_entries = [(e.key, e.value) for e in request.entries if e.value]
-
-            card_plan = await _plan_card_merge_from_entries(
-                session, current_pid, incoming_entries, now
-            )
-
-            written_keys: set[str] = set()
-
             rows_to_upsert: list[dict[str, Any]] = []
-
             keys_to_delete: list[str] = []
 
-            if card_plan is not None:
-                for key, value in card_plan.writes:
-                    rows_to_upsert.append(
-                        {
-                            "player_id": current_pid,
-                            "key": key,
-                            "value": value,
-                            "created_at": now,
-                            "updated_at": now,
-                        }
-                    )
-
-                    written_keys.add(key)
-
-                if card_plan.drop_keys:
-                    keys_to_delete.extend(card_plan.drop_keys)
-
             for proto_entry in request.entries:
-                if proto_entry.key in written_keys or (
-                    card_plan is not None and proto_entry.key in card_plan.drop_keys
-                ):
-                    continue
-
                 if not proto_entry.value:
                     keys_to_delete.append(proto_entry.key)
-
                     continue
 
                 rows_to_upsert.append(
