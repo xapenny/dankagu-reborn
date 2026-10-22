@@ -1,7 +1,9 @@
 """FastAPI router implementing LCX Authentication & Identity endpoints."""
 
+import base64
 import gzip
 import hashlib
+import json
 import logging
 import time
 from typing import Annotated, Any
@@ -41,6 +43,7 @@ from dankagu.lcx.tokens import (
 )
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.player import Player
+from dankagu.models.receipt import PurchaseReceipt
 from dankagu.models.session import Session
 from dankagu.models.storage import PlayerStorageEntry
 from dankagu.models.transfer import AccountTransfer
@@ -763,6 +766,178 @@ async def post_push_user_token(user_id: str | None = None) -> dict[str, Any]:
 async def get_subscriptions(path: str = "") -> list[Any]:
     """Mock subscription list."""
     return []
+
+
+# --------------------------------------------------------------------------------------- IAP
+#
+# The store the client verifies against no longer exists, so every product is free: the
+# catalogue comes from the master's ``ShopProduct_*`` rows, a purchase verifies without a real
+# receipt, and orders are recorded so a retry answers identically instead of granting twice.
+
+#: Product payload prefixes that name an in-game currency, for the ``exchanged`` description.
+_CURRENCY_PREFIXES: dict[str, str] = {
+    "Stone": "STONE",
+    "FreeStone": "FREE_STONE",
+    "PaidStone": "PAID_STONE",
+    "Mitama": "MITAMA",
+}
+
+STORE_NAME = "GUEST"
+
+#: The catalogue is built once: decoding 267 master payloads on every request took ~8s, long
+#: enough for the client to give up and drop back to the title screen.
+_product_cache: dict[str, list[dict[str, Any]]] = {}
+
+
+def _product_payload(raw: str | None) -> dict[str, Any]:
+    """Decode the base64 payload the master keeps next to each game product."""
+    if not raw:
+        return {}
+    try:
+        return json.loads(base64.b64decode(raw).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _store_product_entity(product_id: str, data: dict[str, Any], store: str) -> dict[str, Any]:
+    """One ``ServerProductResponseEntity`` for the store screen, priced at zero."""
+    payload = _product_payload(data.get("value"))
+    prefix = str(payload.get("Prefix", ""))
+    amount = int(payload.get("Count") or payload.get("Value") or 0)
+    return {
+        "storeProduct": {"store": store, "id": product_id},
+        "tier": 0,
+        "tierPrice": 0.0,
+        # The client keeps this string as-is; the master's own payload is the honest value.
+        "productPayload": str(data.get("value") or product_id),
+        "description": prefix or str(data.get("search_label", "")),
+        "title": product_id,
+        "currency": "JPY",
+        # Always present: the client reads its fields unconditionally.
+        "exchanged": {
+            "inGameCurrencyName": _CURRENCY_PREFIXES.get(prefix, prefix or "ITEM"),
+            "amount": amount,
+            "amountDetail": {"freeAmount": 0, "paidAmount": 0},
+        },
+    }
+
+
+async def _product_catalogue(db: AsyncSession, store: str) -> list[dict[str, Any]]:
+    """The free catalogue for one store, built once and reused."""
+    cached = _product_cache.get(store)
+    if cached is not None:
+        return cached
+
+    from dankagu.models.master import MasterGameProduct
+
+    result = await db.execute(
+        select(MasterGameProduct.id, MasterGameProduct.data).where(
+            MasterGameProduct.id.like("ShopProduct%")
+        )
+    )
+    rows = result.all()
+
+    products: list[dict[str, Any]] = []
+    for product_id, raw in rows:
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except Exception:
+            data = {}
+        products.append(_store_product_entity(product_id, data, store))
+    _product_cache[store] = products
+    logger.info("🛒 [IAP] built the catalogue: %d product(s) for store=%s", len(products), store)
+    return products
+
+
+@router.api_route("/iap/product", methods=["GET", "POST"])
+async def get_iap_products(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+) -> list[dict[str, Any]]:
+    """The store catalogue: every master ``ShopProduct_*`` row, priced at zero."""
+    store = (request.query_params.get("store") or STORE_NAME).upper()
+    products = await _product_catalogue(db, store)
+    logger.info("🛒 [IAP] /iap/product store=%s -> %d free product(s)", store, len(products))
+    return products
+
+
+@router.api_route("/iap/purchase-summary", methods=["GET", "POST"])
+@router.api_route("/iap/purchase-summary/{path:path}", methods=["GET", "POST"])
+async def get_iap_purchase_summary(path: str = "") -> dict[str, Any]:
+    """Nothing was ever really bought, so the summary is empty."""
+    return {
+        "storeProduct": {"store": STORE_NAME, "id": path},
+        "count": 0,
+        "amount": 0.0,
+        "currencyCode": "JPY",
+    }
+
+
+@router.api_route("/iap/purchase/retry-incomplete-purchases", methods=["POST"])
+async def post_iap_retry_incomplete_purchases() -> dict[str, Any]:
+    """No purchase is left unfinished when everything is free."""
+    return {"success": [], "error": []}
+
+
+@router.api_route("/iap/purchase", methods=["POST"])
+async def post_iap_purchase(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+) -> dict[str, Any]:
+    """Verify a store purchase. Free: the receipt is accepted and the order recorded once."""
+    body: dict[str, Any] = {}
+    try:
+        raw_body = await request.json()
+        if isinstance(raw_body, dict):
+            body = raw_body
+    except Exception:
+        pass
+
+    store_order_id = str(body.get("storeOrderId") or "").strip()
+    if not store_order_id:
+        store_order_id = f"free-{int(time.time() * 1000)}"
+
+    player = await _resolve_or_create_player(db, request)
+    existing = await db.get(PurchaseReceipt, (player.id, store_order_id))
+    if existing is not None:
+        logger.info("🛒 [IAP] purchase replayed player=%s order=%s", player.id, store_order_id)
+    else:
+        db.add(
+            PurchaseReceipt(
+                player_id=player.id,
+                transaction_id=store_order_id,
+                product_id=str(body.get("storeProductId") or body.get("productId") or ""),
+                card_ids="[]",
+            )
+        )
+        await db.commit()
+        logger.info(
+            "🛒 [IAP] purchase accepted player=%s order=%s store=%s",
+            player.id,
+            store_order_id,
+            body.get("store", STORE_NAME),
+        )
+
+    return {
+        "storeOrderId": store_order_id,
+        "receipt": str(body.get("receipt") or ""),
+        "originalOrderId": store_order_id,
+    }
+
+
+@router.api_route("/iap/purchase/{path:path}", methods=["GET", "POST"])
+async def get_iap_purchase_status(path: str = "") -> dict[str, Any]:
+    """Purchase verification by path (the client's mock flow reaches this)."""
+    logger.info("🛒 [IAP] purchase verify path=%r", path)
+    return {
+        "storeOrderId": path,
+        "originalOrderId": path,
+        "state": "verified",
+        "productId": path,
+        "errorMessage": "",
+        "errorType": "",
+        "errorCode": "",
+    }
 
 
 @router.api_route("/currency-exchange/user-balance", methods=["GET", "POST"])

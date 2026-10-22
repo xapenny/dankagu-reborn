@@ -71,3 +71,22 @@ async def test_lcx_auxiliary_endpoints() -> None:
 
         res = await client.post("/identity/sign-out")
         assert res.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_lcx_iap_endpoints() -> None:
+    app = create_lcx_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="https://danmakujp4-v1.lcx.tokyo"
+    ) as client:
+        res = await client.get("/iap/product?store=GUEST")
+        assert res.status_code == 200
+        assert isinstance(res.json(), list)
+
+        res = await client.get("/iap/purchase-summary")
+        assert res.status_code == 200
+        assert res.json()["count"] == 0
+
+        res = await client.post("/iap/purchase/retry-incomplete-purchases")
+        assert res.status_code == 200
+        assert res.json() == {"success": [], "error": []}
