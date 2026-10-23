@@ -12,7 +12,11 @@ from dankagu.core.net import detect_local_ip
 
 logger = logging.getLogger("dankagu.assets.server")
 
-router = APIRouter(tags=["Assets & Portal"])
+#: Routes the game client calls: AssetBundles, master databases, the ToS/PP text
+game_router = APIRouter(tags=["Assets"])
+
+#: Routes only the operator uses: the setup portal, the CA/server certificates
+ops_router = APIRouter(tags=["Operations"])
 
 MIME_MAP = {
     ".db": "application/x-sqlite3",
@@ -94,7 +98,8 @@ class AssetCatalogResolver:
     def __init__(self) -> None:
         self.manifest_entries: dict[str, dict] = {}
         self.category_files: dict[str, list[tuple[str, Path, int]]] = {}
-        self.generic_fallback: Path | None = None
+        self.generic_fallback_android: Path | None = None
+        self.generic_fallback_ios: Path | None = None
         self._loaded: bool = False
 
     def load(self) -> None:
@@ -119,12 +124,11 @@ class AssetCatalogResolver:
                     if file_on_disk.exists() and file_on_disk.is_file():
                         cat = "/".join(ap.split("/")[:-1])
                         self.category_files.setdefault(cat, []).append((ap, file_on_disk, salt))
-                        if (
-                            self.generic_fallback is None
-                            and file_on_disk.stat().st_size > 1000
-                            and ap.endswith(".xab")
-                        ):
-                            self.generic_fallback = file_on_disk
+                        if file_on_disk.stat().st_size > 1000 and ap.endswith(".xab"):
+                            if cat_key == "1" and self.generic_fallback_android is None:
+                                self.generic_fallback_android = file_on_disk
+                            elif cat_key == "2" and self.generic_fallback_ios is None:
+                                self.generic_fallback_ios = file_on_disk
 
             self._loaded = True
             logger.info(
@@ -197,8 +201,11 @@ class AssetCatalogResolver:
 
         entry = self.manifest_entries.get(hp)
         if not entry:
-            if clean_path.endswith(".xab") and self.generic_fallback:
-                return self.generic_fallback
+            if clean_path.endswith(".xab"):
+                is_ios = clean_path.startswith("2/") or "/ios/" in clean_path
+                chosen = self.generic_fallback_ios if is_ios else self.generic_fallback_android
+                if chosen:
+                    return chosen
             return None
 
         ap = entry.get("AssetPath", "")
@@ -247,13 +254,16 @@ class AssetCatalogResolver:
                 logger.info("🔄 [Asset Fallback] %s -> %s (category fallback)", ap, tmpl_path.name)
                 return tmpl_path
 
-            if self.generic_fallback:
+            is_ios = ap.startswith("ios/") or "/ios/" in ap
+            chosen_generic = self.generic_fallback_ios if is_ios else self.generic_fallback_android
+            if chosen_generic:
                 logger.info(
-                    "🔄 [Asset Fallback] %s -> generic fallback (%s)",
+                    "🔄 [Asset Fallback] %s -> generic fallback (%s, is_ios=%s)",
                     ap,
-                    self.generic_fallback.name,
+                    chosen_generic.name,
+                    is_ios,
                 )
-                return self.generic_fallback
+                return chosen_generic
             return None
 
         # 2. Handle non-.xab files (.acb, .awb, .dat, .db): ONLY match same extension
@@ -269,6 +279,9 @@ class AssetCatalogResolver:
 
 asset_resolver = AssetCatalogResolver()
 
+# Aliases for master databases and bundles where manifest upload hash differs from generated disk hash
+HASH_ALIASES: dict[str, str] = {}
+
 
 def find_asset_file(path_str: str) -> Path | None:
     """Search for the requested asset path across known asset directories.
@@ -276,6 +289,8 @@ def find_asset_file(path_str: str) -> Path | None:
     Handles both direct paths and CDN paths prefixed with upload ID / data.
     """
     cleaned = path_str.split("?")[0].replace("\\", "/").lstrip("/")
+    if cleaned in HASH_ALIASES:
+        cleaned = HASH_ALIASES[cleaned]
 
     candidate_subpaths = [cleaned]
     if "data/" in cleaned:
@@ -294,7 +309,7 @@ def find_asset_file(path_str: str) -> Path | None:
     return asset_resolver.resolve_fallback(cleaned)
 
 
-@router.get("/", response_class=HTMLResponse)
+@ops_router.get("/", response_class=HTMLResponse)
 async def get_portal_index() -> HTMLResponse:
     """Deliver a user-friendly web portal with one-click certificate installation."""
     lan_ip = settings.lan_ip or detect_local_ip()
@@ -308,8 +323,8 @@ async def get_portal_index() -> HTMLResponse:
     return HTMLResponse(content=html_content)
 
 
-@router.get("/ca.crt")
-@router.get("/cert")
+@ops_router.get("/ca.crt")
+@ops_router.get("/cert")
 async def download_ca_certificate() -> Response:
     """Serve DanKagu Root CA certificate for iOS/Android device installation.
 
@@ -332,7 +347,7 @@ async def download_ca_certificate() -> Response:
     )
 
 
-@router.get("/server.crt")
+@ops_router.get("/server.crt")
 async def download_server_certificate() -> Response:
     """Serve server TLS certificate."""
     cert_path = settings.certs_dir / "server.crt"
@@ -352,7 +367,7 @@ async def download_server_certificate() -> Response:
     )
 
 
-@router.get("/status")
+@ops_router.get("/status")
 async def get_server_status() -> JSONResponse:
     """API endpoint providing current server operational status."""
     lan_ip = settings.lan_ip or detect_local_ip()
@@ -379,9 +394,9 @@ async def get_server_status() -> JSONResponse:
     )
 
 
-@router.get("/assets/{asset_path:path}")
-@router.get("/ver/{asset_path:path}")
-@router.get("/static/{asset_path:path}")
+@game_router.get("/assets/{asset_path:path}")
+@game_router.get("/ver/{asset_path:path}")
+@game_router.get("/static/{asset_path:path}")
 async def get_asset(asset_path: str, request: Request) -> Response:
     """Serve an asset by hash path, with fallbacks for boot-critical files."""
     clean_path = asset_path.split("?")[0].lstrip("/\\")
@@ -392,7 +407,7 @@ async def get_asset(asset_path: str, request: Request) -> Response:
         suffix = file_path.suffix.lower()
         media_type = MIME_MAP.get(suffix, "application/octet-stream")
         resp_headers = {}
-        if suffix in [".html", ".txt", ".js", ".json"]:
+        if suffix in [".html", ".txt", ".js", ".json"] or "3760-2-" in file_path.name:
             resp_headers = {
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",
@@ -454,3 +469,31 @@ async def get_asset(asset_path: str, request: Request) -> Response:
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Asset not found: {clean_path}",
     )
+
+
+@game_router.put("/photos/{photo_filename}")
+@game_router.post("/photos/{photo_filename}")
+async def upload_photo_file(photo_filename: str, request: Request) -> Response:
+    """Accept uploaded album photo or thumbnail binary from client."""
+    safe_name = Path(photo_filename).name
+    if not safe_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
+    photos_dir = settings.data_dir / "photos"
+    photos_dir.mkdir(parents=True, exist_ok=True)
+    body = await request.body()
+    (photos_dir / safe_name).write_bytes(body)
+    return Response(status_code=status.HTTP_200_OK)
+
+
+@game_router.get("/photos/{photo_filename}")
+async def get_photo_file(photo_filename: str) -> Response:
+    """Serve uploaded album photo or thumbnail, or a valid PNG placeholder if not on disk."""
+    safe_name = Path(photo_filename).name
+    photo_path = settings.data_dir / "photos" / safe_name
+    if photo_path.exists() and photo_path.is_file():
+        suffix = photo_path.suffix.lower()
+        media_type = MIME_MAP.get(suffix, "image/png")
+        return FileResponse(path=photo_path, media_type=media_type, filename=safe_name)
+
+    media_type, image_bytes = PLACEHOLDER_IMAGES[".png"]
+    return Response(content=image_bytes, media_type=media_type)

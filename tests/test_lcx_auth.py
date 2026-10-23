@@ -17,10 +17,14 @@ from dankagu.lcx.tokens import create_token
 _BASE = "https://danmakujp4-v1.lcx.tokyo"
 
 
-async def _post(path: str) -> tuple[int, dict[str, object]]:
+async def _post(
+    path: str,
+    headers: dict[str, str] | None = None,
+    json: object = None,
+) -> tuple[int, dict[str, object]]:
     app = create_lcx_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
-        response = await client.post(path)
+        response = await client.post(path, headers=headers, json=json)
         body = response.json() if response.content else {}
         return response.status_code, body
 
@@ -38,9 +42,10 @@ def test_missing_jwt_secret_fails_closed(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.asyncio
 async def test_sign_in_is_stable_across_repeated_calls() -> None:
-    """Two sign-ins must resolve to the same player identity."""
-    status_a, first = await _post("/identity/sign-in")
-    status_b, second = await _post("/identity/transfer/guest_user_1/execute")
+    """Two sign-ins from the same device must resolve to the same player identity."""
+    dev_headers = {"deviceAccount": "test-stable-device-id"}
+    status_a, first = await _post("/identity/sign-in", headers=dev_headers)
+    status_b, second = await _post("/identity/transfer/guest_user_1/execute", headers=dev_headers)
 
     assert status_a == 200
     assert status_b == 200
@@ -48,9 +53,18 @@ async def test_sign_in_is_stable_across_repeated_calls() -> None:
     user_a = first["user"]
     user_b = second["user"]
     assert isinstance(user_a, dict) and isinstance(user_b, dict)
-    # The suite runs against a shared in-memory DB, so both calls must land on
-    # the same seeded player rather than creating one per request.
+    assert user_a["store"] == "GUEST"
+    assert user_b["store"] == "GUEST"
     assert user_a["id"] == user_b["id"]
+
+    # A different device resolves to a distinct player
+    status_c, third = await _post(
+        "/identity/sign-in", headers={"deviceAccount": "test-other-device-id"}
+    )
+    assert status_c == 200
+    user_c = third["user"]
+    assert isinstance(user_c, dict)
+    assert user_c["id"] != user_a["id"]
 
 
 @pytest.mark.asyncio

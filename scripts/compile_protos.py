@@ -9,7 +9,7 @@ Usage::
     python scripts/compile_protos.py --fetch   # download schemas, then compile
     python scripts/compile_protos.py           # compile what is in protos/
 
-Source of the schemas: https://github.com/RainbowUnicorn7297/dankagu-local
+Source of the upstream schemas: https://github.com/xapenny/dankagu-local
 (MIT licensed — see THIRD_PARTY_NOTICES.md.)
 """
 
@@ -29,19 +29,39 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROTOS_DIR = PROJECT_ROOT / "protos"
 OUTPUT_DIR = PROJECT_ROOT / "src" / "dankagu" / "grpc" / "generated"
 VENDOR_DIR = PROJECT_ROOT / "vendor-protos"
+SUPPLEMENTAL_VENDOR_DIR = PROJECT_ROOT / "vendor-supplemental-protos"
 
-UPSTREAM_REPO = "https://github.com/RainbowUnicorn7297/dankagu-local.git"
+UPSTREAM_REPO = os.environ.get(
+    "DANKAGU_PROTOS_REPO",
+    "https://github.com/xapenny/dankagu-local.git",
+)
 UPSTREAM_SUBDIR = "protos"
 
+DEFAULT_SUPPLEMENTAL_REPO = os.environ.get("DANKAGU_SUPPLEMENTS_REPO", "")
+SUPPLEMENTAL_SUBDIR = "protos"
 
-def fetch_protos() -> int:
-    """Sparse-clone the upstream repository and copy its ``protos/`` tree here."""
+
+def _rmtree_safe(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def _handle_readonly(func, p, _excinfo):
+        try:
+            os.chmod(p, 0o777)
+            func(p)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onexc=_handle_readonly)
+
+
+def fetch_protos(supplemental_repo: str = DEFAULT_SUPPLEMENTAL_REPO) -> int:
+    """Clone upstream and supplemental repositories, copying their protos trees."""
     if shutil.which("git") is None:
         print("error: git is required for --fetch", file=sys.stderr)
         return 1
 
-    if VENDOR_DIR.exists():
-        shutil.rmtree(VENDOR_DIR)
+    _rmtree_safe(VENDOR_DIR)
 
     print(f"Fetching protocol schemas from {UPSTREAM_REPO} ...")
     steps = [
@@ -66,8 +86,49 @@ def fetch_protos() -> int:
             shutil.rmtree(target) if target.is_dir() else target.unlink()
         shutil.copytree(item, target) if item.is_dir() else shutil.copy2(item, target)
 
-    count = len(list(PROTOS_DIR.rglob("*.proto")))
-    print(f"Copied {count} .proto files into {PROTOS_DIR}")
+    upstream_count = len(list(PROTOS_DIR.rglob("*.proto")))
+    print(f"Copied {upstream_count} .proto files from upstream into {PROTOS_DIR}")
+
+    # Fetch and overlay supplemental protos
+    if supplemental_repo:
+        _rmtree_safe(SUPPLEMENTAL_VENDOR_DIR)
+
+        print(f"Cloning supplemental protocol schemas from {supplemental_repo} ...")
+        res = subprocess.run(
+            ["git", "clone", supplemental_repo, str(SUPPLEMENTAL_VENDOR_DIR)],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            supp_path = Path(supplemental_repo)
+            if supp_path.is_dir() and (supp_path / SUPPLEMENTAL_SUBDIR).is_dir():
+                print(f"Fallback: copying supplemental schemas directly from {supp_path} ...")
+                supp_src = supp_path / SUPPLEMENTAL_SUBDIR
+            else:
+                print(
+                    f"error: failed to fetch supplemental schemas from {supplemental_repo}:\n{res.stderr}",
+                    file=sys.stderr,
+                )
+                return res.returncode
+        else:
+            supp_src = SUPPLEMENTAL_VENDOR_DIR / SUPPLEMENTAL_SUBDIR
+            if not supp_src.is_dir():
+                supp_src = SUPPLEMENTAL_VENDOR_DIR
+
+        supp_count = 0
+        for proto in supp_src.rglob("*.proto"):
+            rel = proto.relative_to(supp_src)
+            target = PROTOS_DIR / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(proto, target)
+            supp_count += 1
+
+        print(f"Copied {supp_count} supplemental .proto files into {PROTOS_DIR}")
+
+        _rmtree_safe(SUPPLEMENTAL_VENDOR_DIR)
+
+    total_count = len(list(PROTOS_DIR.rglob("*.proto")))
+    print(f"Total .proto files in {PROTOS_DIR}: {total_count}")
     return 0
 
 
@@ -89,11 +150,13 @@ def compile_all_protos() -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Found {len(proto_files)} .proto files in {PROTOS_DIR}")
 
+    proto_include = Path(protoc.__file__).parent / "_proto"
     for proto_path in proto_files:
         rel_path = proto_path.relative_to(PROTOS_DIR)
         cmd = [
             "grpc_tools.protoc",
             f"-I{PROTOS_DIR}",
+            f"-I{proto_include}",
             f"--python_out={OUTPUT_DIR}",
             f"--pyi_out={OUTPUT_DIR}",
             f"--grpc_python_out={OUTPUT_DIR}",
@@ -137,10 +200,15 @@ def main() -> int:
         action="store_true",
         help="download the protocol schemas from the upstream project before compiling",
     )
+    parser.add_argument(
+        "--supplements",
+        default=DEFAULT_SUPPLEMENTAL_REPO,
+        help="path or git URL for supplemental protocol schemas",
+    )
     args = parser.parse_args()
 
     if args.fetch:
-        ret = fetch_protos()
+        ret = fetch_protos(supplemental_repo=args.supplements)
         if ret != 0:
             return ret
 

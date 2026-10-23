@@ -9,9 +9,78 @@ from typing import Any
 import grpc
 from grpc.aio import ServerInterceptor
 
+from dankagu.core.redaction import redact_text
+from dankagu.core.session import (
+    reset_current_player,
+    resolve_session_player_id,
+    set_current_player,
+)
 from dankagu.grpc.codec import default_packer
 
 logger = logging.getLogger("dankagu.grpc")
+
+
+PUBLIC_RPC_PREFIXES = ("/takasho.schema.common_featureset.player_api.OndemandMaster/",)
+
+PUBLIC_RPC_METHODS = {
+    "/takasho.schema.common_featureset.player_api.System/AuthorizeV3",
+    "/takasho.schema.common_featureset.player_api.System/AuthorizeV2",
+}
+
+
+def is_public_rpc(method_name: str) -> bool:
+    """Determine if an RPC method is accessible without a session token."""
+    if method_name in PUBLIC_RPC_METHODS:
+        return True
+    return any(method_name.startswith(prefix) for prefix in PUBLIC_RPC_PREFIXES)
+
+
+def _format_proto_for_log(msg: Any) -> str:
+    """Format a Protobuf message for logging without stringifying multi-hundred-KB payloads."""
+    if msg is None:
+        return "(empty message)"
+
+    # Fast path for large messages (> 4 KB) to avoid blocking the event loop
+    # on full text serialization and regex scanning of binary blobs.
+    byte_size_fn = getattr(msg, "ByteSize", None)
+    if callable(byte_size_fn):
+        try:
+            bsize = byte_size_fn()
+            if bsize == 0:
+                return "(empty message)"
+            if bsize > 4096:
+                parts = [f"<{type(msg).__name__} {bsize}B"]
+                for attr in (
+                    "entries",
+                    "criteria",
+                    "game_products",
+                    "loot_box_products",
+                    "inventories",
+                    "received_inventories",
+                    "players",
+                ):
+                    val = getattr(msg, attr, None)
+                    if val is not None and hasattr(val, "__len__") and len(val) > 0:
+                        parts.append(f"{attr}={len(val)}")
+                for scalar in ("revision", "next_revision", "next_page_token"):
+                    sval = getattr(msg, scalar, None)
+                    if sval:
+                        parts.append(f"{scalar}={sval!r}")
+                return " ".join(parts) + ">"
+        except Exception:
+            pass
+
+    raw = str(msg).strip()
+    if not raw:
+        return "(empty message)"
+    # Keep a 500-char margin before redaction so a token straddling the 1000-char
+    # boundary still has its closing quote intact when redact_text runs.
+    if len(raw) > 1500:
+        raw = raw[:1500]
+    redacted = redact_text(raw)
+    if len(redacted) > 1000:
+        return redacted[:1000] + "... [truncated]"
+    return redacted
 
 
 class TakashoAsyncInterceptor(ServerInterceptor):
@@ -35,6 +104,44 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                 server_timestamp = str(int(time.time()))
                 date_header = formatdate(timeval=None, localtime=False, usegmt=True)
 
+                await context.send_initial_metadata(
+                    (
+                        ("x-takasho-debug-adjustment-timestamp", server_timestamp),
+                        ("x-takasho-requested-timestamp", server_timestamp),
+                        ("date", date_header),
+                        ("server", "envoy"),
+                    )
+                )
+
+                if not is_public_rpc(method_name):
+                    session_token: str | None = None
+                    if context.invocation_metadata():
+                        for meta_key, meta_val in context.invocation_metadata():
+                            if str(meta_key).lower() == "x-takasho-session-token":
+                                session_token = str(meta_val)
+                                break
+                    player_id: str | None = None
+                    if session_token:
+                        player_id = await resolve_session_player_id(session_token)
+                    if not session_token or not player_id:
+                        logger.warning(
+                            "🔒 [Auth Reject Auto-Mock] Unauthenticated access to %s (session_token=%s)",
+                            method_name,
+                            session_token,
+                        )
+                        context.set_trailing_metadata(
+                            (
+                                ("x-envoy-upstream-service-time", "0"),
+                                ("x-takasho-respond-timestamp", str(int(time.time()))),
+                                ("x-takasho-server-version", "v1.16.3"),
+                            )
+                        )
+                        await context.abort(
+                            grpc.StatusCode.UNAUTHENTICATED,
+                            "Invalid or expired session token",
+                        )
+                        return b""
+
                 try:
                     unpacked = default_packer.unpack(raw_request)
                     logger.info(
@@ -47,15 +154,6 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     logger.info(
                         "🎮 [gRPC REQ Auto-Mock] ---> %s (raw %d B)", method_name, len(raw_request)
                     )
-
-                await context.send_initial_metadata(
-                    (
-                        ("x-takasho-debug-adjustment-timestamp", server_timestamp),
-                        ("x-takasho-requested-timestamp", server_timestamp),
-                        ("date", date_header),
-                        ("server", "envoy"),
-                    )
-                )
 
                 elapsed_ms = (time.perf_counter_ns() - start_ns) // 1_000_000
                 context.set_trailing_metadata(
@@ -88,12 +186,7 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                 server_timestamp = str(int(time.time()))
                 date_header = formatdate(timeval=None, localtime=False, usegmt=True)
 
-                req_str = str(request).strip()
-                if not req_str:
-                    req_str = "(empty message)"
-                elif len(req_str) > 1000:
-                    req_str = req_str[:1000] + "... [truncated]"
-
+                req_str = _format_proto_for_log(request)
                 logger.info("🎮 [gRPC REQ] ---> %s\n   Payload: %s", method_name, req_str)
 
                 await context.send_initial_metadata(
@@ -105,8 +198,43 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     )
                 )
 
+                session_token: str | None = None
+                if context.invocation_metadata():
+                    for meta_key, meta_val in context.invocation_metadata():
+                        if str(meta_key).lower() == "x-takasho-session-token":
+                            session_token = str(meta_val)
+                            break
+
+                player_id: str | None = None
+                if session_token:
+                    player_id = await resolve_session_player_id(session_token)
+
+                if not is_public_rpc(method_name):
+                    if not session_token or not player_id:
+                        logger.warning(
+                            "🔒 [Auth Reject] Unauthenticated access to %s (session_token=%s, player_id=%s)",
+                            method_name,
+                            session_token,
+                            player_id,
+                        )
+                        context.set_trailing_metadata(
+                            (
+                                ("x-envoy-upstream-service-time", "0"),
+                                ("x-takasho-respond-timestamp", str(int(time.time()))),
+                                ("x-takasho-server-version", "v1.16.3"),
+                            )
+                        )
+                        await context.abort(
+                            grpc.StatusCode.UNAUTHENTICATED,
+                            "Invalid or expired session token",
+                        )
+                        return None
+
+                tokens = set_current_player(player_id, session_token)
                 try:
                     response = await original_behavior(request, context)
+                except (grpc.aio.AbortError, grpc.RpcError):
+                    raise
                 except Exception as exc:
                     logger.error(
                         "💥 [gRPC Error] %s failed with exception: %s",
@@ -115,6 +243,8 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                         exc_info=True,
                     )
                     raise
+                finally:
+                    reset_current_player(tokens)
 
                 elapsed_ms = (time.perf_counter_ns() - start_ns) // 1_000_000
                 context.set_trailing_metadata(
@@ -125,11 +255,7 @@ class TakashoAsyncInterceptor(ServerInterceptor):
                     )
                 )
 
-                resp_str = str(response).strip()
-                if not resp_str:
-                    resp_str = "(empty message)"
-                elif len(resp_str) > 1000:
-                    resp_str = resp_str[:1000] + "... [truncated]"
+                resp_str = _format_proto_for_log(response)
 
                 logger.info(
                     "🎮 [gRPC RESP] <--- %s (%d ms)\n   Payload: %s",

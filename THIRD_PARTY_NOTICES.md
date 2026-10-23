@@ -7,7 +7,8 @@ Their licenses are reproduced or referenced below.
 
 ## 1. dankagu-local — protocol definitions (not redistributed)
 
-**Source:** <https://github.com/RainbowUnicorn7297/dankagu-local>
+**Source:** <https://github.com/xapenny/dankagu-local>
+**Upstream:** <https://github.com/RainbowUnicorn7297/dankagu-local>
 **License:** MIT
 **Copyright:** Copyright (c) 2022 RainbowUnicorn7297
 

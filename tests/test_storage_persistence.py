@@ -16,7 +16,9 @@ regress silently again.
 """
 
 import pytest
+from player_factory import ensure_player
 
+from dankagu.core.session import reset_current_player, set_current_player
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_key_value_store_pb2,
     player_storage_pb2,
@@ -42,17 +44,28 @@ class MockContext:
     def set_trailing_metadata(self, metadata: tuple[tuple[str, str], ...]) -> None:
         self.trailing_metadata.extend(metadata)
 
+    async def abort(self, code: object, details: str = "") -> None:
+        import grpc
 
-async def _read_back(service: PlayerStorageService, key: str) -> bytes | None:
+        raise grpc.RpcError(f"Aborted: {code} - {details}")
+
+
+async def _read_back(
+    service: PlayerStorageService, key: str, player_id: str = "upsert-player"
+) -> bytes | None:
     """Fetch a single key back through the service's own read path."""
-    request = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
-        criteria=[Criterion(key=key, matching_type=Criterion.MatchingType.EXACT)]
-    )
-    response = await service.GetEntriesV2(request, MockContext())  # type: ignore[arg-type]
-    for entry in response.entries:
-        if entry.key == key:
-            return entry.value
-    return None
+    tokens = set_current_player(await ensure_player(player_id))
+    try:
+        request = player_storage_pb2.PlayerStorageGetEntriesV2.Request(
+            criteria=[Criterion(key=key, matching_type=Criterion.MatchingType.EXACT)]
+        )
+        response = await service.GetEntriesV2(request, MockContext())  # type: ignore[arg-type]
+        for entry in response.entries:
+            if entry.key == key:
+                return entry.value
+        return None
+    finally:
+        reset_current_player(tokens)
 
 
 @pytest.mark.asyncio
@@ -61,39 +74,43 @@ async def test_set_entries_v2_twice_with_same_key_updates_in_place() -> None:
     service = PlayerStorageService()
     context = MockContext()
     key = "UpsertRegression--1"
+    pid = "upsert-player"
 
-    first = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
-        entries=[Entry(player_id="upsert-player", key=key, value=b"\x01\x02")],
-        next_revision="rev-1",
-    )
-    await service.SetEntriesV2(first, context)  # type: ignore[arg-type]
+    tokens = set_current_player(await ensure_player(pid))
+    try:
+        first = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
+            entries=[Entry(player_id=pid, key=key, value=b"\x01\x02")],
+            next_revision="rev-1",
+        )
+        await service.SetEntriesV2(first, context)  # type: ignore[arg-type]
 
-    second = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
-        entries=[Entry(player_id="upsert-player", key=key, value=b"\x09\x09\x09")],
-        next_revision="rev-2",
-    )
-    response = await service.SetEntriesV2(second, context)  # type: ignore[arg-type]
+        second = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
+            entries=[Entry(player_id=pid, key=key, value=b"\x09\x09\x09")],
+            next_revision="rev-2",
+        )
+        response = await service.SetEntriesV2(second, context)  # type: ignore[arg-type]
 
-    assert response.revision == "rev-2"
-    assert await _read_back(service, key) == b"\x09\x09\x09"
+        assert response.revision == "rev-2"
+        assert await _read_back(service, key, player_id=pid) == b"\x09\x09\x09"
+    finally:
+        reset_current_player(tokens)
 
 
 @pytest.mark.asyncio
 async def test_set_entries_v2_defaults_blank_player_id() -> None:
-    """The client sends an empty player_id; it must be coerced, not stored empty.
-
-    Storing "" was the direct trigger for the original 20027-2 bug: the lookup
-    for player_id == "" found nothing while the pre-seeded template row already
-    occupied ('default-player', key).
-    """
+    """When the client sends an empty player_id in entry, it is coerced to the authenticated player_id."""
     service = PlayerStorageService()
-    request = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
-        entries=[Entry(player_id="", key="BlankPlayerId--1", value=b"\x07")],
-        next_revision="rev-1",
-    )
-    response = await service.SetEntriesV2(request, MockContext())  # type: ignore[arg-type]
-
-    assert response.entries[0].player_id == "default-player"
+    pid = "authenticated-player"
+    tokens = set_current_player(await ensure_player(pid))
+    try:
+        request = player_storage_pb2.PlayerStorageSetEntriesV2.Request(
+            entries=[Entry(player_id="", key="BlankPlayerId--1", value=b"\x07")],
+            next_revision="rev-1",
+        )
+        response = await service.SetEntriesV2(request, MockContext())  # type: ignore[arg-type]
+        assert response.entries[0].player_id == pid
+    finally:
+        reset_current_player(tokens)
 
 
 @pytest.mark.asyncio
@@ -102,22 +119,27 @@ async def test_pkvs_increment_and_save_is_idempotent_for_entries() -> None:
     service = PlayerKeyValueStoreService()
     context = MockContext()
     key = "PkvsUpsertRegression--1"
+    pid = "pkvs-player"
 
     def make_request(value: bytes) -> object:
         return player_key_value_store_pb2.PlayerKeyValueStoreIncrementPlayerKeyValuesAndSavePlayerStorageV1.Request(
-            entries=[Entry(player_id="pkvs-player", key=key, value=value)],
+            entries=[Entry(player_id=pid, key=key, value=value)],
             next_revision="rev-1",
         )
 
-    await service.IncrementPlayerKeyValuesAndSavePlayerStorageV1(make_request(b"\x01"), context)  # type: ignore[arg-type]
-    response = await service.IncrementPlayerKeyValuesAndSavePlayerStorageV1(  # type: ignore[arg-type]
-        make_request(b"\x02\x02"), context
-    )
+    tokens = set_current_player(await ensure_player(pid))
+    try:
+        await service.IncrementPlayerKeyValuesAndSavePlayerStorageV1(make_request(b"\x01"), context)  # type: ignore[arg-type]
+        response = await service.IncrementPlayerKeyValuesAndSavePlayerStorageV1(  # type: ignore[arg-type]
+            make_request(b"\x02\x02"), context
+        )
 
-    assert response.entries[0].value == b"\x02\x02"
+        assert response.entries[0].value == b"\x02\x02"
 
-    storage = PlayerStorageService()
-    assert await _read_back(storage, key) == b"\x02\x02"
+        storage = PlayerStorageService()
+        assert await _read_back(storage, key, player_id=pid) == b"\x02\x02"
+    finally:
+        reset_current_player(tokens)
 
 
 @pytest.mark.asyncio
@@ -128,10 +150,14 @@ async def test_pkvs_increment_echoes_delta_as_value() -> None:
     item.key = "SomeCounter"
     item.delta = 7
 
-    response = await service.IncrementPlayerKeyValuesV1(request, MockContext())  # type: ignore[arg-type]
+    tokens = set_current_player(await ensure_player("pkvs-delta-player"))
+    try:
+        response = await service.IncrementPlayerKeyValuesV1(request, MockContext())  # type: ignore[arg-type]
 
-    assert len(response.player_key_values) == 1
-    assert response.player_key_values[0].key == "SomeCounter"
-    # The request carries a delta; the response carries the resulting value.
-    assert response.player_key_values[0].value == 7
-    assert response.player_key_values[0].expired_at > 0
+        assert len(response.player_key_values) == 1
+        assert response.player_key_values[0].key == "SomeCounter"
+        # The request carries a delta; the response carries the resulting value.
+        assert response.player_key_values[0].value == 7
+        assert response.player_key_values[0].expired_at > 0
+    finally:
+        reset_current_player(tokens)

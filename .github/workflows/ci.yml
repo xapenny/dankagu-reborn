@@ -69,6 +69,23 @@ jobs:
         # needed for the public repository.
         run: uv run python scripts/compile_protos.py --fetch
 
+      - name: Database migrations are reversible
+        # The baseline revision is the only way a schema is created now, so a
+        # broken revision must fail here rather than on a live server.
+        env:
+          DANKAGU_DB_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+      - name: Migrations match the ORM models
+        # Fails when a model changed without a revision, or when the database
+        # carries objects no revision describes.
+        env:
+          DANKAGU_DB_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu
+        run: uv run alembic check
+
       - name: Run test suite
         env:
           DANKAGU_DB_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu

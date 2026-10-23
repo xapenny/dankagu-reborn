@@ -1,6 +1,12 @@
 """Takasho symmetric block cipher (ChaCha/Salsa variant)."""
 
+import struct
 from typing import Final
+
+_UNPACK_4I = struct.Struct("<4I").unpack
+_UNPACK_8I = struct.Struct("<8I").unpack
+_UNPACK_3I = struct.Struct("<3I").unpack
+_PACK_16I = struct.Struct("<16I").pack
 
 
 class Cipher:
@@ -28,13 +34,12 @@ class Cipher:
         if len(nonce) != 12:
             raise ValueError(f"Nonce must be 12 bytes, got {len(nonce)}")
 
-        self._state: list[int] = [0] * 16
-        for i in range(4):
-            self._state[i] = int.from_bytes(self.SIGMA[4 * i : 4 * (i + 1)], "little")
-        for i in range(8):
-            self._state[i + 4] = int.from_bytes(key[4 * i : 4 * (i + 1)], "little")
-        for i in range(3):
-            self._state[i + 13] = int.from_bytes(nonce[4 * i : 4 * (i + 1)], "little")
+        self._state: list[int] = [
+            *_UNPACK_4I(self.SIGMA),
+            *_UNPACK_8I(key),
+            0,
+            *_UNPACK_3I(nonce),
+        ]
 
         u = (
             ((self._state[9] + self._state[4]) ^ self._state[11])
@@ -53,106 +58,170 @@ class Cipher:
         Returns:
             The transformed bytes.
         """
-        result = bytearray()
-        length = len(body)
-        body_offset = 0
+        if not body:
+            return b""
 
-        while length > 0:
-            block_len = min(length, 0x40)
-            state = self._state.copy()
-            state[12] = counter
+        i0, i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, _, i13, i14, i15 = self._state
+        round_gap = self._round_gap
+        rounds = max(10 - round_gap, 1) if round_gap < 10 else 0
+        pack_16i = _PACK_16I
+        from_bytes = int.from_bytes
 
-            rounds = 10 - self._round_gap
-            if self._round_gap < 10:
-                rounds = max(rounds, 1)
-                for _ in range(rounds):
-                    # Column rounds
-                    state[0] = (state[0] + state[4]) & 0xFFFFFFFF
-                    state[12] = _rotate_right(state[12] ^ state[0], 0x10)
-                    state[8] = (state[8] + state[12]) & 0xFFFFFFFF
-                    state[4] = _rotate_right(state[4] ^ state[8], 0x14)
-                    state[0] = (state[0] + state[4]) & 0xFFFFFFFF
-                    state[12] = _rotate_right(state[12] ^ state[0], 0x18)
-                    state[8] = (state[8] + state[12]) & 0xFFFFFFFF
-                    state[4] = _rotate_right(state[4] ^ state[8], 0x19)
+        chunks: list[bytes] = []
+        mv = memoryview(body)
+        total_len = len(body)
+        offset = 0
 
-                    state[1] = (state[1] + state[5]) & 0xFFFFFFFF
-                    state[13] = _rotate_right(state[13] ^ state[1], 0x10)
-                    state[9] = (state[9] + state[13]) & 0xFFFFFFFF
-                    state[5] = _rotate_right(state[5] ^ state[9], 0x14)
-                    state[1] = (state[1] + state[5]) & 0xFFFFFFFF
-                    state[13] = _rotate_right(state[13] ^ state[1], 0x18)
-                    state[9] = (state[9] + state[13]) & 0xFFFFFFFF
-                    state[5] = _rotate_right(state[5] ^ state[9], 0x19)
+        while offset < total_len:
+            s0, s1, s2, s3 = i0, i1, i2, i3
+            s4, s5, s6, s7 = i4, i5, i6, i7
+            s8, s9, s10, s11 = i8, i9, i10, i11
+            s12 = counter & 0xFFFFFFFF
+            s13, s14, s15 = i13, i14, i15
 
-                    state[2] = (state[2] + state[6]) & 0xFFFFFFFF
-                    state[14] = _rotate_right(state[14] ^ state[2], 0x10)
-                    state[10] = (state[10] + state[14]) & 0xFFFFFFFF
-                    state[6] = _rotate_right(state[6] ^ state[10], 0x14)
-                    state[2] = (state[2] + state[6]) & 0xFFFFFFFF
-                    state[14] = _rotate_right(state[14] ^ state[2], 0x18)
-                    state[10] = (state[10] + state[14]) & 0xFFFFFFFF
-                    state[6] = _rotate_right(state[6] ^ state[10], 0x19)
+            for _ in range(rounds):
+                # Column rounds
+                s0 = (s0 + s4) & 0xFFFFFFFF
+                t = s12 ^ s0
+                s12 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s8 = (s8 + s12) & 0xFFFFFFFF
+                t = s4 ^ s8
+                s4 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s0 = (s0 + s4) & 0xFFFFFFFF
+                t = s12 ^ s0
+                s12 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s8 = (s8 + s12) & 0xFFFFFFFF
+                t = s4 ^ s8
+                s4 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-                    state[3] = (state[3] + state[7]) & 0xFFFFFFFF
-                    state[15] = _rotate_right(state[15] ^ state[3], 0x10)
-                    state[11] = (state[11] + state[15]) & 0xFFFFFFFF
-                    state[7] = _rotate_right(state[7] ^ state[11], 0x14)
-                    state[3] = (state[3] + state[7]) & 0xFFFFFFFF
-                    state[15] = _rotate_right(state[15] ^ state[3], 0x18)
-                    state[11] = (state[11] + state[15]) & 0xFFFFFFFF
-                    state[7] = _rotate_right(state[7] ^ state[11], 0x19)
+                s1 = (s1 + s5) & 0xFFFFFFFF
+                t = s13 ^ s1
+                s13 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s9 = (s9 + s13) & 0xFFFFFFFF
+                t = s5 ^ s9
+                s5 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s1 = (s1 + s5) & 0xFFFFFFFF
+                t = s13 ^ s1
+                s13 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s9 = (s9 + s13) & 0xFFFFFFFF
+                t = s5 ^ s9
+                s5 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-                    # Diagonal rounds
-                    state[0] = (state[0] + state[5]) & 0xFFFFFFFF
-                    state[15] = _rotate_right(state[15] ^ state[0], 0x10)
-                    state[10] = (state[10] + state[15]) & 0xFFFFFFFF
-                    state[5] = _rotate_right(state[5] ^ state[10], 0x14)
-                    state[0] = (state[0] + state[5]) & 0xFFFFFFFF
-                    state[15] = _rotate_right(state[15] ^ state[0], 0x18)
-                    state[10] = (state[10] + state[15]) & 0xFFFFFFFF
-                    state[5] = _rotate_right(state[5] ^ state[10], 0x19)
+                s2 = (s2 + s6) & 0xFFFFFFFF
+                t = s14 ^ s2
+                s14 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s10 = (s10 + s14) & 0xFFFFFFFF
+                t = s6 ^ s10
+                s6 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s2 = (s2 + s6) & 0xFFFFFFFF
+                t = s14 ^ s2
+                s14 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s10 = (s10 + s14) & 0xFFFFFFFF
+                t = s6 ^ s10
+                s6 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-                    state[1] = (state[1] + state[6]) & 0xFFFFFFFF
-                    state[12] = _rotate_right(state[12] ^ state[1], 0x10)
-                    state[11] = (state[11] + state[12]) & 0xFFFFFFFF
-                    state[6] = _rotate_right(state[6] ^ state[11], 0x14)
-                    state[1] = (state[1] + state[6]) & 0xFFFFFFFF
-                    state[12] = _rotate_right(state[12] ^ state[1], 0x18)
-                    state[11] = (state[11] + state[12]) & 0xFFFFFFFF
-                    state[6] = _rotate_right(state[6] ^ state[11], 0x19)
+                s3 = (s3 + s7) & 0xFFFFFFFF
+                t = s15 ^ s3
+                s15 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s11 = (s11 + s15) & 0xFFFFFFFF
+                t = s7 ^ s11
+                s7 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s3 = (s3 + s7) & 0xFFFFFFFF
+                t = s15 ^ s3
+                s15 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s11 = (s11 + s15) & 0xFFFFFFFF
+                t = s7 ^ s11
+                s7 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-                    state[2] = (state[2] + state[7]) & 0xFFFFFFFF
-                    state[13] = _rotate_right(state[13] ^ state[2], 0x10)
-                    state[8] = (state[8] + state[13]) & 0xFFFFFFFF
-                    state[7] = _rotate_right(state[7] ^ state[8], 0x14)
-                    state[2] = (state[2] + state[7]) & 0xFFFFFFFF
-                    state[13] = _rotate_right(state[13] ^ state[2], 0x18)
-                    state[8] = (state[8] + state[13]) & 0xFFFFFFFF
-                    state[7] = _rotate_right(state[7] ^ state[8], 0x19)
+                # Diagonal rounds
+                s0 = (s0 + s5) & 0xFFFFFFFF
+                t = s15 ^ s0
+                s15 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s10 = (s10 + s15) & 0xFFFFFFFF
+                t = s5 ^ s10
+                s5 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s0 = (s0 + s5) & 0xFFFFFFFF
+                t = s15 ^ s0
+                s15 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s10 = (s10 + s15) & 0xFFFFFFFF
+                t = s5 ^ s10
+                s5 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-                    state[3] = (state[3] + state[4]) & 0xFFFFFFFF
-                    state[14] = _rotate_right(state[14] ^ state[3], 0x10)
-                    state[9] = (state[9] + state[14]) & 0xFFFFFFFF
-                    state[4] = _rotate_right(state[4] ^ state[9], 0x14)
-                    state[3] = (state[3] + state[4]) & 0xFFFFFFFF
-                    state[14] = _rotate_right(state[14] ^ state[3], 0x18)
-                    state[9] = (state[9] + state[14]) & 0xFFFFFFFF
-                    state[4] = _rotate_right(state[4] ^ state[9], 0x19)
+                s1 = (s1 + s6) & 0xFFFFFFFF
+                t = s12 ^ s1
+                s12 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s11 = (s11 + s12) & 0xFFFFFFFF
+                t = s6 ^ s11
+                s6 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s1 = (s1 + s6) & 0xFFFFFFFF
+                t = s12 ^ s1
+                s12 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s11 = (s11 + s12) & 0xFFFFFFFF
+                t = s6 ^ s11
+                s6 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-            for i in range(16):
-                state[i] = (state[i] + self._state[i]) & 0xFFFFFFFF
-            state[12] = (state[12] + counter) & 0xFFFFFFFF
+                s2 = (s2 + s7) & 0xFFFFFFFF
+                t = s13 ^ s2
+                s13 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s8 = (s8 + s13) & 0xFFFFFFFF
+                t = s7 ^ s8
+                s7 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s2 = (s2 + s7) & 0xFFFFFFFF
+                t = s13 ^ s2
+                s13 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s8 = (s8 + s13) & 0xFFFFFFFF
+                t = s7 ^ s8
+                s7 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-            for i in range(block_len):
-                keystream_byte = (state[i // 4] >> (8 * (i % 4))) & 0xFF
-                result.append(body[body_offset + i] ^ keystream_byte)
+                s3 = (s3 + s4) & 0xFFFFFFFF
+                t = s14 ^ s3
+                s14 = ((t >> 16) | (t << 16)) & 0xFFFFFFFF
+                s9 = (s9 + s14) & 0xFFFFFFFF
+                t = s4 ^ s9
+                s4 = ((t >> 20) | (t << 12)) & 0xFFFFFFFF
+                s3 = (s3 + s4) & 0xFFFFFFFF
+                t = s14 ^ s3
+                s14 = ((t >> 24) | (t << 8)) & 0xFFFFFFFF
+                s9 = (s9 + s14) & 0xFFFFFFFF
+                t = s4 ^ s9
+                s4 = ((t >> 25) | (t << 7)) & 0xFFFFFFFF
 
-            length -= block_len
-            body_offset += block_len
+            ks = pack_16i(
+                (s0 + i0) & 0xFFFFFFFF,
+                (s1 + i1) & 0xFFFFFFFF,
+                (s2 + i2) & 0xFFFFFFFF,
+                (s3 + i3) & 0xFFFFFFFF,
+                (s4 + i4) & 0xFFFFFFFF,
+                (s5 + i5) & 0xFFFFFFFF,
+                (s6 + i6) & 0xFFFFFFFF,
+                (s7 + i7) & 0xFFFFFFFF,
+                (s8 + i8) & 0xFFFFFFFF,
+                (s9 + i9) & 0xFFFFFFFF,
+                (s10 + i10) & 0xFFFFFFFF,
+                (s11 + i11) & 0xFFFFFFFF,
+                (s12 + counter) & 0xFFFFFFFF,
+                (s13 + i13) & 0xFFFFFFFF,
+                (s14 + i14) & 0xFFFFFFFF,
+                (s15 + i15) & 0xFFFFFFFF,
+            )
+
+            block = mv[offset : offset + 64]
+            blen = len(block)
+            if blen == 64:
+                chunks.append(
+                    (from_bytes(block, "little") ^ from_bytes(ks, "little")).to_bytes(64, "little")
+                )
+            else:
+                chunks.append(
+                    (from_bytes(block, "little") ^ from_bytes(ks[:blen], "little")).to_bytes(
+                        blen, "little"
+                    )
+                )
+
+            offset += 64
             counter += 1
 
-        return bytes(result)
+        return b"".join(chunks)
 
 
 def _rotate_right(value: int, n_bits: int) -> int:

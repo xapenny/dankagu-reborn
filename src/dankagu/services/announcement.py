@@ -21,25 +21,35 @@ class AnnouncementService(announcement_pb2_grpc.AnnouncementServicer):
         self.cached_announcements: announcement_pb2.AnnouncementGetAvailableV1.Response | None = (
             None
         )
-        self._load_announcements()
 
-    def _load_announcements(self) -> None:
-        hex_file = settings.hexdata_cf_dir / "announcement.100.hex"
-        if not hex_file.exists():
-            hex_file = settings.hexdata_cf_dir / "announcement.10.hex"
+    async def _ensure_loaded(self) -> None:
+        if self.cached_announcements is not None:
+            return
 
-        if hex_file.exists():
-            try:
-                self.cached_announcements = (
-                    announcement_pb2.AnnouncementGetAvailableV1.Response.FromString(
-                        bytes.fromhex(hex_file.read_text(encoding="utf-8").strip())
-                    )
+        from google.protobuf import json_format
+        from sqlalchemy import select
+
+        from dankagu.core.database import get_sessionmaker
+        from dankagu.models.master import MasterAnnouncement
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(MasterAnnouncement).where(MasterAnnouncement.enabled.is_(True))
                 )
+                rows = result.scalars().all()
+                resp = announcement_pb2.AnnouncementGetAvailableV1.Response()
+                for r in rows:
+                    ann = resp.announcements.add()
+                    json_format.ParseDict(r.data, ann, ignore_unknown_fields=True)
+                self.cached_announcements = resp
                 logger.info(
-                    "📢 Loaded %d announcements", len(self.cached_announcements.announcements)
+                    "📢 Loaded %d enabled announcements from PostgreSQL",
+                    len(self.cached_announcements.announcements),
                 )
-            except Exception as e:
-                logger.error("Failed to parse announcement hex: %s", e)
+        except Exception as e:
+            logger.error("Failed to load announcements from database: %s", e)
 
         if self.cached_announcements is None:
             self.cached_announcements = announcement_pb2.AnnouncementGetAvailableV1.Response()
@@ -50,6 +60,7 @@ class AnnouncementService(announcement_pb2_grpc.AnnouncementServicer):
         context: grpc.aio.ServicerContext,
     ) -> announcement_pb2.AnnouncementGetAvailableV1.Response:
         logger.info("📢 [Announcement] GetAvailableV1 (max_results=%s)", request.max_results)
+        await self._ensure_loaded()
         response = announcement_pb2.AnnouncementGetAvailableV1.Response()
         if self.cached_announcements:
             response.CopyFrom(self.cached_announcements)

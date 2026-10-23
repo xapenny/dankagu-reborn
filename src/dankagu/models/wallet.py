@@ -16,8 +16,8 @@ class WalletBalance(Base):
     player_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("players.id", ondelete="CASCADE"), primary_key=True
     )
-    free_stones: Mapped[int] = mapped_column(Integer, default=50000)
-    paid_stones: Mapped[int] = mapped_column(Integer, default=50000)
+    free_stones: Mapped[int] = mapped_column(Integer, default=60000)
+    paid_stones: Mapped[int] = mapped_column(Integer, default=30000)
     updated_at: Mapped[int] = mapped_column(BigInteger, default=lambda: int(time.time()))
 
     def __repr__(self) -> str:

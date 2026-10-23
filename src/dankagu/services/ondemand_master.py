@@ -14,30 +14,64 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
     """Servicer for OndemandMaster RPCs."""
 
     def __init__(self) -> None:
+        manifest_meta = settings.data_dir / "metadata" / "AssetUploadV2+v2_1_0_any+g262.json"
         self._manifest_path = (
-            settings.hexdata_cf_dir / "ondemand_master.AssetUploadV2+v2_1_0_any+g262.json"
+            manifest_meta
+            if manifest_meta.exists()
+            else settings.hexdata_cf_dir / "ondemand_master.AssetUploadV2+v2_1_0_any+g262.json"
         )
         self._cached_manifest: bytes = b""
         if self._manifest_path.exists():
             self._cached_manifest = self._manifest_path.read_bytes()
 
         self._gacha_entries: dict[str, list[bytes]] = {}
-        gacha_hex_path = settings.hexdata_cf_dir / "ondemand_master.gacha.hex"
-        if gacha_hex_path.exists():
-            try:
-                gacha_resp = ondemand_master_pb2.OndemandMasterGetEntriesV2.Response.FromString(
-                    bytes.fromhex(gacha_hex_path.read_text(encoding="utf-8").strip())
-                )
-                for e in gacha_resp.entries:
-                    self._gacha_entries.setdefault(e.key, []).append(e.value)
-            except Exception:
-                pass
+
+    async def _ensure_loaded(self) -> None:
+        if self._gacha_entries:
+            return
+
+        import json
+
+        from sqlalchemy import select
+
+        from dankagu.core.database import get_sessionmaker
+        from dankagu.models.master import MasterOndemandEntry
+
+        try:
+            session_factory = get_sessionmaker()
+            async with session_factory() as session:
+                result = await session.execute(select(MasterOndemandEntry))
+                rows = result.scalars().all()
+                for r in rows:
+                    k = r.key
+                    d = dict(r.value)
+                    if k == "Gacha-163":
+                        d["GachaBannerID"] = 165
+                    elif k == "Gacha-167":
+                        d["GachaBannerID"] = 169
+                    elif k == "Gacha-171":
+                        d["GachaBannerID"] = 173
+                    elif k == "Gacha-3":
+                        d["StartDashHours"] = 999999
+                    val_bytes = json.dumps(d, ensure_ascii=False).encode("utf-8")
+                    self._gacha_entries.setdefault(k, []).append(val_bytes)
+
+                # Add alias keys if client requests them
+                if "Gacha-163" in self._gacha_entries:
+                    self._gacha_entries["Gacha-165"] = self._gacha_entries["Gacha-163"]
+                if "Gacha-167" in self._gacha_entries:
+                    self._gacha_entries["Gacha-169"] = self._gacha_entries["Gacha-167"]
+                if "Gacha-171" in self._gacha_entries:
+                    self._gacha_entries["Gacha-173"] = self._gacha_entries["Gacha-171"]
+        except Exception:
+            pass
 
     async def GetEntriesV1(
         self,
         request: ondemand_master_pb2.OndemandMasterGetEntriesV2.Request,
         context: grpc.aio.ServicerContext,
     ) -> ondemand_master_pb2.OndemandMasterGetEntriesV2.Response:
+        await self._ensure_loaded()
         response = ondemand_master_pb2.OndemandMasterGetEntriesV2.Response()
 
         if "ODMGeneric_Boot" in request.keys:
@@ -48,7 +82,7 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
                 b'{"CloseAt":"4102444800","Enable":2,"ID":2,"Key":"PPVer","OpenAt":"0","Value":"1"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":3,"Key":"TosBaseUrl","OpenAt":"0","Value":"{AssetBase}/static/tos"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":4,"Key":"PPBaseUrl","OpenAt":"0","Value":"{AssetBase}/static/pp"},'
-                b'{"CloseAt":"4102444800","Enable":2,"ID":5,"Key":"AccountLinkApealTime","OpenAt":"0","Value":"25920"},'
+                b'{"CloseAt":"4102444800","Enable":2,"ID":5,"Key":"AccountLinkApealTime","OpenAt":"0","Value":"2147483647"},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1001,"Key":"AdmobTester","OpenAt":"0","Value":""},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1002,"Key":"AdmobTestDevice","OpenAt":"0","Value":""},'
                 b'{"CloseAt":"4102444800","Enable":2,"ID":1003,"Key":"AdmobAlwaysTestDevice","OpenAt":"0","Value":"0"},'

@@ -4,9 +4,9 @@ import logging
 import time
 
 import grpc
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
@@ -19,7 +19,8 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     player_preference_pb2_grpc as fes_player_preference_pb2_grpc,
 )
-from dankagu.models.storage import PlayerStorageEntry
+from dankagu.models.player import Player
+from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.player_preference")
 
@@ -32,20 +33,36 @@ class PlayerPreferenceService(player_preference_pb2_grpc.PlayerPreferenceService
         request: player_preference_pb2.PlayerPreferenceGetPreferenceV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_preference_pb2.PlayerPreferenceGetPreferenceV1.Response:
-        logger.info("👤 [PlayerPreference] GetPreferenceV1")
+        current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return player_preference_pb2.PlayerPreferenceGetPreferenceV1.Response()
+
+        logger.info("👤 [PlayerPreference] GetPreferenceV1 for player=%s", current_pid)
         response = player_preference_pb2.PlayerPreferenceGetPreferenceV1.Response()
         pref = response.preference
-        pref.birth_year = 2000
-        pref.birth_month = 1
-        pref.consented_tos_version = "v1"
-        pref.consented_privacy_policy_version = "1"
-        pref.created_at = int(time.time()) - 86400 * 30
-        pref.updated_at = int(time.time())
-        pref.nickname = "DanKagu"
-        pref.nickname_updated_at = -62135596800
-        pref.max_friend_number = 100
-        pref.max_friend_request_queue_length = 50
-        response.player_short_id = "12345678"
+        now = int(time.time())
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player = await session.get(Player, current_pid)
+
+        if player is not None:
+            pref.birth_year = player.birth_year
+            pref.birth_month = player.birth_month
+            pref.consented_tos_version = player.consented_tos_version or ""
+            pref.consented_privacy_policy_version = "1" if player.consented_tos_version else ""
+            pref.created_at = player.registered_at
+            pref.updated_at = now
+            pref.nickname = player.nickname or ""
+            pref.nickname_updated_at = -62135596800 if not player.nickname else now
+            pref.max_friend_number = 100
+            pref.max_friend_request_queue_length = 50
+            response.player_short_id = player.short_id or ""
+        else:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player not found")
+            return response
+
         return response
 
     async def SetPreferenceV1(
@@ -53,19 +70,127 @@ class PlayerPreferenceService(player_preference_pb2_grpc.PlayerPreferenceService
         request: player_preference_pb2.PlayerPreferenceSetPreferenceV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_preference_pb2.PlayerPreferenceSetPreferenceV1.Response:
-        logger.info("👤 [PlayerPreference] SetPreferenceV1")
+        current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return player_preference_pb2.PlayerPreferenceSetPreferenceV1.Response()
+
+        logger.info("👤 [PlayerPreference] SetPreferenceV1 for player=%s", current_pid)
+        now = int(time.time())
         response = player_preference_pb2.PlayerPreferenceSetPreferenceV1.Response()
-        return response
+        pref = response.preference
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player = await session.get(Player, current_pid)
+            if player is not None:
+                req_pref = request.preference
+                if req_pref.nickname:
+                    player.nickname = req_pref.nickname
+                    player.name = req_pref.nickname
+                if req_pref.birth_year:
+                    player.birth_year = req_pref.birth_year
+                if req_pref.birth_month:
+                    player.birth_month = req_pref.birth_month
+                if req_pref.consented_tos_version:
+                    player.consented_tos_version = req_pref.consented_tos_version
+
+                await session.commit()
+
+                pref.birth_year = player.birth_year
+                pref.birth_month = player.birth_month
+                pref.consented_tos_version = player.consented_tos_version or ""
+                pref.consented_privacy_policy_version = "1" if player.consented_tos_version else ""
+                pref.created_at = player.registered_at
+                pref.updated_at = now
+                pref.nickname = player.nickname or ""
+                pref.nickname_updated_at = now
+                pref.max_friend_number = 100
+                pref.max_friend_request_queue_length = 50
+                response.player_short_id = player.short_id or ""
+                return response
+            else:
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player not found")
+                return response
 
     async def SetPreferenceAndSavePlayerStorageV1(
         self,
         request: player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response:
-        logger.info("👤 [PlayerPreference] SetPreferenceAndSavePlayerStorageV1")
+        current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return (
+                player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response()
+            )
+
+        logger.info(
+            "👤 [PlayerPreference] SetPreferenceAndSavePlayerStorageV1 for player=%s (%d entries)",
+            current_pid,
+            len(request.entries),
+        )
+        now = int(time.time())
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player = await session.get(Player, current_pid)
+            if player is None:
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player not found")
+                return player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response()
+
+            if request.preference:
+                req_pref = request.preference
+                if req_pref.nickname:
+                    player.nickname = req_pref.nickname
+                    player.name = req_pref.nickname
+                if req_pref.birth_year:
+                    player.birth_year = req_pref.birth_year
+                if req_pref.birth_month:
+                    player.birth_month = req_pref.birth_month
+                if req_pref.consented_tos_version:
+                    player.consented_tos_version = req_pref.consented_tos_version
+
+            if request.entries:
+                rows_to_upsert = [
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
+                    for proto_entry in request.entries
+                ]
+                await batch_upsert_storage_entries(session, rows_to_upsert)
+
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
+            await session.commit()
+
         response = (
             player_preference_pb2.PlayerPreferenceSetPreferenceAndSavePlayerStorageV1.Response()
         )
+        pref = response.preference
+        pref.birth_year = player.birth_year
+        pref.birth_month = player.birth_month
+        pref.consented_tos_version = player.consented_tos_version or ""
+        pref.consented_privacy_policy_version = "1" if player.consented_tos_version else ""
+        pref.created_at = player.registered_at
+        pref.updated_at = now
+        pref.nickname = player.nickname or ""
+        pref.nickname_updated_at = now
+        pref.max_friend_number = 100
+        pref.max_friend_request_queue_length = 50
+        response.player_short_id = player.short_id or ""
+
+        response.entries.extend(request.entries)
+        for entry in response.entries:
+            entry.player_id = current_pid
+            entry.created_at = entry.created_at or now
+            entry.updated_at = now
+
+        response.revision = revision
         return response
 
     async def GetMonthlyBillingLimitV1(
@@ -144,12 +269,26 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
         request: fes_player_preference_pb2.FesPlayerPreferenceGetV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> fes_player_preference_pb2.FesPlayerPreferenceGetV1.Response:
-        logger.info("🎮 [FesPlayerPreference] GetV1")
+        current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return fes_player_preference_pb2.FesPlayerPreferenceGetV1.Response()
+
+        logger.info("🎮 [FesPlayerPreference] GetV1 for player=%s", current_pid)
         response = fes_player_preference_pb2.FesPlayerPreferenceGetV1.Response()
         pref = response.player_preference
-        pref.player_id = "dankagu-reborn-user"
-        pref.player_level = 100
-        pref.is_my_space_released = True
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player = await session.get(Player, current_pid)
+
+        if player is not None:
+            pref.player_id = player.id
+            pref.player_level = max(1, player.level)
+            pref.is_my_space_released = player.level >= 10
+        else:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player not found")
+            return response
         return response
 
     async def SetAndSavePlayerStorageV1(
@@ -157,41 +296,56 @@ class FesPlayerPreferenceService(fes_player_preference_pb2_grpc.FesPlayerPrefere
         request: fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Response:
+        current_pid = get_current_player_id()
+        if not current_pid:
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player session required")
+            return fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Response()
+
         logger.info(
-            "🎮 [FesPlayerPreference] SetAndSavePlayerStorageV1 (%d entries)", len(request.entries)
+            "🎮 [FesPlayerPreference] SetAndSavePlayerStorageV1 for player=%s (%d entries)",
+            current_pid,
+            len(request.entries),
         )
         now = int(time.time())
-        if request.entries:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                for proto_entry in request.entries:
-                    p_id = proto_entry.player_id or "default-player"
-                    stmt = pg_insert(PlayerStorageEntry).values(
-                        player_id=p_id,
-                        key=proto_entry.key,
-                        value=proto_entry.value,
-                        created_at=proto_entry.created_at or now,
-                        updated_at=now,
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-                        set_={
-                            "value": stmt.excluded.value,
-                            "updated_at": stmt.excluded.updated_at,
-                        },
-                    )
-                    await session.execute(stmt)
-                await session.commit()
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player = await session.get(Player, current_pid)
+            if player is None:
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Player not found")
+                return fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Response()
+
+            if request.player_preference and request.player_preference.player_level > 0:
+                player.level = int(request.player_preference.player_level)
+
+            if request.entries:
+                rows_to_upsert = [
+                    {
+                        "player_id": current_pid,
+                        "key": proto_entry.key,
+                        "value": proto_entry.value,
+                        "created_at": proto_entry.created_at or now,
+                        "updated_at": now,
+                    }
+                    for proto_entry in request.entries
+                ]
+                await batch_upsert_storage_entries(session, rows_to_upsert)
+
+            revision = await StorageRevisionManager.set_revision_and_save(
+                request.next_revision, player_id=current_pid, session=session
+            )
+            await session.commit()
 
         response = fes_player_preference_pb2.FesPlayerPreferenceSetAndSavePlayerStorageV1.Response()
-        response.player_preference.CopyFrom(request.player_preference)
+        pref = response.player_preference
+        pref.player_id = player.id
+        pref.player_level = player.level
+        pref.is_my_space_released = player.level >= 10
+
         response.entries.extend(request.entries)
         for entry in response.entries:
-            entry.player_id = entry.player_id or "default-player"
+            entry.player_id = current_pid
             entry.created_at = entry.created_at or now
             entry.updated_at = now
-        p_id = request.player_preference.player_id if request.player_preference else None
-        response.revision = await StorageRevisionManager.set_revision_and_save(
-            request.next_revision, player_id=p_id
-        )
+
+        response.revision = revision
         return response
