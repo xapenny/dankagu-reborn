@@ -33,7 +33,13 @@ provides:
 - The **LCX REST authentication** surface used before gameplay.
 - The **Takasho gRPC** game API, including its custom wire framing.
 - An **asset delivery** service for Unity AssetBundles and master databases.
-- Stateful **player persistence** through the generic `PlayerStorage` engine.
+- Stateful, **multi-tenant player persistence** in PostgreSQL: the generic
+  `PlayerStorage` engine plus dedicated tables for accounts, sessions, wallet,
+  inventory, gacha, friends, MySpace/photos, clubs and rankings.
+- **Account identity and transfer**: device-bound sessions and permanent transfer
+  codes.
+- A **server-side economy**: atomic purchases and gacha with duplicate-card handling.
+- **Versioned schema migrations** with Alembic, applied at startup.
 
 ### Scope
 
@@ -57,7 +63,7 @@ flowchart TD
     subgraph gRPC_Svc["Takasho gRPC — grpc.aio (50051 plaintext, 50052 TLS)"]
         Interceptor["TakashoAsyncInterceptor<br/>(Envoy headers, logging,<br/>auto-mock fallback)"]
         Codec["takasho_unary_handler<br/>+ TakashoPacker"]
-        Servicers["26 RPC service namespaces<br/>82 handler bindings"]
+        Servicers["27 servicer registrations<br/>131 handler bindings"]
     end
 
     subgraph Assets["Portal and Asset CDN — FastAPI (8080, plain HTTP)"]
@@ -68,6 +74,7 @@ flowchart TD
 
     subgraph Storage["Persistence"]
         ORM["SQLAlchemy 2.0 Async + asyncpg"]
+        Alembic["Alembic migrations<br/>(run before listeners bind)"]
         DB[("PostgreSQL")]
     end
 
@@ -79,6 +86,7 @@ flowchart TD
     Client -.->|"0. fetch CA"| Portal
     Generator --> AssetRouter
     ORM --> DB
+    Alembic --> DB
 ```
 
 Four processes run concurrently under one entrypoint, plus an optional gRPC-over-TLS
@@ -121,17 +129,20 @@ Measured against the shipped code:
 | Component | Status |
 |---|---|
 | Takasho framing codec (cipher + Deflate + HMAC) | Complete, with known-answer tests |
-| LCX REST auth surface | 15 route decorators across 20 handlers, including a catch-all fallback |
-| gRPC service namespaces registered | **26** |
-| Generated RPC methods (from `protos/`) | 113 across 33 service stubs |
-| RPC handler bindings wired | 82 (71 distinct method names) |
+| LCX REST auth surface | Identity, transfer, IAP, push, subscription, currency-exchange and analytics routes, with an `/identity/*` catch-all |
+| gRPC servicer registrations | **27** (`grpc/server.py`) |
+| RPC handler bindings wired | 131 `takasho_unary_handler` bindings in `services/` |
 | RPCs answered by the auto-mock fallback | The remainder — empty but valid responses |
-| On-demand manifest generation | 7 archives synthesized at startup |
-| Persistence | 3 tables, atomic UPSERT |
-| Test suite | 14 tests across 5 modules |
+| On-demand manifest generation | Archives synthesized at startup |
+| Persistence | **32 tables** (accounts, sessions, wallet, inventory, gacha, social, ranking, club, master data, KV/storage) |
+| Schema migrations | 9 Alembic revisions (`0001_baseline` … `0009_performance_indexes`) |
+| Test suite | **166 tests across 24 modules**, run against PostgreSQL in CI |
 
-Hand-written source: **5,295 lines across 43 modules** (generated protobuf
-stubs — 234 modules, ~11.5k lines — are excluded).
+Implemented gameplay domains: login bonus, wallet and purchases, loot box (gacha)
+and step-up loot box, player inventory and growth, achievements, reconstruction
+spots, restoration, friends, MySpace and photo album, event and song rankings,
+FES player data, player KVS/preferences. The **club** system (servicers, models)
+is in progress and not yet covered by a migration.
 
 ---
 
@@ -158,11 +169,35 @@ async interceptor injects the Envoy and Takasho metadata headers the protocol
 expects. Unregistered RPCs are answered by an auto-mock fallback rather than
 failing, so an unknown call returns a valid empty response instead of an error.
 
+**Identity, sessions and transfer.** Accounts are keyed on the signed token, not
+on a device identifier; identifiers every install shares are ignored. Sessions are
+bound to a device, stale or unbound tokens are refused
+(`DANKAGU_REQUIRE_DEVICE_BOUND_TOKENS`), and an expired token falls back to the
+device that owns the account. Transfer codes are long-lived
+(`DANKAGU_TRANSFER_TTL_DAYS`), password-guarded and rate-limited, and moving an
+account replaces whatever account holds the target device. Account deletion is
+handled by the database, and credentials are redacted from logs.
+
+**Economy and gacha.** Purchases charge once, under a row lock, at the price the
+master data states, and receipts make IAP purchases idempotent. Gacha pools live
+in the database; a pull never rolls from an empty pool, multi-pulls are
+de-duplicated, and duplicate cards are kept as one collection entry with a copy
+count.
+
+**Social and ranking.** Friends (with gated player search), MySpace, photo
+album, song and event leaderboards, and per-caller reconstruction-spot responses.
+
+**Schema migrations.** Alembic revisions live under `src/dankagu/db/migrations/`
+and are applied under a PostgreSQL advisory lock before any listener binds;
+pre-Alembic databases are stamped, not rebuilt. See
+[`src/dankagu/db/README.md`](src/dankagu/db/README.md).
+
 **Stateful `PlayerStorage`.** Almost all player state is a key/value entry with
 an opaque binary payload. `GetEntriesV2` supports both `EXACT` matching and
 `FORWARD` prefix matching; `SetEntriesV2` performs an atomic PostgreSQL upsert, so
-concurrent updates cannot violate the composite primary key. Missing keys fall
-back to operator-supplied template data.
+concurrent updates cannot violate the composite primary key, and empty values
+are not persisted. Missing keys fall back to template data seeded into the
+master tables; storage failures surface as errors rather than invented data.
 
 **Manifest synthesis.** `assets/generator.py` builds the `arg_m_*` / `arg_t_*`
 archives needed during boot: FlatBuffers tables wrapped in a single-entry POSIX
@@ -227,13 +262,19 @@ uv run python scripts/compile_protos.py --fetch
 # 4. Generate a local CA and server certificate
 uv run python -m dankagu.core.certs
 
-# 5. Verify
+# 5. Start PostgreSQL (matching DANKAGU_DB_URL) and verify
+uv run alembic upgrade head
+uv run alembic check
 uv run pytest
-uv run ruff check src tests
+uv run ruff check src tests scripts
+uv run ruff format --check src tests scripts
 
-# 6. Run
+# 6. Run (migrates the schema and seeds master data on startup)
 uv run python -m dankagu.main
 ```
+
+The tests and the server need a reachable PostgreSQL instance. CI uses
+`postgres:16`.
 
 Binding `443` requires elevated privileges on most systems; `9443` exists for
 the unprivileged case. The entrypoint takes no arguments.
@@ -245,9 +286,11 @@ the unprivileged case. The entrypoint takes no arguments.
 ```
 dankagu-reborn/
 ├── .env.example               # Configuration template (copy to .env)
+├── .github/                   # CI workflow (tests, lint, build, workflow audit) and Dependabot
 ├── LICENSE                    # MIT, for this project's source only
 ├── THIRD_PARTY_NOTICES.md     # Third-party licenses and attribution
 ├── README.md
+├── alembic.ini                # Alembic configuration
 ├── pyproject.toml             # PEP 621 configuration
 ├── uv.lock                    # Locked dependency graph
 ├── certs/                     # YOUR generated TLS material (not distributed)
@@ -255,6 +298,7 @@ dankagu-reborn/
 │   ├── assets/                #   Indexed AssetBundles and generated manifests
 │   ├── hexdata/               #   Response templates (supply your own)
 │   ├── manifest/              #   Asset manifest catalogs
+│   ├── metadata/              #   Master-data JSON seeded into the database (not distributed)
 │   ├── static/index.html      #   Consent page served to the client WebView
 │   └── ver/jp/tos.txt         #   Terms-of-service version marker
 ├── docs/
@@ -270,7 +314,20 @@ dankagu-reborn/
 │   │   ├── packer.py          #   Framing codec (nonce + cipher + Deflate + HMAC)
 │   │   ├── database.py        #   SQLAlchemy 2.0 Async engine and session
 │   │   ├── certs.py           #   Self-signed CA and server certificate generation
+│   │   ├── identity.py        #   Device identity rules
+│   │   ├── session.py         #   Session tracking and device binding
+│   │   ├── transfer.py        #   Account transfer codes
+│   │   ├── economy.py         #   Purchases and pricing
+│   │   ├── growth.py          #   Card growth / cultivation
+│   │   ├── gacha_seed.py      #   Gacha pool seeding
+│   │   ├── master_seed.py     #   Master-data seeding
+│   │   ├── starter.py         #   New-player starter data
+│   │   ├── storage_state.py   #   PlayerStorage state helpers
+│   │   ├── redaction.py       #   Credential redaction for logs
 │   │   └── net.py             #   LAN IP detection
+│   ├── db/
+│   │   ├── migrate.py         #   Migration runner (advisory lock, legacy stamping)
+│   │   └── migrations/        #   Alembic revisions 0001-0009
 │   ├── lcx/
 │   │   ├── app.py             #   FastAPI app factory and request logging
 │   │   ├── router.py          #   Auth and identity routes
@@ -280,13 +337,13 @@ dankagu-reborn/
 │   │   ├── codec.py           #   Packer-aware unary handler wrapper
 │   │   ├── interceptors.py    #   Envoy/Takasho metadata + auto-mock fallback
 │   │   └── generated/         #   BUILD OUTPUT — regenerate with compile_protos.py
-│   ├── services/              #   22 modules registering 26 RPC service namespaces
-│   ├── models/                #   SQLAlchemy ORM models
+│   ├── services/              #   27 servicer registrations (storage, wallet, loot box, friends, ...)
+│   ├── models/                #   SQLAlchemy ORM models (32 tables)
 │   └── assets/
 │       ├── server.py          #   Asset routes, CA routes, status, fallback resolver
 │       ├── generator.py       #   arg_m_* / arg_t_* manifest synthesis
 │       └── portal.py          #   Setup portal UI
-└── tests/                     # 14 tests across 5 modules
+└── tests/                     # 166 tests across 24 modules
 ```
 
 ---
@@ -311,7 +368,17 @@ over `.env`.
 | `DANKAGU_GRPC_PORT` | `50051` | Takasho gRPC, plaintext. |
 | `DANKAGU_GRPC_TLS_PORT` | `50052` | Takasho gRPC over TLS. |
 | `DANKAGU_ASSET_PORT` | `8080` | Asset CDN, portal, `/status`. |
+| `DANKAGU_ASSET_SERVER_ENABLED` | `true` | Set to `false` to leave the plain-HTTP portal and operator routes unbound. |
+| `DANKAGU_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | `DANKAGU_DB_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/dankagu` | SQLAlchemy async PostgreSQL URL (`asyncpg`). |
+| `DANKAGU_DB_AUTO_MIGRATE` | `true` | Apply Alembic migrations at startup. If `false`, run `python -m dankagu.db.migrate --upgrade` yourself. |
+| `DANKAGU_DB_MIGRATE_WAIT_SECONDS` | `300` | How long a second instance waits for the migration lock. |
+| `DANKAGU_SHARED_DEVICE_IDS` | *(empty)* | Extra device identifiers shared by every install, to be ignored as identity. |
+| `DANKAGU_SIGN_IN_SESSION_TTL_SECONDS` | `2592000` | Lifetime of the LCX `signInSessionToken` (30 days). |
+| `DANKAGU_REQUIRE_DEVICE_BOUND_TOKENS` | `true` | Reject session tokens that carry no device binding. |
+| `DANKAGU_TRANSFER_TTL_DAYS` | `3650` | How long a transfer code stays usable. |
+| `DANKAGU_TRANSFER_MIN_PASSWORD_LENGTH` | `8` | Minimum transfer password length. |
+| `DANKAGU_TRANSFER_ATTEMPTS_PER_HOUR` | `20` | Transfer attempts allowed per hour. |
 
 ### Secret handling
 
@@ -334,11 +401,13 @@ These are intentionally not distributed and are git-ignored:
 - **Protocol schemas** (`protos/`) and the derived stubs
   (`src/dankagu/grpc/generated/`). Third-party content and build output:
   `python scripts/compile_protos.py --fetch`.
-- **`data/hexdata/`** — response templates. Eight service modules load from here
+- **`data/hexdata/`** — response templates. Several service modules load from here
   (`wallet`, `player_storage`, `loot_box`, `game_product`, `announcement`,
   `login_bonus`, `reconstruction_spot`, `ondemand_master`). Without them those
-  servicers return empty responses; `wallet.py` and `player_storage.py`
-  additionally carry small hard-coded fallbacks.
+  servicers return empty responses.
+- **`data/metadata/`** — master-data JSON (cards, items, musics, events, gacha
+  pools, ...). It is seeded into the `master_*` tables on first start when the
+  tables are empty.
 - **`data/assets/`, `data/manifest/`** — game assets and manifest catalogs.
 
 ---
