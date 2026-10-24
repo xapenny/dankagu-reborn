@@ -9,6 +9,7 @@ from dankagu.grpc.interceptors import TakashoAsyncInterceptor
 from dankagu.services.achievement import register_achievement_servicer
 from dankagu.services.announcement import register_announcement_servicer
 from dankagu.services.baas_product import register_baas_product_servicer
+from dankagu.services.box_loot_box import register_box_loot_box_servicer
 from dankagu.services.club import register_club_servicers
 from dankagu.services.fes_player import register_fes_player_servicer
 from dankagu.services.friend import register_friend_servicer
@@ -51,6 +52,7 @@ def create_grpc_server() -> grpc.aio.Server:
     register_game_product_servicer(server)
     register_loot_box_servicer(server)
     register_step_up_loot_box_servicer(server)
+    register_box_loot_box_servicer(server)
     register_announcement_servicer(server)
     register_player_inventory_servicer(server)
     register_baas_product_servicer(server)
