@@ -41,7 +41,7 @@ async def test_box_loot_box_lifecycle() -> None:
         1: [(0, 38)],
         2: [(0, 1000)],
         3: [(0, 1000)],  # 1000 spendable event points
-        15: [(0, 0)],    # box 1 (0-indexed progress)
+        15: [(0, 0)],  # box 1 (0-indexed progress)
     }
     encoded_status = encode_raw_protobuf(ev_fields)
     now = int(time.time())
@@ -97,6 +97,7 @@ async def test_box_loot_box_lifecycle() -> None:
         assert entry is not None
         # Parse fields
         from dankagu.services.box_loot_box import parse_raw_protobuf
+
         updated_fields = parse_raw_protobuf(entry.value)
         # 1000 - 100 = 900
         assert updated_fields[3][0][1] == 900

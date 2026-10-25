@@ -54,6 +54,11 @@ def get_event_box_rewards() -> dict[str, dict[str, list[dict]]]:
                 _BOX_REWARDS_CACHE = {}
         else:
             _BOX_REWARDS_CACHE = {}
+
+        if not _BOX_REWARDS_CACHE:
+            from dankagu.services.box_loot_box_data import FALLBACK_EVENT_BOX_REWARDS
+
+            _BOX_REWARDS_CACHE = FALLBACK_EVENT_BOX_REWARDS
     return _BOX_REWARDS_CACHE
 
 
@@ -177,7 +182,9 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         remain_counts = {str(e["id"]): int(e["reward_count"]) for e in box_entries}
         can_reset = False
         now = int(time.time())
-        save_val = json.dumps({"remain_counts": remain_counts, "can_reset": can_reset}).encode("utf-8")
+        save_val = json.dumps({"remain_counts": remain_counts, "can_reset": can_reset}).encode(
+            "utf-8"
+        )
         upsert_stmt = pg_insert(PlayerStorageEntry).values(
             player_id=player_id,
             key=state_key,
@@ -187,7 +194,10 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         )
         upsert_stmt = upsert_stmt.on_conflict_do_update(
             index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-            set_={"value": upsert_stmt.excluded.value, "updated_at": upsert_stmt.excluded.updated_at},
+            set_={
+                "value": upsert_stmt.excluded.value,
+                "updated_at": upsert_stmt.excluded.updated_at,
+            },
         )
         await session.execute(upsert_stmt)
         return remain_counts, can_reset
@@ -204,7 +214,9 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         """Persist remaining prize counts and can_reset flag."""
         state_key = f"_BoxLootState_{event_id}_{box_no}"
         now = int(time.time())
-        save_val = json.dumps({"remain_counts": remain_counts, "can_reset": can_reset}).encode("utf-8")
+        save_val = json.dumps({"remain_counts": remain_counts, "can_reset": can_reset}).encode(
+            "utf-8"
+        )
         upsert_stmt = pg_insert(PlayerStorageEntry).values(
             player_id=player_id,
             key=state_key,
@@ -214,7 +226,10 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         )
         upsert_stmt = upsert_stmt.on_conflict_do_update(
             index_elements=[PlayerStorageEntry.player_id, PlayerStorageEntry.key],
-            set_={"value": upsert_stmt.excluded.value, "updated_at": upsert_stmt.excluded.updated_at},
+            set_={
+                "value": upsert_stmt.excluded.value,
+                "updated_at": upsert_stmt.excluded.updated_at,
+            },
         )
         await session.execute(upsert_stmt)
 
@@ -230,7 +245,7 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         box = box_v1_pb2.BoxLootBoxBox()
         box.box_loot_box_box_num = box_no
         box.inventory_message = "イベント報酬"
-        box.is_repeat = (box_no >= total_boxes)
+        box.is_repeat = box_no >= total_boxes
         box.has_extra = False
 
         total_cnt = sum(int(e["reward_count"]) for e in box_entries)
@@ -307,7 +322,9 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         product.box_num = current_box_no
         product.total_box_num = total_boxes
 
-        box = self._build_box_proto(event_id, current_box_no, box_entries, remain_counts, total_boxes)
+        box = self._build_box_proto(
+            event_id, current_box_no, box_entries, remain_counts, total_boxes
+        )
         pbox = product.box_loot_box_boxes.add()
         pbox.CopyFrom(box)
 
@@ -652,4 +669,6 @@ def register_box_loot_box_servicer(server: grpc.aio.Server) -> None:
         "takasho.schema.fes.player_api.BoxLootBox", method_handlers
     )
     server.add_generic_rpc_handlers((generic_handler,))
-    logger.info("📦 [BoxLootBox] Servicer registered under takasho.schema.fes.player_api.BoxLootBox")
+    logger.info(
+        "📦 [BoxLootBox] Servicer registered under takasho.schema.fes.player_api.BoxLootBox"
+    )

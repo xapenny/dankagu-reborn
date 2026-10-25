@@ -96,7 +96,8 @@ async def test_player_achievement_service() -> None:
         )
     )
     res_unlock_storage = await service.UnlockAndSavePlayerStorageV1(
-        req_unlock_storage, ctx  # type: ignore[arg-type]
+        req_unlock_storage,
+        ctx,  # type: ignore[arg-type]
     )
     assert len(res_unlock_storage.player_achievements) == 1
     assert len(res_unlock_storage.entries) == 1

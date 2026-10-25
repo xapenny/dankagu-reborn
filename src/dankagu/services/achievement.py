@@ -228,7 +228,9 @@ class PlayerAchievementService(player_achievement_pb2_grpc.PlayerAchievementServ
         request: player_achievement_pb2.PlayerAchievementGetAvailableByIDsV1.Request,
         context: grpc.aio.ServicerContext,
     ) -> player_achievement_pb2.PlayerAchievementGetAvailableByIDsV1.Response:
-        logger.info("🏆 [PlayerAchievement] GetAvailableByIDsV1 (%d ids)", len(request.achievement_ids))
+        logger.info(
+            "🏆 [PlayerAchievement] GetAvailableByIDsV1 (%d ids)", len(request.achievement_ids)
+        )
         response = player_achievement_pb2.PlayerAchievementGetAvailableByIDsV1.Response()
         now = int(time.time())
         for ach_id in request.achievement_ids:
