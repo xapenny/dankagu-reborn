@@ -166,4 +166,3 @@ class ClubScalar(Base):
         onupdate=lambda: int(time.time()),
         nullable=False,
     )
-

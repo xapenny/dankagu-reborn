@@ -40,7 +40,9 @@ def upgrade() -> None:
             sa.Column("id", sa.String(length=64), primary_key=True),
             sa.Column("name", sa.String(length=64), nullable=False),
             sa.Column("profile", sa.Text(), nullable=False, server_default=""),
-            sa.Column("character_id", sa.String(length=32), nullable=False, server_default="1011001"),
+            sa.Column(
+                "character_id", sa.String(length=32), nullable=False, server_default="1011001"
+            ),
             sa.Column("play_style", sa.Integer(), nullable=False, server_default="1"),
             sa.Column("approval_policy", sa.Integer(), nullable=False, server_default="2"),
             sa.Column("searchable", sa.Boolean(), nullable=False, server_default=sa.true()),
@@ -139,7 +141,9 @@ def upgrade() -> None:
             sa.Column("updated_at", sa.BigInteger(), nullable=False),
         )
     _create_index("ix_club_join_requests_club_status", "club_join_requests", ["club_id", "status"])
-    _create_index("ix_club_join_requests_player_status", "club_join_requests", ["player_id", "status"])
+    _create_index(
+        "ix_club_join_requests_player_status", "club_join_requests", ["player_id", "status"]
+    )
 
     if not _has_table("club_scalars"):
         op.create_table(

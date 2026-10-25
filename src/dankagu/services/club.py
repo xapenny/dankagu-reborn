@@ -1974,9 +1974,7 @@ class ClubScalarService(club_scalar_pb2_grpc.ClubScalarServicer):
         context: grpc.aio.ServicerContext,
     ) -> club_scalar_pb2.ClubScalarGet.Response:
         key = request.key or "ClubPoint"
-        logger.info(
-            "💎 [ClubScalar] Get: club_id=%s, key=%s", request.club_id, key
-        )
+        logger.info("💎 [ClubScalar] Get: club_id=%s, key=%s", request.club_id, key)
         session_factory = get_sessionmaker()
         async with session_factory() as session:
             stmt = select(ClubScalar.value).where(
