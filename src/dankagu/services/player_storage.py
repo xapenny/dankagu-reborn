@@ -22,7 +22,9 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.resource.player_sto
     Criterion,
 )
 from dankagu.models.player import Player
+from dankagu.models.ranking import EventLeaderboard
 from dankagu.models.storage import PlayerStorageEntry
+from dankagu.services.box_loot_box import encode_raw_protobuf, parse_raw_protobuf
 
 logger = logging.getLogger("dankagu.services.player_storage")
 
@@ -113,6 +115,131 @@ async def _upsert_entry(
     )
 
 
+def sanitize_gpx_info_status(raw_bytes: bytes) -> tuple[bytes, dict[int, int]]:
+    """Sanitize GpxInfoStatusProto to eliminate poisoned legacy backup scores (15M+).
+
+    Returns (sanitized_bytes, dict_of_phase_id_to_total_score).
+    """
+    if not raw_bytes:
+        return raw_bytes, {}
+
+    try:
+        from google.protobuf.internal import decoder, encoder
+
+        def parse_fields(data: bytes):
+            pos = 0
+            fields = []
+            while pos < len(data):
+                tag, pos = decoder._DecodeVarint(data, pos)
+                fn = tag >> 3
+                wt = tag & 7
+                if wt == 0:
+                    val, pos = decoder._DecodeVarint(data, pos)
+                    fields.append((fn, wt, val))
+                elif wt == 2:
+                    length, pos = decoder._DecodeVarint(data, pos)
+                    val = data[pos : pos + length]
+                    pos += length
+                    fields.append((fn, wt, val))
+                else:
+                    break
+            return fields
+
+        root_fields = parse_fields(raw_bytes)
+        out = bytearray()
+        phase_scores = {}
+
+        for fn, wt, val in root_fields:
+            if fn == 2 and wt == 2:  # Phase sub-message
+                p_fields = parse_fields(val)
+                phase_id = 0
+                is_clear = b"\x00\x00\x00"
+                max_scores = [0, 0, 0]
+                scores = [0, 0, 0]
+                max_total_score = 0
+                receive_reward = 0
+
+                for pfn, _pwt, pval in p_fields:
+                    if pfn == 1:
+                        phase_id = pval
+                    elif pfn == 2:
+                        is_clear = pval
+                    elif pfn == 3:
+                        pos = 0
+                        ms = []
+                        while pos < len(pval):
+                            v, pos = decoder._DecodeVarint(pval, pos)
+                            ms.append(v)
+                        if ms:
+                            max_scores = ms
+                    elif pfn == 4:
+                        pos = 0
+                        sc = []
+                        while pos < len(pval):
+                            v, pos = decoder._DecodeVarint(pval, pos)
+                            sc.append(v)
+                        if sc:
+                            scores = sc
+                    elif pfn == 5:
+                        max_total_score = pval
+                    elif pfn == 6:
+                        receive_reward = pval
+
+                total_score = sum(scores)
+                if max_total_score >= 10_000_000:
+                    max_total_score = total_score
+                    max_scores = list(scores)
+                elif total_score > max_total_score:
+                    max_total_score = total_score
+                    max_scores = list(scores)
+
+                phase_scores[phase_id] = total_score
+
+                # Re-encode phase
+                p_out = bytearray()
+                p_out += encoder._VarintBytes((1 << 3) | 0) + encoder._VarintBytes(phase_id)
+                p_out += (
+                    encoder._VarintBytes((2 << 3) | 2)
+                    + encoder._VarintBytes(len(is_clear))
+                    + is_clear
+                )
+                ms_buf = bytearray()
+                for s in max_scores:
+                    ms_buf += encoder._VarintBytes(s)
+                p_out += (
+                    encoder._VarintBytes((3 << 3) | 2) + encoder._VarintBytes(len(ms_buf)) + ms_buf
+                )
+                sc_buf = bytearray()
+                for s in scores:
+                    sc_buf += encoder._VarintBytes(s)
+                p_out += (
+                    encoder._VarintBytes((4 << 3) | 2) + encoder._VarintBytes(len(sc_buf)) + sc_buf
+                )
+                if max_total_score > 0:
+                    p_out += encoder._VarintBytes((5 << 3) | 0) + encoder._VarintBytes(
+                        max_total_score
+                    )
+                if receive_reward > 0:
+                    p_out += encoder._VarintBytes((6 << 3) | 0) + encoder._VarintBytes(
+                        receive_reward
+                    )
+
+                out += (
+                    encoder._VarintBytes((2 << 3) | 2)
+                    + encoder._VarintBytes(len(p_out))
+                    + bytes(p_out)
+                )
+            elif wt == 0:
+                out += encoder._VarintBytes((fn << 3) | 0) + encoder._VarintBytes(val)
+            elif wt == 2:
+                out += encoder._VarintBytes((fn << 3) | 2) + encoder._VarintBytes(len(val)) + val
+
+        return bytes(out), phase_scores
+    except Exception as e:
+        logger.debug("Failed parsing GpxInfoStatusProto in sanitizer: %s", e)
+        return raw_bytes, {}
+
+
 class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
     """Handles GetEntriesV2 and SetEntriesV2 for game state persistence."""
 
@@ -148,6 +275,18 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         self.template_entries.setdefault(
             "PlayerBootStatus--1", b"\x08\x01\x18\x01 \x0e(\xff\xff\xff\xff\x07"
         )
+        # Seed all 16 UnlockEntityStatusCollection categories (Card, Heroine, Character,
+        # Map, MapGrid, Lunatic, CardIllust, Emblem, DanmakuPass, HomeCard, ClubStamp,
+        # HeroineGrowth, ExpeditionCount, AnotherMusic, FirstBurstLink, SdSkin)
+        for cat_id in range(1, 17):
+            self.template_entries.setdefault(
+                f"UnlockEntityStatusCollection--{cat_id}", bytes([0x08, cat_id])
+            )
+        # Seed all EpisodeEntityStatusCollection categories (1, 2, 3: Chara, 4, 5, 6, 10)
+        for ep_cat in (1, 2, 3, 4, 5, 6, 10):
+            self.template_entries.setdefault(
+                f"EpisodeEntityStatusCollection--{ep_cat}", bytes([0x08, ep_cat])
+            )
         self.template_entries.setdefault(
             "JoinClubStatus--0", b"\020\363\234\252\210\006\030\363\234\252\210\006 \001"
         )
@@ -161,10 +300,20 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             "CoopEventInfoStatus-V3-3",
             b"\010\003\022\004ddd\000\030\205\016 \220\302\233\232\006(\233\360\225\232\0060\216\231\001",
         )
-        self.template_entries.setdefault(
-            "GpxInfoStatus-V1-1",
-            b'\010\001\022*\010\250\214=\022\003\001\001\001\032\014\333\324\212\002\273\212\370\001\241\250\266\002"\014\333\324\212\002\320\376\361\001\241\250\266\002(\314\373\262\006\022*\010\220\224=\022\003\001\001\001\032\014\373\303\342\001\371\257\307\001\376\203\245\002"\014\373\303\342\001\371\257\307\001\376\203\245\002(\362\367\316\005\022$\010\370\233=\022\003\001\001\001\032\014\356\314\223\002\347\216\232\002\332\230\326\002"\006\000\000\240\320\303\002(\265\377\347\006\022*\010\340\243=\022\003\001\001\001\032\014\307\265\365\001\364\272\354\002\374\337\343\001"\014\262\374\362\001\364\272\354\002\374\337\343\001(\242\227\303\006\022\'\010\310\253=\022\003\001\001\001\032\014\212\376\240\002\261\276\307\002\210\227\315\002"\t\212\376\240\002\200\367\303\002\000(\273\357\252\007(\0050\0018\004@\310\253=H\264\272\223\232\006P\001X\001b$fa6306e0-3343-4016-bf2a-d24b6aa077bdh\357R',
+        # Clean GpxInfoStatusProto: ID=1, 5 phases (1001000..1005000), maxTotalScore=0, scores=[0,0,0]
+        # This ensures real gameplay scores trigger GpxService.RegistRanking -> RegisterScore on client.
+        gpx_info_val = bytes.fromhex(
+            "0801121308a88c3d12030000001a030000002203000000"
+            "12130890943d12030000001a030000002203000000"
+            "121308f89b3d12030000001a030000002203000000"
+            "121308e0a33d12030000001a030000002203000000"
+            "121308c8ab3d12030000001a030000002203000000"
+            "28013001380440c8ab3d48b4ba939a065001580162006800"
         )
+        self.template_entries.setdefault("GpxInfoStatus-V1-1", gpx_info_val)
+        self.template_entries.setdefault("GpxInfoStatus--1", gpx_info_val)
+        self.template_entries.setdefault("GpxEntryStatus-V1-1", b"\x08\x01\x10\x01")
+        self.template_entries.setdefault("GpxEntryStatus--1", b"\x08\x01\x10\x01")
         self.template_entries.setdefault(
             "ExpeditionMissionRecordEntityCollecttion--1",
             bytes.fromhex("0801121c08914e100018002000280030003a0200004205000000000048015000"),
@@ -265,6 +414,8 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     proto.player_id = current_pid
                     proto.key = e.key
                     proto.value = e.value
+                    if k.startswith("GpxInfoStatus"):
+                        proto.value, _ = sanitize_gpx_info_status(proto.value)
                     proto.created_at = e.created_at
                     proto.updated_at = e.updated_at
                     served_keys.add(k)
@@ -290,6 +441,8 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                     proto.player_id = current_pid
                     proto.key = e.key
                     proto.value = e.value
+                    if k.startswith("GpxInfoStatus"):
+                        proto.value, _ = sanitize_gpx_info_status(proto.value)
                     proto.created_at = e.created_at
                     proto.updated_at = e.updated_at
                     served_keys.add(k)
@@ -355,6 +508,35 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                         PlayerStorageEntry.key.in_(keys_to_delete),
                     )
                 )
+
+            # Sanitize GpxInfoStatus and auto-sync medley ranking scores
+            gpx_phase_scores: dict[int, int] = {}
+            for row in rows_to_upsert:
+                if row["key"].startswith("GpxInfoStatus"):
+                    clean_val, p_scores = sanitize_gpx_info_status(row["value"])
+                    row["value"] = clean_val
+                    gpx_phase_scores.update(p_scores)
+
+            p5_score = gpx_phase_scores.get(1005000, 0)
+            if p5_score > 0:
+                ranking_key = "gpx_s1_p1005"
+                lb_stmt = select(EventLeaderboard).where(
+                    EventLeaderboard.ranking_event_id == ranking_key,
+                    EventLeaderboard.player_id == current_pid,
+                )
+                lb_entry = (await session.execute(lb_stmt)).scalars().first()
+                if lb_entry is None:
+                    session.add(
+                        EventLeaderboard(
+                            ranking_event_id=ranking_key,
+                            player_id=current_pid,
+                            score=p5_score,
+                            updated_at=now,
+                        )
+                    )
+                elif p5_score > lb_entry.score:
+                    lb_entry.score = p5_score
+                    lb_entry.updated_at = now
 
             if rows_to_upsert:
                 await batch_upsert_storage_entries(session, rows_to_upsert)
