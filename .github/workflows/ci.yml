@@ -20,6 +20,7 @@ env:
   # resolving something that was never tested locally.
   UV_FROZEN: "1"
   PYTHONUNBUFFERED: "1"
+  DANKAGU_PROTOS_REPO: "https://github.com/xapenny/dankagu-local.git"
 
 jobs:
   test:

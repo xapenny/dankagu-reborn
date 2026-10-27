@@ -160,6 +160,11 @@ class AchievementService(achievement_pb2_grpc.AchievementServicer):
                 resp_entry.created_at = proto_entry.created_at or now
                 resp_entry.updated_at = now
 
+            # Auto-grant heroine & character milestone titles (Lv 50 / Lv 100)
+            from dankagu.services.player_storage import check_and_grant_heroine_milestones
+
+            await check_and_grant_heroine_milestones(session, current_pid, request.entries, now)
+
             # 2. Unlock achievements and grant rewards to mailbox
             for ach_id in request.achievement_ids:
                 p_ach = response.player_achievements.add()
@@ -345,6 +350,11 @@ class PlayerAchievementService(player_achievement_pb2_grpc.PlayerAchievementServ
                 resp_entry.value = proto_entry.value
                 resp_entry.created_at = proto_entry.created_at or now
                 resp_entry.updated_at = now
+
+            # Auto-grant heroine & character milestone titles (Lv 50 / Lv 100)
+            from dankagu.services.player_storage import check_and_grant_heroine_milestones
+
+            await check_and_grant_heroine_milestones(session, current_pid, request.entries, now)
 
             for ach_id in request.achievement_ids:
                 p_ach = response.player_achievements.add()

@@ -177,7 +177,7 @@ def generate_all_manifest_assets(force: bool = True) -> dict[str, Path]:
         {
             "category": "4",
             "salt": 2858,
-            "hash_path": "4/40/3760-2-4d57879999f6fce80d6d50c79dee755a7e688f29",
+            "hash_path": "4/40/3760-2-6e317ef0a64306e6a64ee90c4c1f669ccbfbfbbd",
             "name": "arg_m_db_r_00003760",
         },
         # Common Main (Category 2)
@@ -226,7 +226,7 @@ def generate_all_manifest_assets(force: bool = True) -> dict[str, Path]:
         {
             "category": "4",
             "salt": 2153,
-            "hash_path": "4/40/3760-2-796661f6d24cfcf9c7cf96c667b8208576e0b9f1",
+            "hash_path": "4/40/3760-2-d450ffff768806d80f1dc74f71962262d77ff22e",
             "name": "arg_m_db_r_00003760_u0",
         },
         # Upload[0] iOS Main (Category 3, OpenAt=1665817200)

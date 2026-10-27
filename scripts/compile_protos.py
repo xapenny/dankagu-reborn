@@ -31,10 +31,14 @@ OUTPUT_DIR = PROJECT_ROOT / "src" / "dankagu" / "grpc" / "generated"
 VENDOR_DIR = PROJECT_ROOT / "vendor-protos"
 SUPPLEMENTAL_VENDOR_DIR = PROJECT_ROOT / "vendor-supplemental-protos"
 
-UPSTREAM_REPO = os.environ.get(
-    "DANKAGU_PROTOS_REPO",
-    "https://github.com/xapenny/dankagu-local.git",
+_IS_CI = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+_DEFAULT_UPSTREAM_REPO = (
+    "https://github.com/xapenny/dankagu-local.git"
+    if _IS_CI
+    else "https://gh-proxy.org/https://github.com/xapenny/dankagu-local.git"
 )
+
+UPSTREAM_REPO = os.environ.get("DANKAGU_PROTOS_REPO", _DEFAULT_UPSTREAM_REPO)
 UPSTREAM_SUBDIR = "protos"
 
 DEFAULT_SUPPLEMENTAL_REPO = os.environ.get("DANKAGU_SUPPLEMENTS_REPO", "")
