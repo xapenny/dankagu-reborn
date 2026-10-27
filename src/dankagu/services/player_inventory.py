@@ -318,6 +318,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                 top_up_kaleidoscopes = False
                 growth_by_count: dict[int, list[int]] = {}
                 generic_by_prefix_and_count: dict[tuple[int, int], list[int]] = {}
+                unlocks_by_cat: dict[int, list[int]] = {}
 
                 for item in items:
                     parsed: dict = {}
@@ -379,6 +380,22 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                         if "PlayerStatus--1" not in client_entry_keys:
                             total_coin_to_add += count
 
+                    # Server-side fallback for Unlock-based items (Emblem, ClubStamp, AnotherMusic, SdSkin)
+                    elif (
+                        prefix in ("Emblem", "ClubStamp", "AnotherMusic", "SdSkin")
+                        and isinstance(val, int)
+                        and val > 0
+                    ):
+                        prefix_to_cat = {
+                            "Emblem": 8,
+                            "ClubStamp": 11,
+                            "AnotherMusic": 14,
+                            "SdSkin": 16,
+                        }
+                        cat_id = prefix_to_cat[prefix]
+                        if f"UnlockEntityStatusCollection--{cat_id}" not in client_entry_keys:
+                            unlocks_by_cat.setdefault(cat_id, []).append(val)
+
                     item.is_claimed = True
                     item.received_at = now
 
@@ -395,6 +412,37 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                     await add_growth_items(
                         session, current_pid, SKILL_ITEM_IDS, count=99, max_cap=99
                     )
+
+                for cat_id, u_ids in unlocks_by_cat.items():
+                    u_key = f"UnlockEntityStatusCollection--{cat_id}"
+                    u_stmt = select(PlayerStorageEntry).where(
+                        PlayerStorageEntry.player_id == current_pid,
+                        PlayerStorageEntry.key == u_key,
+                    )
+                    curr_u = (await session.execute(u_stmt)).scalar_one_or_none()
+                    from dankagu.services.player_storage import add_unlock_ids_to_collection
+
+                    curr_val = curr_u.value if curr_u else None
+                    new_val = add_unlock_ids_to_collection(curr_val, cat_id, u_ids, now)
+                    if curr_u:
+                        curr_u.value = new_val
+                        curr_u.updated_at = now
+                    else:
+                        session.add(
+                            PlayerStorageEntry(
+                                player_id=current_pid,
+                                key=u_key,
+                                value=new_val,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
+                    resp_entry = response.entries.add()
+                    resp_entry.player_id = current_pid
+                    resp_entry.key = u_key
+                    resp_entry.value = new_val
+                    resp_entry.created_at = curr_u.created_at if curr_u else now
+                    resp_entry.updated_at = now
 
                 if total_coin_to_add > 0:
                     ps_res = await session.execute(

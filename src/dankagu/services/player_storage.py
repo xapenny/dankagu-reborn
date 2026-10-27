@@ -115,6 +115,133 @@ async def _upsert_entry(
     )
 
 
+def add_unlock_ids_to_collection(
+    current_bytes: bytes | None, category: int, unlock_ids: list[int], now: int
+) -> bytes:
+    """Add unlock IDs to an UnlockEntityStatusCollection--{category} protobuf blob."""
+    existing_ids: set[int] = set()
+    sub_messages = []
+
+    if current_bytes:
+        try:
+            fields = parse_raw_protobuf(current_bytes)
+            for _, sub_raw in fields.get(2, []):
+                sub = parse_raw_protobuf(sub_raw)
+                uid = sub.get(4, [(0, 0)])[0][1]
+                existing_ids.add(uid)
+                sub_messages.append((2, sub_raw))
+        except Exception as e:
+            logger.debug(
+                "Failed parsing existing UnlockEntityStatusCollection--%d: %s", category, e
+            )
+
+    added = False
+    for uid in unlock_ids:
+        if uid not in existing_ids:
+            new_sub = {
+                1: [(0, now)],
+                2: [(0, now)],
+                3: [(0, category)],
+                4: [(0, uid)],
+                6: [(0, 1)],
+            }
+            sub_messages.append((2, encode_raw_protobuf(new_sub)))
+            existing_ids.add(uid)
+            added = True
+
+    if not added and current_bytes:
+        return current_bytes
+
+    root = {
+        1: [(0, category)],
+        2: sub_messages,
+    }
+    return encode_raw_protobuf(root)
+
+
+def add_emblems_to_collection(
+    current_bytes: bytes | None, emblem_ids: list[int], now: int
+) -> bytes:
+    """Add emblem IDs to an UnlockEntityStatusCollection--8 protobuf blob."""
+    return add_unlock_ids_to_collection(current_bytes, 8, emblem_ids, now)
+
+
+async def check_and_grant_heroine_milestones(
+    session: AsyncSession, player_id: str, entries: Any, now: int
+) -> PlayerStorageEntry | None:
+    """Auto-grant heroine milestone titles (Lv 50: 1000000+cid, Lv 100: 1100000+cid).
+
+    Ensures UnlockEntityStatusCollection--8 contains the unlocked titles.
+    Titles are NOT queued to player_inventories because titles have MaxCount=1 and
+    the client's EmblemProxy.CheckFully checks haveCount + addCount > 1, which blocks
+    claiming if already unlocked.
+    """
+    emblems_to_grant: set[int] = set()
+    has_unlock_8_in_entries = False
+
+    for entry in entries:
+        k = entry.key
+        v = entry.value
+        if not v:
+            continue
+        if k == "UnlockEntityStatusCollection--8":
+            has_unlock_8_in_entries = True
+        elif k.startswith("HeroineStatus--"):
+            try:
+                fields = parse_raw_protobuf(v)
+                chara_id = fields.get(2, [(0, 0)])[0][1]
+                exp = fields.get(8, [(0, 0)])[0][1]
+                if chara_id > 0:
+                    if exp >= 49:
+                        emblems_to_grant.add(1000000 + chara_id)
+                    if exp >= 99:
+                        emblems_to_grant.add(1100000 + chara_id)
+            except Exception as e:
+                logger.debug("Failed parsing HeroineStatus: %s", e)
+        elif k.startswith("CharacterStatus--"):
+            try:
+                fields = parse_raw_protobuf(v)
+                chara_id = fields.get(1, [(0, 0)])[0][1]
+                exp = fields.get(4, [(0, 0)])[0][1]
+                if chara_id > 0:
+                    if exp >= 49:
+                        emblems_to_grant.add(1000000 + chara_id)
+                    if exp >= 99:
+                        emblems_to_grant.add(1100000 + chara_id)
+            except Exception as e:
+                logger.debug("Failed parsing CharacterStatus: %s", e)
+
+    if not emblems_to_grant:
+        return None
+
+    # If client did not provide UnlockEntityStatusCollection--8 in this request, update it on server
+    if not has_unlock_8_in_entries:
+        stmt_u8 = select(PlayerStorageEntry).where(
+            PlayerStorageEntry.player_id == player_id,
+            PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
+        )
+        curr_u8 = (await session.execute(stmt_u8)).scalar_one_or_none()
+        curr_val = curr_u8.value if curr_u8 else None
+        updated_val = add_emblems_to_collection(curr_val, list(emblems_to_grant), now)
+        if curr_u8:
+            if curr_u8.value != updated_val:
+                curr_u8.value = updated_val
+                curr_u8.updated_at = now
+            return curr_u8
+        else:
+            new_u8 = PlayerStorageEntry(
+                player_id=player_id,
+                key="UnlockEntityStatusCollection--8",
+                value=updated_val,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(new_u8)
+            return new_u8
+
+    return None
+
+
 def sanitize_gpx_info_status(raw_bytes: bytes) -> tuple[bytes, dict[int, int]]:
     """Sanitize GpxInfoStatusProto to eliminate poisoned legacy backup scores (15M+).
 
@@ -569,6 +696,11 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 )
                 await session.execute(mat_stmt)
 
+            # Auto-grant heroine & character milestone titles (Lv 50 / Lv 100)
+            u8_entry = await check_and_grant_heroine_milestones(
+                session, current_pid, request.entries, now
+            )
+
             revision = await StorageRevisionManager.set_revision_and_save(
                 request.next_revision, player_id=current_pid, session=session
             )
@@ -576,6 +708,13 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
 
         response = player_storage_pb2.PlayerStorageSetEntriesV2.Response()
         written_map = {row["key"]: row for row in rows_to_upsert}
+        if u8_entry and u8_entry.key not in written_map:
+            written_map[u8_entry.key] = {
+                "key": u8_entry.key,
+                "value": u8_entry.value,
+                "created_at": u8_entry.created_at,
+                "updated_at": u8_entry.updated_at,
+            }
 
         for key, row in written_map.items():
             resp_entry = response.entries.add()
