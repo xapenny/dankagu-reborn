@@ -33,7 +33,7 @@ SUPPLEMENTAL_VENDOR_DIR = PROJECT_ROOT / "vendor-supplemental-protos"
 
 UPSTREAM_REPO = os.environ.get(
     "DANKAGU_PROTOS_REPO",
-    "https://github.com/xapenny/dankagu-local.git",
+    "https://gh-proxy.org/https://github.com/xapenny/dankagu-local.git",
 )
 UPSTREAM_SUBDIR = "protos"
 
