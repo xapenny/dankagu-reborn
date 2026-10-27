@@ -304,7 +304,11 @@ async def test_player_inventory_gift_box_flow(sample_player: Player) -> None:
     req_get = player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request()
     resp_get = await servicer.GetInventoriesV1(req_get, ctx)
     assert len(resp_get.inventories) >= 1
-    welcome_gift = next(g for g in resp_get.inventories if g.system_resource_name == "FREE_STONE")
+    welcome_gift = next(
+        g
+        for g in resp_get.inventories
+        if g.system_resource_name == "FREE_STONE" and g.system_resource_num == 2500
+    )
     assert welcome_gift.system_resource_num == 2500
 
     # 2. GetInventoriesAndCountV1 check

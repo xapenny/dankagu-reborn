@@ -8,6 +8,11 @@ import grpc
 from sqlalchemy import func, or_, select
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.ranking_rewards import (
+    check_and_grant_event_ranking_milestones,
+    check_and_grant_gpx_milestones,
+    check_and_grant_gpx_milestones_for_player,
+)
 from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.generated.takasho.schema.fes.player_api import (
@@ -87,6 +92,30 @@ class RankingService(ranking_pb2_grpc.RankingServicer):
                 score_val = entry.score
             await session.commit()
 
+            # Calculate rank and check for milestone rewards
+            rank_stmt = (
+                select(func.count())
+                .select_from(EventLeaderboard)
+                .where(
+                    EventLeaderboard.ranking_event_id == request.ranking_event_id,
+                    EventLeaderboard.score > score_val,
+                )
+            )
+            higher_count = (await session.execute(rank_stmt)).scalar() or 0
+            rank = higher_count + 1
+            granted = await check_and_grant_event_ranking_milestones(
+                session, player_id, request.ranking_event_id, rank
+            )
+            if granted > 0:
+                await session.commit()
+                logger.info(
+                    "🎁 [Ranking] Granted %d milestone reward(s) to %s (rank %d in %s)",
+                    granted,
+                    player_id,
+                    rank,
+                    request.ranking_event_id,
+                )
+
         response = ranking_pb2.RankingRegisterV1.Response()
         response.score = score_val
         return response
@@ -126,9 +155,22 @@ class RankingService(ranking_pb2_grpc.RankingServicer):
                     )
                 )
                 higher_count = (await session.execute(rank_stmt)).scalar() or 0
+                rank = higher_count + 1
                 response.is_registered = True
                 response.score = entry.score
-                response.rank = higher_count + 1
+                response.rank = rank
+
+                granted = await check_and_grant_event_ranking_milestones(
+                    session, player_id, request.ranking_event_id, rank
+                )
+                if granted > 0:
+                    await session.commit()
+                    logger.info(
+                        "🎁 [Ranking] GetMyRankV1 granted %d milestone reward(s) to %s (rank %d)",
+                        granted,
+                        player_id,
+                        rank,
+                    )
             return response
 
     async def GetRankInfosV1(
@@ -1166,6 +1208,32 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
             higher_count = (await session.execute(higher_stmt)).scalar() or 0
             rank = higher_count + 1
 
+            # Check and grant GPX class and group milestone rewards
+            class_map = await self._batch_get_player_class_ids(
+                session, [player_id], {player_id: final_score}
+            )
+            cid_str = class_map.get(player_id, "1")
+            class_id = int(cid_str) if str(cid_str).isdigit() and int(cid_str) > 0 else 1
+            group_rank = min(rank, 20) if rank > 0 else 1
+
+            granted = await check_and_grant_gpx_milestones(
+                session,
+                player_id,
+                grand_prix_rank=rank,
+                group_rank=group_rank,
+                class_id=class_id,
+            )
+            if granted > 0:
+                await session.commit()
+                logger.info(
+                    "🎁 [ScoreRanking] Granted %d GPX milestone reward(s) to %s (rank %d, group %d, class %d)",
+                    granted,
+                    player_id,
+                    rank,
+                    group_rank,
+                    class_id,
+                )
+
         response = score_ranking_pb2.ScoreRankingRegisterV1.Response()
         response.score = final_score
         response.rank = rank
@@ -1177,7 +1245,15 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         context: grpc.aio.ServicerContext,
     ) -> score_ranking_pb2.ScoreRankingReceiveClassPrizeV1.Response:
         logger.info("🏅 [ScoreRanking] ReceiveClassPrizeV1")
-        # Empty response indicates no unclaimed prizes for completed periods
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player_id = await self._resolve_player_id(session, get_current_player_id())
+            ranking_key = "gpx_s1_p1005"
+            granted = await check_and_grant_gpx_milestones_for_player(
+                session, player_id=player_id, ranking_key=ranking_key
+            )
+            if granted > 0:
+                await session.commit()
         return score_ranking_pb2.ScoreRankingReceiveClassPrizeV1.Response()
 
     async def ReceiveGrandPrixPrizeV1(
@@ -1186,6 +1262,15 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         context: grpc.aio.ServicerContext,
     ) -> score_ranking_pb2.ScoreRankingReceiveGrandPrixPrizeV1.Response:
         logger.info("🏅 [ScoreRanking] ReceiveGrandPrixPrizeV1")
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            player_id = await self._resolve_player_id(session, get_current_player_id())
+            ranking_key = "gpx_s1_p1005"
+            granted = await check_and_grant_gpx_milestones_for_player(
+                session, player_id=player_id, ranking_key=ranking_key
+            )
+            if granted > 0:
+                await session.commit()
         return score_ranking_pb2.ScoreRankingReceiveGrandPrixPrizeV1.Response()
 
 
