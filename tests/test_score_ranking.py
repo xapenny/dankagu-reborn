@@ -40,7 +40,9 @@ async def test_score_ranking_lifecycle_and_batch_queries() -> None:
     assert found
 
     # 4. Probing past end (fast cache path)
-    probe_req = score_ranking_pb2.ScoreRankingGetGrandPrixLeaderBoardV1.Request(start=100000, count=1)
+    probe_req = score_ranking_pb2.ScoreRankingGetGrandPrixLeaderBoardV1.Request(
+        start=100000, count=1
+    )
     probe_res = await service.GetGrandPrixLeaderBoardV1(probe_req, ctx)  # type: ignore[arg-type]
     assert len(probe_res.player_rank_infos) == 0
 

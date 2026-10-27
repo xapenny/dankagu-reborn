@@ -1170,6 +1170,7 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         response.score = final_score
         response.rank = rank
         return response
+
     async def ReceiveClassPrizeV1(
         self,
         request: score_ranking_pb2.ScoreRankingReceiveClassPrizeV1.Request,
