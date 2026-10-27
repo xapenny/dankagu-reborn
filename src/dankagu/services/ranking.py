@@ -5,7 +5,7 @@ import logging
 import time
 
 import grpc
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.session import get_current_player_id
@@ -409,6 +409,11 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
     DEFAULT_GROUP_ID = "d5c0c1906e8e91ec6e027edfecb9eca9"
     DEFAULT_STORAGE_KEYS = ("PlayerBase--1", "PlayerStatus--1", "PlayerPublicStatus--1")
 
+    # Fast in-memory caches to eliminate redundant roundtrips to remote PostgreSQL
+    _known_player_ids: set[str] = set()
+    _participant_counts: dict[str, tuple[int, float]] = {}
+    _COUNT_CACHE_TTL = 15.0  # seconds
+
     _EXP_BREAKPOINTS = (
         (1, 5),
         (2, 55),
@@ -508,29 +513,61 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
             }
         )
 
-    async def _attach_leaderboard_storage_entries(
+    async def _attach_leaderboard_data(
         self,
         session,
         rows: list,
-        infos: list,
+        start_rank: int,
+        target_container,
+        is_grand_prix: bool = True,
     ) -> None:
-        """Batch-load and attach PlayerStorage entries for leaderboard entries."""
+        """Batch-load PlayerStorage entries and GPX class IDs in a single query, populating rank infos."""
         if not rows:
             return
 
         player_ids = [entry.player_id for entry, _, _, _ in rows]
+
+        # Single batched SQL query to get both DEFAULT_STORAGE_KEYS and GpxInfoStatus%
         stmt = select(PlayerStorageEntry).where(
             PlayerStorageEntry.player_id.in_(player_ids),
-            PlayerStorageEntry.key.in_(self.DEFAULT_STORAGE_KEYS),
+            or_(
+                PlayerStorageEntry.key.in_(self.DEFAULT_STORAGE_KEYS),
+                PlayerStorageEntry.key.like("GpxInfoStatus%"),
+            ),
         )
         storage_rows = (await session.execute(stmt)).scalars().all()
 
         storage_by_player: dict[str, dict[str, PlayerStorageEntry]] = {}
+        class_by_player: dict[str, str] = {}
+
         for s_entry in storage_rows:
-            storage_by_player.setdefault(s_entry.player_id, {})[s_entry.key] = s_entry
+            if s_entry.key.startswith("GpxInfoStatus"):
+                cid = self._extract_last_class_id(s_entry.value)
+                if cid is not None and 1 <= cid <= 4:
+                    class_by_player[s_entry.player_id] = str(cid)
+            else:
+                storage_by_player.setdefault(s_entry.player_id, {})[s_entry.key] = s_entry
 
         now = int(time.time())
-        for (entry, nickname, name, level), info in zip(rows, infos, strict=False):
+        for i, (entry, nickname, name, level) in enumerate(rows, start=start_rank):
+            info = target_container.add()
+            info.player_id = entry.player_id
+            info.nickname = nickname or name or "Player"
+            info.level = level or 1
+            info.rank = i
+
+            if is_grand_prix:
+                info.point = entry.score // 100
+            else:
+                info.score = entry.score
+
+            # Resolve class_id
+            cid = class_by_player.get(entry.player_id)
+            if not cid:
+                cid = "4" if entry.score > 0 else "0"
+            info.class_id = cid if cid != "0" else "4"
+
+            # Attach PlayerStorage entries
             p_entries = storage_by_player.get(entry.player_id, {})
             player_name = nickname or name or "Player"
             player_level = level or 1
@@ -570,6 +607,74 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
                 pe.updated_at = now
 
             # 3. PlayerPublicStatus--1 (if present in DB)
+            if "PlayerPublicStatus--1" in p_entries:
+                pub_s = p_entries["PlayerPublicStatus--1"]
+                pe = info.player_storage_entries.add()
+                pe.player_id = pub_s.player_id
+                pe.key = pub_s.key
+                pe.value = pub_s.value
+                pe.created_at = pub_s.created_at
+                pe.updated_at = pub_s.updated_at
+
+    async def _attach_leaderboard_storage_entries(
+        self,
+        session,
+        rows: list,
+        infos: list,
+    ) -> None:
+        """Batch-load and attach PlayerStorage entries for leaderboard entries (legacy adapter)."""
+        if not rows:
+            return
+
+        player_ids = [entry.player_id for entry, _, _, _ in rows]
+        stmt = select(PlayerStorageEntry).where(
+            PlayerStorageEntry.player_id.in_(player_ids),
+            PlayerStorageEntry.key.in_(self.DEFAULT_STORAGE_KEYS),
+        )
+        storage_rows = (await session.execute(stmt)).scalars().all()
+
+        storage_by_player: dict[str, dict[str, PlayerStorageEntry]] = {}
+        for s_entry in storage_rows:
+            storage_by_player.setdefault(s_entry.player_id, {})[s_entry.key] = s_entry
+
+        now = int(time.time())
+        for (entry, nickname, name, level), info in zip(rows, infos, strict=False):
+            p_entries = storage_by_player.get(entry.player_id, {})
+            player_name = nickname or name or "Player"
+            player_level = level or 1
+
+            if "PlayerBase--1" in p_entries:
+                base_s = p_entries["PlayerBase--1"]
+                pe = info.player_storage_entries.add()
+                pe.player_id = base_s.player_id
+                pe.key = base_s.key
+                pe.value = base_s.value
+                pe.created_at = base_s.created_at
+                pe.updated_at = base_s.updated_at
+            else:
+                pe = info.player_storage_entries.add()
+                pe.player_id = entry.player_id
+                pe.key = "PlayerBase--1"
+                pe.value = self._synthesize_player_base(player_name)
+                pe.created_at = now
+                pe.updated_at = now
+
+            if "PlayerStatus--1" in p_entries:
+                status_s = p_entries["PlayerStatus--1"]
+                pe = info.player_storage_entries.add()
+                pe.player_id = status_s.player_id
+                pe.key = status_s.key
+                pe.value = status_s.value
+                pe.created_at = status_s.created_at
+                pe.updated_at = status_s.updated_at
+            else:
+                pe = info.player_storage_entries.add()
+                pe.player_id = entry.player_id
+                pe.key = "PlayerStatus--1"
+                pe.value = self._synthesize_player_status(player_level)
+                pe.created_at = now
+                pe.updated_at = now
+
             if "PlayerPublicStatus--1" in p_entries:
                 pub_s = p_entries["PlayerPublicStatus--1"]
                 pe = info.player_storage_entries.add()
@@ -651,17 +756,39 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
     async def _resolve_player_id(self, session, player_id: str | None) -> str:
         """Resolve player_id ensuring it exists in the players table to satisfy FK constraints."""
         if player_id:
+            if player_id in self._known_player_ids:
+                return player_id
             exists_stmt = select(Player.id).where(Player.id == player_id)
             if (await session.execute(exists_stmt)).scalar() is not None:
+                self._known_player_ids.add(player_id)
                 return player_id
 
         # Fall back to an existing player in DB
         fallback_stmt = select(Player.id).limit(1)
         fallback_id = (await session.execute(fallback_stmt)).scalar()
         if fallback_id:
+            self._known_player_ids.add(fallback_id)
             return fallback_id
 
         return player_id or "dankagu-reborn-user"
+
+    async def _get_total_participants(self, session, ranking_key: str) -> int:
+        now = time.monotonic()
+        cached = self._participant_counts.get(ranking_key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        count_stmt = (
+            select(func.count())
+            .select_from(EventLeaderboard)
+            .where(
+                EventLeaderboard.ranking_event_id == ranking_key,
+                EventLeaderboard.score > 0,
+            )
+        )
+        total = (await session.execute(count_stmt)).scalar() or 0
+        self._participant_counts[ranking_key] = (total, now + self._COUNT_CACHE_TTL)
+        return total
 
     async def _get_player_gpx_score(
         self, session, player_id: str, period_id: str = "1005"
@@ -689,6 +816,70 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         )
         higher_count = (await session.execute(higher_stmt)).scalar() or 0
         return entry.score, higher_count + 1
+
+    async def _batch_get_gpx_scores_and_ranks(
+        self, session, player_ids: list[str], ranking_key: str
+    ) -> dict[str, tuple[int, int]]:
+        """Batch-fetch (score, rank) for a list of player_ids."""
+        if not player_ids:
+            return {}
+
+        unique_pids = list(dict.fromkeys(player_ids))
+        stmt = select(EventLeaderboard.player_id, EventLeaderboard.score).where(
+            EventLeaderboard.ranking_event_id == ranking_key,
+            EventLeaderboard.player_id.in_(unique_pids),
+        )
+        score_rows = (await session.execute(stmt)).all()
+        scores_map = dict(score_rows)
+
+        result: dict[str, tuple[int, int]] = {}
+        for pid in unique_pids:
+            score = scores_map.get(pid, 0)
+            if score <= 0:
+                result[pid] = (0, 0)
+            else:
+                higher_stmt = (
+                    select(func.count())
+                    .select_from(EventLeaderboard)
+                    .where(
+                        EventLeaderboard.ranking_event_id == ranking_key,
+                        EventLeaderboard.score > score,
+                    )
+                )
+                rank = ((await session.execute(higher_stmt)).scalar() or 0) + 1
+                result[pid] = (score, rank)
+
+        return result
+
+    async def _batch_get_player_class_ids(
+        self, session, player_ids: list[str], scores_map: dict[str, int]
+    ) -> dict[str, str]:
+        """Batch-fetch GPX class IDs for player_ids."""
+        if not player_ids:
+            return {}
+
+        unique_pids = list(dict.fromkeys(player_ids))
+        stmt = select(PlayerStorageEntry.player_id, PlayerStorageEntry.value).where(
+            PlayerStorageEntry.player_id.in_(unique_pids),
+            PlayerStorageEntry.key.like("GpxInfoStatus%"),
+        )
+        storage_rows = (await session.execute(stmt)).all()
+
+        class_map: dict[str, str] = {}
+        for pid, val in storage_rows:
+            last_class_id = self._extract_last_class_id(val)
+            if last_class_id is not None and 1 <= last_class_id <= 4:
+                class_map[pid] = str(last_class_id)
+
+        result: dict[str, str] = {}
+        for pid in unique_pids:
+            if pid in class_map:
+                result[pid] = class_map[pid]
+            elif scores_map.get(pid, 0) > 0:
+                result[pid] = "4"
+            else:
+                result[pid] = "0"
+        return result
 
     async def GetAvailableV1(
         self,
@@ -748,14 +939,20 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         start = max(1, request.start)
         count = request.count if request.count > 0 else 50
         offset = start - 1
+        ranking_key = "gpx_s1_p1005"
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            # Fast check: If offset exceeds total registered participants, return immediately
+            total = await self._get_total_participants(session, ranking_key)
+            if offset >= total:
+                return response
+
             stmt = (
                 select(EventLeaderboard, Player.nickname, Player.name, Player.level)
                 .outerjoin(Player, EventLeaderboard.player_id == Player.id)
                 .where(
-                    EventLeaderboard.ranking_event_id == "gpx_s1_p1005",
+                    EventLeaderboard.ranking_event_id == ranking_key,
                     EventLeaderboard.score > 0,
                 )
                 .order_by(EventLeaderboard.score.desc(), EventLeaderboard.updated_at.asc())
@@ -763,19 +960,12 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
                 .limit(count)
             )
             rows = (await session.execute(stmt)).all()
+            if not rows:
+                return response
 
-            for i, (entry, nickname, name, level) in enumerate(rows, start=start):
-                info = response.player_rank_infos.add()
-                info.player_id = entry.player_id
-                info.nickname = nickname or name or "Player"
-                info.level = level or 1
-                class_id = await self._get_player_class_id(session, entry.player_id, entry.score)
-                info.class_id = class_id if class_id != "0" else "4"
-                info.rank = i
-                info.point = entry.score // 100
-
-            await self._attach_leaderboard_storage_entries(
-                session, rows, list(response.player_rank_infos)
+            # Unified batched storage and class_id fetch in ONE query
+            await self._attach_leaderboard_data(
+                session, rows, start, response.player_rank_infos, is_grand_prix=True
             )
 
         return response
@@ -795,14 +985,20 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         start = max(1, request.start)
         count = request.count if request.count > 0 else 50
         offset = start - 1
+        ranking_key = "gpx_s1_p1005"
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            # Fast check: If offset exceeds total registered participants, return immediately
+            total = await self._get_total_participants(session, ranking_key)
+            if offset >= total:
+                return response
+
             stmt = (
                 select(EventLeaderboard, Player.nickname, Player.name, Player.level)
                 .outerjoin(Player, EventLeaderboard.player_id == Player.id)
                 .where(
-                    EventLeaderboard.ranking_event_id == "gpx_s1_p1005",
+                    EventLeaderboard.ranking_event_id == ranking_key,
                     EventLeaderboard.score > 0,
                 )
                 .order_by(EventLeaderboard.score.desc(), EventLeaderboard.updated_at.asc())
@@ -810,19 +1006,12 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
                 .limit(count)
             )
             rows = (await session.execute(stmt)).all()
+            if not rows:
+                return response
 
-            for i, (entry, nickname, name, level) in enumerate(rows, start=start):
-                info = response.player_rank_infos.add()
-                info.player_id = entry.player_id
-                info.nickname = nickname or name or "Player"
-                info.level = level or 1
-                class_id = await self._get_player_class_id(session, entry.player_id, entry.score)
-                info.class_id = class_id if class_id != "0" else "4"
-                info.rank = i
-                info.score = entry.score
-
-            await self._attach_leaderboard_storage_entries(
-                session, rows, list(response.player_rank_infos)
+            # Unified batched storage and class_id fetch in ONE query
+            await self._attach_leaderboard_data(
+                session, rows, start, response.player_rank_infos, is_grand_prix=False
             )
 
         return response
@@ -839,8 +1028,10 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         async with session_factory() as session:
             current_pid = await self._resolve_player_id(session, get_current_player_id())
             target_pids = list(request.player_ids) or [current_pid]
+            data = await self._batch_get_gpx_scores_and_ranks(session, target_pids, "gpx_s1_p1005")
+
             for pid in target_pids:
-                score, rank = await self._get_player_gpx_score(session, pid, "1005")
+                score, rank = data.get(pid, (0, 0))
                 info = response.player_grand_prix_rank_infos.add()
                 info.player_id = pid
                 info.rank = rank if score > 0 else 0
@@ -861,8 +1052,12 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         async with session_factory() as session:
             current_pid = await self._resolve_player_id(session, get_current_player_id())
             target_pids = list(request.player_ids) or [current_pid]
+            data = await self._batch_get_gpx_scores_and_ranks(
+                session, target_pids, f"gpx_s1_p{period_id}"
+            )
+
             for pid in target_pids:
-                score, rank = await self._get_player_gpx_score(session, pid, period_id)
+                score, rank = data.get(pid, (0, 0))
                 info = response.player_class_group_rank_infos.add()
                 info.player_id = pid
                 info.rank = rank if score > 0 else 0
@@ -883,9 +1078,21 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         async with session_factory() as session:
             current_pid = await self._resolve_player_id(session, get_current_player_id())
             target_pids = list(request.player_ids) or [current_pid]
+            ranking_key = f"gpx_s1_p{period_id}"
+
+            unique_pids = list(dict.fromkeys(target_pids))
+            stmt = select(EventLeaderboard.player_id, EventLeaderboard.score).where(
+                EventLeaderboard.ranking_event_id == ranking_key,
+                EventLeaderboard.player_id.in_(unique_pids),
+            )
+            score_rows = (await session.execute(stmt)).all()
+            scores_map = dict(score_rows)
+
+            class_map = await self._batch_get_player_class_ids(session, target_pids, scores_map)
+
             for pid in target_pids:
-                score, _ = await self._get_player_gpx_score(session, pid, period_id)
-                class_id = await self._get_player_class_id(session, pid, score)
+                score = scores_map.get(pid, 0)
+                class_id = class_map.get(pid, "0")
                 pclass = response.player_classes.add()
                 pclass.player_id = pid
                 pclass.class_id = class_id
@@ -945,6 +1152,9 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
                 final_score = entry.score
             await session.commit()
 
+            # Invalidate cached participant count on score update
+            self._participant_counts.pop(ranking_key, None)
+
             higher_stmt = (
                 select(func.count())
                 .select_from(EventLeaderboard)
@@ -960,7 +1170,6 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         response.score = final_score
         response.rank = rank
         return response
-
     async def ReceiveClassPrizeV1(
         self,
         request: score_ranking_pb2.ScoreRankingReceiveClassPrizeV1.Request,
