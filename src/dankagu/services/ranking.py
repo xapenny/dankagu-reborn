@@ -1031,10 +1031,12 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            # Fast check: If offset exceeds total registered participants, return immediately
-            total = await self._get_total_participants(session, ranking_key)
-            if offset >= total:
-                return response
+            current_pid = await self._resolve_player_id(session, get_current_player_id())
+            # Determine caller's class_id to filter the group leaderboard
+            score, _ = await self._get_player_gpx_score(session, current_pid, "1005")
+            caller_class_id = await self._get_player_class_id(session, current_pid, score)
+            if caller_class_id == "0":
+                caller_class_id = "4"
 
             stmt = (
                 select(EventLeaderboard, Player.nickname, Player.name, Player.level)
@@ -1044,16 +1046,26 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
                     EventLeaderboard.score > 0,
                 )
                 .order_by(EventLeaderboard.score.desc(), EventLeaderboard.updated_at.asc())
-                .offset(offset)
-                .limit(count)
             )
-            rows = (await session.execute(stmt)).all()
-            if not rows:
+            all_rows = (await session.execute(stmt)).all()
+            if not all_rows:
                 return response
 
-            # Unified batched storage and class_id fetch in ONE query
+            all_pids = [entry.player_id for entry, _, _, _ in all_rows]
+            scores_map = {entry.player_id: entry.score for entry, _, _, _ in all_rows}
+            class_map = await self._batch_get_player_class_ids(session, all_pids, scores_map)
+
+            # Filter rows to only players in caller's class
+            class_rows = [
+                row for row in all_rows if class_map.get(row[0].player_id, "4") == caller_class_id
+            ]
+
+            if offset >= len(class_rows):
+                return response
+
+            page_rows = class_rows[offset : offset + count]
             await self._attach_leaderboard_data(
-                session, rows, start, response.player_rank_infos, is_grand_prix=False
+                session, page_rows, start, response.player_rank_infos, is_grand_prix=False
             )
 
         return response
@@ -1094,15 +1106,47 @@ class ScoreRankingService(score_ranking_pb2_grpc.ScoreRankingServicer):
         async with session_factory() as session:
             current_pid = await self._resolve_player_id(session, get_current_player_id())
             target_pids = list(request.player_ids) or [current_pid]
-            data = await self._batch_get_gpx_scores_and_ranks(
-                session, target_pids, f"gpx_s1_p{period_id}"
+            ranking_key = f"gpx_s1_p{period_id}"
+
+            scores_and_ranks = await self._batch_get_gpx_scores_and_ranks(
+                session, target_pids, ranking_key
+            )
+            scores_map = {pid: sr[0] for pid, sr in scores_and_ranks.items()}
+            target_classes = await self._batch_get_player_class_ids(
+                session, target_pids, scores_map
             )
 
+            # Fetch all participants to compute accurate rank within the class
+            all_stmt = (
+                select(EventLeaderboard.player_id, EventLeaderboard.score)
+                .where(
+                    EventLeaderboard.ranking_event_id == ranking_key,
+                    EventLeaderboard.score > 0,
+                )
+                .order_by(EventLeaderboard.score.desc(), EventLeaderboard.updated_at.asc())
+            )
+            all_participants = (await session.execute(all_stmt)).all()
+            all_pids = [p[0] for p in all_participants]
+            all_scores_map = dict(all_participants)
+            all_classes = await self._batch_get_player_class_ids(session, all_pids, all_scores_map)
+
             for pid in target_pids:
-                score, rank = data.get(pid, (0, 0))
+                score = scores_map.get(pid, 0)
+                cid = target_classes.get(pid, "4")
+                if score <= 0:
+                    rank = 0
+                else:
+                    higher_in_class = sum(
+                        1
+                        for other_pid, other_score in all_participants
+                        if other_score > score and all_classes.get(other_pid, "4") == cid
+                    )
+                    class_rank = higher_in_class + 1
+                    rank = min(class_rank, 20)
+
                 info = response.player_class_group_rank_infos.add()
                 info.player_id = pid
-                info.rank = rank if score > 0 else 0
+                info.rank = rank
                 info.score = score
 
         return response

@@ -60,6 +60,46 @@ def encode_player_status(fields: dict[int, int]) -> bytes:
     return bytes(buf)
 
 
+async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
+    """Self-healing migration for ranking reward items created with search_label='rank_rew:...'."""
+    legacy_stmt = select(PlayerInventoryItem).where(
+        PlayerInventoryItem.player_id == player_id,
+        PlayerInventoryItem.search_label.like("rank_rew:%"),
+    )
+    legacy_items = (await session.execute(legacy_stmt)).scalars().all()
+    if legacy_items:
+        for leg_item in legacy_items:
+            prefix = ""
+            try:
+                val_dict = json.loads(leg_item.value.decode("utf-8"))
+                prefix = str(val_dict.get("Prefix", ""))
+            except Exception:
+                pass
+            if not leg_item.system_resource_name or not leg_item.system_resource_name.startswith(
+                "rank_rew:"
+            ):
+                leg_item.system_resource_name = (
+                    f"{leg_item.search_label}#{leg_item.system_resource_name}"
+                )
+            if prefix in ("VC", "VirtualCurrency", "Stone"):
+                leg_item.search_label = "VC"
+                leg_item.schema_key = "VC"
+            elif prefix == "Coin":
+                leg_item.search_label = "Coin"
+            elif prefix == "Card":
+                leg_item.search_label = "Card"
+            elif prefix in ("GachaTicket", "GachaTicketExchange"):
+                leg_item.search_label = "GachaTicket"
+            elif prefix == "SelectTicket":
+                leg_item.search_label = "SelectTicket"
+            elif prefix == "Emblem":
+                leg_item.search_label = "Other"
+                leg_item.schema_key = "EVENT_EMBLEM_DIRECT"
+            else:
+                leg_item.search_label = "Item"
+        await session.commit()
+
+
 class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
     """Servicer for player inventory items and receiving rewards."""
 
@@ -88,6 +128,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            await heal_legacy_ranking_reward_items(session, current_pid)
             stmt = select(PlayerInventoryItem).where(
                 PlayerInventoryItem.player_id == current_pid,
                 PlayerInventoryItem.is_claimed == False,  # noqa: E712
@@ -147,6 +188,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            await heal_legacy_ranking_reward_items(session, current_pid)
             base_filters = [
                 PlayerInventoryItem.player_id == current_pid,
                 PlayerInventoryItem.is_claimed == False,  # noqa: E712

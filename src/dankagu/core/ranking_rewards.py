@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.models.inventory import PlayerInventoryItem
@@ -899,6 +899,34 @@ CLASS_NAMES: dict[int, str] = {
 }
 
 
+def get_inventory_search_label(it_prefix: str) -> str:
+    """Return authentic client SearchLabel for present box tabs."""
+    if it_prefix in ("VC", "VirtualCurrency", "Stone"):
+        return "VC"
+    elif it_prefix == "Coin":
+        return "Coin"
+    elif it_prefix == "Card":
+        return "Card"
+    elif it_prefix in ("GachaTicket", "GachaTicketExchange"):
+        return "GachaTicket"
+    elif it_prefix == "SelectTicket":
+        return "SelectTicket"
+    elif it_prefix == "Emblem":
+        return "Other"
+    else:
+        return "Item"
+
+
+def get_inventory_schema_key(it_prefix: str) -> str:
+    """Return authentic schema key for AppItemInfoBuilder.Build."""
+    if it_prefix in ("VC", "VirtualCurrency", "Stone"):
+        return "VC"
+    elif it_prefix == "Emblem":
+        return "EVENT_EMBLEM_DIRECT"
+    else:
+        return "ITEM"
+
+
 async def check_and_grant_event_ranking_milestones(
     session: AsyncSession,
     player_id: str,
@@ -934,12 +962,20 @@ async def check_and_grant_event_ranking_milestones(
 
     candidate_labels = [f"rank_rew:{category_code}:tier_{t['tier_id']}" for t in eligible_tiers]
 
-    # 2. Check already granted labels
-    stmt = select(PlayerInventoryItem.search_label).where(
+    # 2. Check already granted labels via system_resource_name or legacy search_label
+    stmt = select(PlayerInventoryItem.system_resource_name, PlayerInventoryItem.search_label).where(
         PlayerInventoryItem.player_id == player_id,
-        PlayerInventoryItem.search_label.in_(candidate_labels),
+        or_(
+            PlayerInventoryItem.system_resource_name.like(f"rank_rew:{category_code}:tier_%"),
+            PlayerInventoryItem.search_label.in_(candidate_labels),
+        ),
     )
-    existing_labels = set((await session.execute(stmt)).scalars().all())
+    existing_labels = set()
+    for sys_name, s_label in (await session.execute(stmt)).all():
+        if sys_name and sys_name.startswith(f"rank_rew:{category_code}:tier_"):
+            existing_labels.add(sys_name.split("#")[0])
+        if s_label and s_label.startswith(f"rank_rew:{category_code}:tier_"):
+            existing_labels.add(s_label)
 
     # 3. Grant ungranted tiers
     now = int(time.time())
@@ -965,14 +1001,14 @@ async def check_and_grant_event_ranking_milestones(
                 id=str(uuid.uuid4()),
                 player_id=player_id,
                 item_type=item_type,
-                schema_key="ITEM",
+                schema_key=get_inventory_schema_key(it_prefix),
                 value=val_bytes,
                 route=4,  # Route.Achievement
                 message=msg,
-                search_label=tier_label,
+                search_label=get_inventory_search_label(it_prefix),
                 opened_at=now,
                 expired_at=now + 86400 * 90,
-                system_resource_name=f"{it_prefix}_{it_id}",
+                system_resource_name=f"{tier_label}#{it_prefix}_{it_id}",
                 system_resource_num=it_cnt,
                 is_claimed=False,
                 created_at=now,
@@ -1002,11 +1038,16 @@ async def check_and_grant_gpx_milestones(
 
     # 1. Check Class Tier milestone (e.g. reaching Platinum / Gold / Silver / Bronze)
     class_label = f"rank_rew:gpx_class:c{class_id}"
-    class_stmt = select(PlayerInventoryItem.search_label).where(
+    class_stmt = select(
+        PlayerInventoryItem.system_resource_name, PlayerInventoryItem.search_label
+    ).where(
         PlayerInventoryItem.player_id == player_id,
-        PlayerInventoryItem.search_label == class_label,
+        or_(
+            PlayerInventoryItem.system_resource_name.like(f"{class_label}%"),
+            PlayerInventoryItem.search_label == class_label,
+        ),
     )
-    already_class = (await session.execute(class_stmt)).scalars().first()
+    already_class = (await session.execute(class_stmt)).first() is not None
 
     if not already_class:
         for ct in GPX_CLASS_TIERS:
@@ -1020,14 +1061,14 @@ async def check_and_grant_gpx_milestones(
                         id=str(uuid.uuid4()),
                         player_id=player_id,
                         item_type=item_type,
-                        schema_key="ITEM",
+                        schema_key=get_inventory_schema_key(it_prefix),
                         value=val_bytes,
                         route=4,  # Route.Achievement
                         message=f"【メドレーグランプリ】クラス「{class_name}」達成報酬！",
-                        search_label=class_label,
+                        search_label=get_inventory_search_label(it_prefix),
                         opened_at=now,
                         expired_at=now + 86400 * 90,
-                        system_resource_name=f"{it_prefix}_{it_id}",
+                        system_resource_name=f"{class_label}#{it_prefix}_{it_id}",
                         system_resource_num=it_cnt,
                         is_claimed=False,
                         created_at=now,
@@ -1044,11 +1085,24 @@ async def check_and_grant_gpx_milestones(
             candidate_labels = [
                 f"rank_rew:gpx_group_c{class_id}:tier_{t['tier_id']}" for t in eligible_group_tiers
             ]
-            stmt = select(PlayerInventoryItem.search_label).where(
+            stmt = select(
+                PlayerInventoryItem.system_resource_name, PlayerInventoryItem.search_label
+            ).where(
                 PlayerInventoryItem.player_id == player_id,
-                PlayerInventoryItem.search_label.in_(candidate_labels),
+                or_(
+                    PlayerInventoryItem.system_resource_name.like(
+                        f"rank_rew:gpx_group_c{class_id}:tier_%"
+                    ),
+                    PlayerInventoryItem.search_label.in_(candidate_labels),
+                ),
             )
-            existing_labels = set((await session.execute(stmt)).scalars().all())
+            rows = (await session.execute(stmt)).all()
+            existing_labels = set()
+            for sys_name, s_label in rows:
+                if sys_name and sys_name.startswith(f"rank_rew:gpx_group_c{class_id}:tier_"):
+                    existing_labels.add(sys_name.split("#")[0])
+                if s_label and s_label.startswith(f"rank_rew:gpx_group_c{class_id}:tier_"):
+                    existing_labels.add(s_label)
 
             for tier in eligible_group_tiers:
                 tier_label = f"rank_rew:gpx_group_c{class_id}:tier_{tier['tier_id']}"
@@ -1066,14 +1120,14 @@ async def check_and_grant_gpx_milestones(
                         id=str(uuid.uuid4()),
                         player_id=player_id,
                         item_type=item_type,
-                        schema_key="ITEM",
+                        schema_key=get_inventory_schema_key(it_prefix),
                         value=val_bytes,
                         route=4,  # Route.Achievement
                         message=f"【メドレーグランプリ】{class_name}グループ{rank_str}達成報酬！",
-                        search_label=tier_label,
+                        search_label=get_inventory_search_label(it_prefix),
                         opened_at=now,
                         expired_at=now + 86400 * 90,
-                        system_resource_name=f"{it_prefix}_{it_id}",
+                        system_resource_name=f"{tier_label}#{it_prefix}_{it_id}",
                         system_resource_num=it_cnt,
                         is_claimed=False,
                         created_at=now,

@@ -64,7 +64,7 @@ async def test_event_score_ranking_instant_milestones() -> None:
             select(PlayerInventoryItem)
             .where(
                 PlayerInventoryItem.player_id == pid,
-                PlayerInventoryItem.search_label.like("rank_rew:score38:%"),
+                PlayerInventoryItem.system_resource_name.like("rank_rew:score38:%"),
             )
             .order_by(PlayerInventoryItem.created_at.asc())
         )
@@ -74,14 +74,17 @@ async def test_event_score_ranking_instant_milestones() -> None:
         # all 12 milestone tiers should be granted!
         assert len(items) == 12
 
-        labels = {it.search_label for it in items}
+        labels = {it.system_resource_name.split("#")[0] for it in items}
         # Verify specific tiers exist
         assert "rank_rew:score38:tier_1" in labels
         assert "rank_rew:score38:tier_2" in labels
         assert "rank_rew:score38:tier_12" in labels
 
         # Check Tier 1 reward contains exclusive Rank 1 Emblem 3003801
-        tier1_item = next(it for it in items if it.search_label == "rank_rew:score38:tier_1")
+        tier1_item = next(
+            it for it in items if it.system_resource_name.startswith("rank_rew:score38:tier_1")
+        )
+        assert tier1_item.search_label in ("Other", "Item")
         data = json.loads(tier1_item.value.decode("utf-8"))
         assert data["Prefix"] == "Emblem"
         assert data["Value"] == 3003801
@@ -99,7 +102,7 @@ async def test_event_score_ranking_instant_milestones() -> None:
     async with session_factory() as session:
         count_stmt = select(PlayerInventoryItem).where(
             PlayerInventoryItem.player_id == pid,
-            PlayerInventoryItem.search_label.like("rank_rew:score38:%"),
+            PlayerInventoryItem.system_resource_name.like("rank_rew:score38:%"),
         )
         count_items = (await session.execute(count_stmt)).scalars().all()
         assert len(count_items) == 12  # Still exactly 12 items!
@@ -130,7 +133,7 @@ async def test_event_point_ranking_milestones_and_claim() -> None:
     async with session_factory() as session:
         stmt = select(PlayerInventoryItem).where(
             PlayerInventoryItem.player_id == pid,
-            PlayerInventoryItem.search_label.like("rank_rew:point38:%"),
+            PlayerInventoryItem.system_resource_name.like("rank_rew:point38:%"),
         )
         items = (await session.execute(stmt)).scalars().all()
         assert len(items) > 0
@@ -139,9 +142,10 @@ async def test_event_point_ranking_milestones_and_claim() -> None:
         card_items = [
             it
             for it in items
-            if "Card" in it.system_resource_name or "Growth" in it.system_resource_name
+            if "#Card_" in it.system_resource_name or "#Growth_" in it.system_resource_name
         ]
         assert len(card_items) > 0
+        assert any(it.search_label == "Card" for it in card_items)
         item_ids_to_receive = [it.id for it in items[:5]]
 
     # Claim items through PlayerInventoryService
@@ -185,10 +189,11 @@ async def test_gpx_class_and_group_instant_milestones() -> None:
         # 1. Check Class milestone (Class 4 Bronze milestone granted)
         c_stmt = select(PlayerInventoryItem).where(
             PlayerInventoryItem.player_id == pid,
-            PlayerInventoryItem.search_label == "rank_rew:gpx_class:c4",
+            PlayerInventoryItem.system_resource_name.like("rank_rew:gpx_class:c4%"),
         )
         class_item = (await session.execute(c_stmt)).scalars().first()
         assert class_item is not None
+        assert class_item.search_label == "VC"
         c_val = json.loads(class_item.value.decode("utf-8"))
         assert c_val["Prefix"] in ("VC", "VirtualCurrency", "Stone")
         assert c_val["Count"] == 1500  # 1500 VC stones for Bronze tier
@@ -196,11 +201,12 @@ async def test_gpx_class_and_group_instant_milestones() -> None:
         # 2. Check Group rank milestones (Group rank in Class 4)
         g_stmt = select(PlayerInventoryItem).where(
             PlayerInventoryItem.player_id == pid,
-            PlayerInventoryItem.search_label.like("rank_rew:gpx_group_c4:%"),
+            PlayerInventoryItem.system_resource_name.like("rank_rew:gpx_group_c4:%"),
         )
         group_items = (await session.execute(g_stmt)).scalars().all()
         # All tiers matching rank are granted
         assert len(group_items) >= 15
+        assert all(it.search_label in ("VC", "Item", "Coin", "Other", "Card") for it in group_items)
 
     # 3. Test ReceiveClassPrizeV1 RPC also returns success idempotently
     prize_req = score_ranking_pb2.ScoreRankingReceiveClassPrizeV1.Request()
@@ -313,9 +319,213 @@ async def test_player_storage_auto_sync_gpx_and_event_milestones() -> None:
         assert len(all_mailbox) > 0
 
         # Confirm both GPX and Event items exist in mailbox
-        has_gpx = any(it.search_label.startswith("rank_rew:gpx_") for it in all_mailbox)
-        has_ev = any(it.search_label.startswith("rank_rew:point38:") for it in all_mailbox)
+        has_gpx = any(it.system_resource_name.startswith("rank_rew:gpx_") for it in all_mailbox)
+        has_ev = any(it.system_resource_name.startswith("rank_rew:point38:") for it in all_mailbox)
         assert has_gpx
         assert has_ev
 
     reset_current_player(tokens)
+
+
+@pytest.mark.asyncio
+async def test_mailbox_filtering_and_legacy_healing() -> None:
+    """Legacy items with search_label='rank_rew:...' are auto-migrated so client tab filtering finds them."""
+    pid = f"test-heal-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="HealTester")
+    tokens = set_current_player(pid)
+    ctx = MockContext()
+
+    now = int(time.time())
+    session_factory = get_sessionmaker()
+
+    # 1. Seed legacy items directly into PlayerInventoryItem with search_label = "rank_rew:..."
+    async with session_factory() as session:
+        legacy_vc = PlayerInventoryItem(
+            id=str(uuid.uuid4()),
+            player_id=pid,
+            item_type=1,
+            schema_key="VC",
+            value=json.dumps({"Prefix": "VC", "Value": 90001, "Count": 1000}).encode("utf-8"),
+            route=4,
+            message="【メドレーグランプリ】グループ第1位達成報酬！",
+            search_label="rank_rew:gpx_group_c4:tier_1",
+            opened_at=now,
+            expired_at=now + 86400 * 90,
+            system_resource_name="FREE_STONE",
+            system_resource_num=1000,
+            is_claimed=False,
+            created_at=now,
+        )
+        legacy_item = PlayerInventoryItem(
+            id=str(uuid.uuid4()),
+            player_id=pid,
+            item_type=0,
+            schema_key="ITEM",
+            value=json.dumps({"Prefix": "GenericItem", "Value": 70010, "Count": 2500}).encode(
+                "utf-8"
+            ),
+            route=4,
+            message="【メドレーグランプリ】グループ第1位達成報酬！",
+            search_label="rank_rew:gpx_group_c4:tier_1",
+            opened_at=now,
+            expired_at=now + 86400 * 90,
+            system_resource_name="ITEM",
+            system_resource_num=2500,
+            is_claimed=False,
+            created_at=now,
+        )
+        session.add(legacy_vc)
+        session.add(legacy_item)
+        await session.commit()
+
+    inv_svc = PlayerInventoryService()
+
+    # 2. Client calls GetInventoriesV1 with search_labels used by PresentService
+    client_search_labels = ["VC", "Card", "Item", "Coin", "SelectTicket", "GachaTicket", "Other"]
+    req = player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request()
+    req.criterion.search_labels.extend(client_search_labels)
+    resp = await inv_svc.GetInventoriesV1(req, ctx)  # type: ignore[arg-type]
+
+    # Both items must be found because heal_legacy_ranking_reward_items migrated their search_labels!
+    resp_ids = {inv.id for inv in resp.inventories}
+    assert legacy_vc.id in resp_ids
+    assert legacy_item.id in resp_ids
+
+    # 3. Check DB to ensure search_label was permanently healed and milestone key preserved
+    async with session_factory() as session:
+        healed_vc = (
+            await session.execute(
+                select(PlayerInventoryItem).where(PlayerInventoryItem.id == legacy_vc.id)
+            )
+        ).scalar_one()
+        assert healed_vc.search_label == "VC"
+        assert healed_vc.system_resource_name.startswith("rank_rew:gpx_group_c4:tier_1")
+
+        healed_item = (
+            await session.execute(
+                select(PlayerInventoryItem).where(PlayerInventoryItem.id == legacy_item.id)
+            )
+        ).scalar_one()
+        assert healed_item.search_label == "Item"
+        assert healed_item.system_resource_name.startswith("rank_rew:gpx_group_c4:tier_1")
+
+    reset_current_player(tokens)
+
+
+@pytest.mark.asyncio
+async def test_class_group_leaderboard_isolated_by_class() -> None:
+    """ClassGroup leaderboard only returns players in caller's class, while GrandPrix returns all."""
+    from google.protobuf.internal import encoder
+
+    ctx = MockContext()
+
+    # Create Player Bronze (Class 4)
+    pid_bronze = f"test-bronze-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid_bronze, nickname="BronzePlayer")
+    tok_bronze = set_current_player(pid_bronze)
+
+    storage_svc = PlayerStorageService()
+    now = int(time.time())
+
+    # Set GpxInfoStatus with lastClassID = 4 (Bronze)
+    gpx_b = bytearray()
+    gpx_b += encoder._VarintBytes((1 << 3) | 0) + encoder._VarintBytes(1)
+    gpx_b += encoder._VarintBytes((6 << 3) | 0) + encoder._VarintBytes(4)  # Class 4
+
+    req_b = player_storage_pb2.PlayerStorageSetEntriesV2.Request(next_revision="rev_b")
+    eb = req_b.entries.add()
+    eb.key = "GpxInfoStatus-V1-1"
+    eb.value = bytes(gpx_b)
+    eb.created_at = now
+    eb.updated_at = now
+    await storage_svc.SetEntriesV2(req_b, ctx)  # type: ignore[arg-type]
+
+    # Register score 3,000,000 for Bronze
+    gpx_svc = ScoreRankingService()
+    await gpx_svc.RegisterV1(
+        score_ranking_pb2.ScoreRankingRegisterV1.Request(score=3000000),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    # Create Player Platinum (Class 1)
+    pid_plat = f"test-plat-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid_plat, nickname="PlatPlayer")
+    tok_plat = set_current_player(pid_plat)
+
+    # Set GpxInfoStatus with lastClassID = 1 (Platinum)
+    gpx_p = bytearray()
+    gpx_p += encoder._VarintBytes((1 << 3) | 0) + encoder._VarintBytes(1)
+    gpx_p += encoder._VarintBytes((6 << 3) | 0) + encoder._VarintBytes(1)  # Class 1
+
+    req_p = player_storage_pb2.PlayerStorageSetEntriesV2.Request(next_revision="rev_p")
+    ep = req_p.entries.add()
+    ep.key = "GpxInfoStatus-V1-1"
+    ep.value = bytes(gpx_p)
+    ep.created_at = now
+    ep.updated_at = now
+    await storage_svc.SetEntriesV2(req_p, ctx)  # type: ignore[arg-type]
+
+    # Register score 6,000,000 for Platinum
+    await gpx_svc.RegisterV1(
+        score_ranking_pb2.ScoreRankingRegisterV1.Request(score=6000000),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    # 1. Check Bronze Player's Class Group Leaderboard
+    set_current_player(pid_bronze)
+    bronze_group_lb = await gpx_svc.GetClassGroupLeaderBoardV1(
+        score_ranking_pb2.ScoreRankingGetClassGroupLeaderBoardV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    bronze_group_pids = [entry.player_id for entry in bronze_group_lb.player_rank_infos]
+    assert pid_bronze in bronze_group_pids
+    assert pid_plat not in bronze_group_pids  # Platinum player is NOT in Bronze group!
+
+    # Bronze Player's Class Group Rank is 1 (within Bronze)
+    bronze_group_rank = await gpx_svc.GetClassGroupRankV1(
+        score_ranking_pb2.ScoreRankingGetClassGroupRankV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(bronze_group_rank.player_class_group_rank_infos) > 0
+    assert bronze_group_rank.player_class_group_rank_infos[0].rank == 1
+
+    # 2. Check Platinum Player's Class Group Leaderboard
+    set_current_player(pid_plat)
+    plat_group_lb = await gpx_svc.GetClassGroupLeaderBoardV1(
+        score_ranking_pb2.ScoreRankingGetClassGroupLeaderBoardV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    plat_group_pids = [entry.player_id for entry in plat_group_lb.player_rank_infos]
+    assert pid_plat in plat_group_pids
+    assert pid_bronze not in plat_group_pids  # Bronze player is NOT in Platinum group!
+
+    plat_group_rank = await gpx_svc.GetClassGroupRankV1(
+        score_ranking_pb2.ScoreRankingGetClassGroupRankV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(plat_group_rank.player_class_group_rank_infos) > 0
+    assert plat_group_rank.player_class_group_rank_infos[0].rank == 1
+
+    # 3. Check Grand Prix Leaderboard (Global across all classes)
+    set_current_player(pid_bronze)
+    global_lb = await gpx_svc.GetGrandPrixLeaderBoardV1(
+        score_ranking_pb2.ScoreRankingGetGrandPrixLeaderBoardV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    global_pids = [entry.player_id for entry in global_lb.player_rank_infos]
+    assert pid_plat in global_pids
+    assert pid_bronze in global_pids
+    # In global, Plat (6M) is #1, Bronze (3M) is #2
+    plat_entry = next(e for e in global_lb.player_rank_infos if e.player_id == pid_plat)
+    bronze_entry = next(e for e in global_lb.player_rank_infos if e.player_id == pid_bronze)
+    assert plat_entry.rank < bronze_entry.rank
+
+    bronze_global_rank = await gpx_svc.GetGrandPrixRankV1(
+        score_ranking_pb2.ScoreRankingGetGrandPrixRankV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(bronze_global_rank.player_grand_prix_rank_infos) > 0
+    assert bronze_global_rank.player_grand_prix_rank_infos[0].rank >= 2  # Behind platinum!
+
+    reset_current_player(tok_bronze)
+    reset_current_player(tok_plat)
