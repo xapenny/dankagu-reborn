@@ -927,6 +927,73 @@ def get_inventory_schema_key(it_prefix: str) -> str:
         return "ITEM"
 
 
+def extract_unlocked_emblem_ids(blob: bytes | None) -> set[int]:
+    """Extract set of unlocked emblem IDs from UnlockEntityStatusCollection--8 protobuf blob."""
+    if not blob:
+        return set()
+    unlocked: set[int] = set()
+    try:
+        from dankagu.services.box_loot_box import parse_raw_protobuf
+
+        fields = parse_raw_protobuf(blob)
+        for _, sub_raw in fields.get(2, []):
+            if isinstance(sub_raw, (bytes, bytearray)):
+                sub = parse_raw_protobuf(sub_raw)
+                uids = sub.get(4, [])
+                if uids:
+                    unlocked.add(uids[0][1])
+    except Exception:
+        pass
+    return unlocked
+
+
+def extract_stock_counts(storage_rows: list[PlayerStorageEntry]) -> dict[int, int]:
+    """Extract item stock counts from GrowthItemStock--% and ItemStockStatus--% entries."""
+    stocks: dict[int, int] = {}
+    from dankagu.services.box_loot_box import parse_raw_protobuf
+
+    for entry in storage_rows:
+        if not entry.value:
+            continue
+        try:
+            fields = parse_raw_protobuf(entry.value)
+            f1 = fields.get(1)
+            f2 = fields.get(2)
+            if f1 and f2:
+                stocks[f1[0][1]] = f2[0][1]
+        except Exception:
+            pass
+    return stocks
+
+
+def should_skip_reward_item(
+    it_prefix: str,
+    it_id: int,
+    unlocked_emblems: set[int],
+    stocks: dict[int, int],
+) -> bool:
+    """Return True if player already owns this unique item or has reached max capacity."""
+    # 1. Unique Emblems (possession limit is 1)
+    if it_prefix == "Emblem" and it_id in unlocked_emblems:
+        return True
+
+    # 2. Kaleidoscopes (possession limit is 99)
+    if it_prefix == "Growth" and it_id in (32003, 32004) and stocks.get(it_id, 0) >= 99:
+        return True
+
+    # 3. Growth Materials (possession limit is 2500)
+    if it_prefix == "Growth" and stocks.get(it_id, 0) >= 2500:
+        return True
+
+    # 4. Kaleidoscope Shards (comp_id = 13_000_000 + it_id, limit is 2500)
+    if it_prefix == "GenericItem" and it_id in (32005, 32006):
+        comp_id = 13_000_000 + it_id
+        if stocks.get(comp_id, 0) >= 2500:
+            return True
+
+    return False
+
+
 async def check_and_grant_event_ranking_milestones(
     session: AsyncSession,
     player_id: str,
@@ -981,6 +1048,22 @@ async def check_and_grant_event_ranking_milestones(
     now = int(time.time())
     new_items_count = 0
 
+    # 3.1 Load player storage entries to check for unique/capped items
+    storage_stmt = select(PlayerStorageEntry).where(
+        PlayerStorageEntry.player_id == player_id,
+        or_(
+            PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
+            PlayerStorageEntry.key.like("GrowthItemStock--%"),
+            PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+        ),
+    )
+    storage_rows = (await session.execute(storage_stmt)).scalars().all()
+    unlocked_emblems: set[int] = set()
+    stocks = extract_stock_counts(storage_rows)
+    for entry in storage_rows:
+        if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
+            unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
+
     for tier in eligible_tiers:
         tier_label = f"rank_rew:{category_code}:tier_{tier['tier_id']}"
         if tier_label in existing_labels:
@@ -988,6 +1071,9 @@ async def check_and_grant_event_ranking_milestones(
 
         rank_to = tier["rank_to"]
         for it_prefix, it_id, it_cnt in tier["items"]:
+            if should_skip_reward_item(it_prefix, it_id, unlocked_emblems, stocks):
+                continue
+
             item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0
             val_bytes = json.dumps({"Prefix": it_prefix, "Value": it_id, "Count": it_cnt}).encode(
                 "utf-8"
@@ -1036,6 +1122,22 @@ async def check_and_grant_gpx_milestones(
     new_items_count = 0
     class_name = CLASS_NAMES.get(class_id, "ブロンズ")
 
+    # Load player storage entries to check for unique/capped items
+    storage_stmt = select(PlayerStorageEntry).where(
+        PlayerStorageEntry.player_id == player_id,
+        or_(
+            PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
+            PlayerStorageEntry.key.like("GrowthItemStock--%"),
+            PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+        ),
+    )
+    storage_rows = (await session.execute(storage_stmt)).scalars().all()
+    unlocked_emblems: set[int] = set()
+    stocks = extract_stock_counts(storage_rows)
+    for entry in storage_rows:
+        if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
+            unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
+
     # 1. Check Class Tier milestone (e.g. reaching Platinum / Gold / Silver / Bronze)
     class_label = f"rank_rew:gpx_class:c{class_id}"
     class_stmt = select(
@@ -1053,6 +1155,9 @@ async def check_and_grant_gpx_milestones(
         for ct in GPX_CLASS_TIERS:
             if ct["class_id"] == class_id:
                 for it_prefix, it_id, it_cnt in ct["items"]:
+                    if should_skip_reward_item(it_prefix, it_id, unlocked_emblems, stocks):
+                        continue
+
                     item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0
                     val_bytes = json.dumps(
                         {"Prefix": it_prefix, "Value": it_id, "Count": it_cnt}
@@ -1112,6 +1217,9 @@ async def check_and_grant_gpx_milestones(
                 rank_to = tier["rank_to"]
                 rank_str = f"第{rank_to}位" if rank_to <= 20 else "グループ参加"
                 for it_prefix, it_id, it_cnt in tier["items"]:
+                    if should_skip_reward_item(it_prefix, it_id, unlocked_emblems, stocks):
+                        continue
+
                     item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0
                     val_bytes = json.dumps(
                         {"Prefix": it_prefix, "Value": it_id, "Count": it_cnt}

@@ -8,7 +8,7 @@ from typing import Any
 import grpc
 from google.protobuf.internal.decoder import _DecodeVarint
 from google.protobuf.internal.encoder import _EncodeVarint
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import add_stones, get_or_create_wallet
@@ -61,43 +61,87 @@ def encode_player_status(fields: dict[int, int]) -> bytes:
 
 
 async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
-    """Self-healing migration for ranking reward items created with search_label='rank_rew:...'."""
+    """Self-healing migration for ranking reward items.
+
+    1. Map search_label and schema_key to authentic client Present Box tabs.
+    2. Auto-claim / clear items that the player already owns or that exceed max possession limits
+       (e.g. duplicate emblems, maxed out 99 kaleidoscopes, maxed out 2500 materials)
+       so the present box can be received without 'Reached Possession Limit' errors.
+    """
+    from dankagu.core.ranking_rewards import (
+        extract_stock_counts,
+        extract_unlocked_emblem_ids,
+        should_skip_reward_item,
+    )
+
     legacy_stmt = select(PlayerInventoryItem).where(
         PlayerInventoryItem.player_id == player_id,
-        PlayerInventoryItem.search_label.like("rank_rew:%"),
+        PlayerInventoryItem.is_claimed == False,  # noqa: E712
+        or_(
+            PlayerInventoryItem.search_label.like("rank_rew:%"),
+            PlayerInventoryItem.system_resource_name.like("rank_rew:%"),
+        ),
     )
     legacy_items = (await session.execute(legacy_stmt)).scalars().all()
-    if legacy_items:
-        for leg_item in legacy_items:
-            prefix = ""
-            try:
-                val_dict = json.loads(leg_item.value.decode("utf-8"))
-                prefix = str(val_dict.get("Prefix", ""))
-            except Exception:
-                pass
-            if not leg_item.system_resource_name or not leg_item.system_resource_name.startswith(
-                "rank_rew:"
-            ):
-                leg_item.system_resource_name = (
-                    f"{leg_item.search_label}#{leg_item.system_resource_name}"
-                )
-            if prefix in ("VC", "VirtualCurrency", "Stone"):
-                leg_item.search_label = "VC"
-                leg_item.schema_key = "VC"
-            elif prefix == "Coin":
-                leg_item.search_label = "Coin"
-            elif prefix == "Card":
-                leg_item.search_label = "Card"
-            elif prefix in ("GachaTicket", "GachaTicketExchange"):
-                leg_item.search_label = "GachaTicket"
-            elif prefix == "SelectTicket":
-                leg_item.search_label = "SelectTicket"
-            elif prefix == "Emblem":
-                leg_item.search_label = "Other"
-                leg_item.schema_key = "EVENT_EMBLEM_DIRECT"
-            else:
-                leg_item.search_label = "Item"
-        await session.commit()
+    if not legacy_items:
+        return
+
+    # Load player's unlocked emblems and item stocks
+    storage_stmt = select(PlayerStorageEntry).where(
+        PlayerStorageEntry.player_id == player_id,
+        or_(
+            PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
+            PlayerStorageEntry.key.like("GrowthItemStock--%"),
+            PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+        ),
+    )
+    storage_rows = (await session.execute(storage_stmt)).scalars().all()
+    unlocked_emblems: set[int] = set()
+    stocks = extract_stock_counts(storage_rows)
+    for entry in storage_rows:
+        if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
+            unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
+
+    now = int(time.time())
+    for leg_item in legacy_items:
+        prefix = ""
+        val = 0
+        try:
+            val_dict = json.loads(leg_item.value.decode("utf-8"))
+            prefix = str(val_dict.get("Prefix", ""))
+            val = int(val_dict.get("Value", 0))
+        except Exception:
+            pass
+
+        # If item is an emblem already owned, or capped at max limit:
+        if should_skip_reward_item(prefix, val, unlocked_emblems, stocks):
+            leg_item.is_claimed = True
+            leg_item.received_at = now
+            continue
+
+        if not leg_item.system_resource_name or not leg_item.system_resource_name.startswith(
+            "rank_rew:"
+        ):
+            leg_item.system_resource_name = (
+                f"{leg_item.search_label}#{leg_item.system_resource_name}"
+            )
+        if prefix in ("VC", "VirtualCurrency", "Stone"):
+            leg_item.search_label = "VC"
+            leg_item.schema_key = "VC"
+        elif prefix == "Coin":
+            leg_item.search_label = "Coin"
+        elif prefix == "Card":
+            leg_item.search_label = "Card"
+        elif prefix in ("GachaTicket", "GachaTicketExchange"):
+            leg_item.search_label = "GachaTicket"
+        elif prefix == "SelectTicket":
+            leg_item.search_label = "SelectTicket"
+        elif prefix == "Emblem":
+            leg_item.search_label = "Other"
+            leg_item.schema_key = "EVENT_EMBLEM_DIRECT"
+        else:
+            leg_item.search_label = "Item"
+    await session.commit()
 
 
 class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):

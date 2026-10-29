@@ -529,3 +529,157 @@ async def test_class_group_leaderboard_isolated_by_class() -> None:
 
     reset_current_player(tok_bronze)
     reset_current_player(tok_plat)
+
+
+@pytest.mark.asyncio
+async def test_skip_already_unlocked_emblem_and_capped_items() -> None:
+    """Milestone reward distribution skips unique emblems already owned and capped items."""
+    pid = f"test-skip-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="SkipTester")
+    tok = set_current_player(pid)
+    ctx = MockContext()
+
+    # 1. Player already owns Emblem 3003812 in UnlockEntityStatusCollection--8
+    storage_svc = PlayerStorageService()
+    now = int(time.time())
+    from dankagu.services.box_loot_box import encode_raw_protobuf
+
+    emblem_sub = {
+        1: [(0, now)],
+        2: [(0, now)],
+        3: [(0, 8)],
+        4: [(0, 3003812)],
+        6: [(0, 1)],
+    }
+    emblem_col = {
+        1: [(0, 8)],
+        2: [(2, encode_raw_protobuf(emblem_sub))],
+    }
+
+    req_storage = player_storage_pb2.PlayerStorageSetEntriesV2.Request(next_revision="rev_emb")
+    e_emb = req_storage.entries.add()
+    e_emb.key = "UnlockEntityStatusCollection--8"
+    e_emb.value = encode_raw_protobuf(emblem_col)
+    e_emb.created_at = now
+    e_emb.updated_at = now
+
+    # 2. Player also already has 99 of kaleidoscope 32004
+    growth_item = {
+        1: [(0, 32004)],
+        2: [(0, 99)],
+        4: [(0, now)],
+    }
+    e_growth = req_storage.entries.add()
+    e_growth.key = "GrowthItemStock--32004"
+    e_growth.value = encode_raw_protobuf(growth_item)
+    e_growth.created_at = now
+    e_growth.updated_at = now
+
+    await storage_svc.SetEntriesV2(req_storage, ctx)  # type: ignore[arg-type]
+
+    # 3. Trigger rank 500,000 in Event Score 38 (which would grant Emblem 3003812 in tier 12)
+    ranking_svc = RankingService()
+    await ranking_svc.RegisterV1(
+        ranking_pb2.RankingRegisterV1.Request(ranking_event_id="38", score=1000),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    # 4. Check mailbox: Emblem 3003812 must NOT be in mailbox!
+    inv_svc = PlayerInventoryService()
+    res = await inv_svc.GetInventoriesV1(
+        player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    for inv in res.inventories:
+        val_d = json.loads(inv.value.decode("utf-8"))
+        assert val_d.get("Value") != 3003812, "Emblem 3003812 should have been skipped!"
+
+    reset_current_player(tok)
+
+
+@pytest.mark.asyncio
+async def test_heal_legacy_ranking_reward_auto_claims_blocked_items() -> None:
+    """Heal legacy migration auto-claims blocked items (already owned emblems or capped items)."""
+    pid = f"test-heal-block-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="HealBlockTester")
+    tok = set_current_player(pid)
+    ctx = MockContext()
+
+    storage_svc = PlayerStorageService()
+    now = int(time.time())
+    from dankagu.services.box_loot_box import encode_raw_protobuf
+
+    # Player has Emblem 3003801
+    emblem_sub = {1: [(0, now)], 2: [(0, now)], 3: [(0, 8)], 4: [(0, 3003801)], 6: [(0, 1)]}
+    emblem_col = {1: [(0, 8)], 2: [(2, encode_raw_protobuf(emblem_sub))]}
+    req_storage = player_storage_pb2.PlayerStorageSetEntriesV2.Request(next_revision="rev_emb2")
+    e_emb = req_storage.entries.add()
+    e_emb.key = "UnlockEntityStatusCollection--8"
+    e_emb.value = encode_raw_protobuf(emblem_col)
+    e_emb.created_at = now
+    e_emb.updated_at = now
+    await storage_svc.SetEntriesV2(req_storage, ctx)  # type: ignore[arg-type]
+
+    # Seed 2 unclaimed items directly in DB:
+    # Item 1: Emblem 3003801 (blocked because already owned)
+    # Item 2: Free Stones (VC 90001, claimable)
+    session_factory = get_sessionmaker()
+    async with session_factory() as session:
+        session.add(
+            PlayerInventoryItem(
+                id=str(uuid.uuid4()),
+                player_id=pid,
+                item_type=0,
+                schema_key="ITEM",
+                value=json.dumps({"Prefix": "Emblem", "Value": 3003801, "Count": 1}).encode(
+                    "utf-8"
+                ),
+                route=4,
+                message="Emblem reward",
+                search_label="rank_rew:score38:tier_1",
+                opened_at=now,
+                expired_at=now + 86400,
+                system_resource_name="rank_rew:score38:tier_1#Emblem_3003801",
+                system_resource_num=1,
+                is_claimed=False,
+                created_at=now,
+            )
+        )
+        session.add(
+            PlayerInventoryItem(
+                id=str(uuid.uuid4()),
+                player_id=pid,
+                item_type=1,
+                schema_key="ITEM",
+                value=json.dumps({"Prefix": "VC", "Value": 90001, "Count": 5000}).encode("utf-8"),
+                route=4,
+                message="Stones reward",
+                search_label="rank_rew:score38:tier_1",
+                opened_at=now,
+                expired_at=now + 86400,
+                system_resource_name="rank_rew:score38:tier_1#VC_90001",
+                system_resource_num=5000,
+                is_claimed=False,
+                created_at=now,
+            )
+        )
+        await session.commit()
+
+    # Opening the mailbox should auto-heal: Emblem marked as claimed, Free Stones preserved as VC tab
+    inv_svc = PlayerInventoryService()
+    res = await inv_svc.GetInventoriesV1(
+        player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(res.inventories) == 1
+    assert res.inventories[0].search_label == "VC"
+    assert res.inventories[0].system_resource_num == 5000
+
+    # Claim the remaining stone gift smoothly
+    rec_req = player_inventory_pb2.PlayerInventoryReceiveV1.Request(
+        delete_inventory_ids=[res.inventories[0].id]
+    )
+    rec_resp = await inv_svc.ReceiveV1(rec_req, ctx)  # type: ignore[arg-type]
+    assert rec_resp is not None
+
+    reset_current_player(tok)
