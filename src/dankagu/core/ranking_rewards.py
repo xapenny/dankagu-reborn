@@ -966,26 +966,55 @@ def extract_stock_counts(storage_rows: list[PlayerStorageEntry]) -> dict[int, in
     return stocks
 
 
+def extract_owned_card_ids(storage_rows: list[PlayerStorageEntry]) -> set[int]:
+    """Extract card master IDs from CardStatus--% entries."""
+    owned: set[int] = set()
+    from dankagu.services.box_loot_box import parse_raw_protobuf
+
+    for entry in storage_rows:
+        if not entry.key.startswith("CardStatus--") or not entry.value:
+            continue
+        try:
+            fields = parse_raw_protobuf(entry.value)
+            f2 = fields.get(2)
+            if f2:
+                owned.add(f2[0][1])
+            elif 1 in fields:
+                owned.add(fields[1][0][1])
+        except Exception:
+            pass
+    return owned
+
+
 def should_skip_reward_item(
     it_prefix: str,
     it_id: int,
     unlocked_emblems: set[int],
     stocks: dict[int, int],
+    owned_cards: set[int] | None = None,
+    granted_cards: set[int] | None = None,
 ) -> bool:
     """Return True if player already owns this unique item or has reached max capacity."""
     # 1. Unique Emblems (possession limit is 1)
     if it_prefix == "Emblem" and it_id in unlocked_emblems:
         return True
 
-    # 2. Kaleidoscopes (possession limit is 99)
+    # 2. Character Cards (if player already owns the card, or has mail pending, do NOT send!)
+    if it_prefix == "Card":
+        if owned_cards and it_id in owned_cards:
+            return True
+        if granted_cards and it_id in granted_cards:
+            return True
+
+    # 3. Kaleidoscopes (possession limit is 99)
     if it_prefix == "Growth" and it_id in (32003, 32004) and stocks.get(it_id, 0) >= 99:
         return True
 
-    # 3. Growth Materials (possession limit is 2500)
+    # 4. Growth Materials (possession limit is 2500)
     if it_prefix == "Growth" and stocks.get(it_id, 0) >= 2500:
         return True
 
-    # 4. Kaleidoscope Shards (comp_id = 13_000_000 + it_id, limit is 2500)
+    # 5. Kaleidoscope Shards (comp_id = 13_000_000 + it_id, limit is 2500)
     if it_prefix == "GenericItem" and it_id in (32005, 32006):
         comp_id = 13_000_000 + it_id
         if stocks.get(comp_id, 0) >= 2500:
@@ -1055,14 +1084,34 @@ async def check_and_grant_event_ranking_milestones(
             PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
             PlayerStorageEntry.key.like("GrowthItemStock--%"),
             PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+            PlayerStorageEntry.key.like("CardStatus--%"),
         ),
     )
     storage_rows = (await session.execute(storage_stmt)).scalars().all()
     unlocked_emblems: set[int] = set()
     stocks = extract_stock_counts(storage_rows)
+    owned_cards = extract_owned_card_ids(storage_rows)
     for entry in storage_rows:
         if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
             unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
+
+    # 3.2 Load any cards already granted in mailbox (claimed or unclaimed)
+    mail_card_stmt = select(PlayerInventoryItem.value).where(
+        PlayerInventoryItem.player_id == player_id,
+        or_(
+            PlayerInventoryItem.search_label == "Card",
+            PlayerInventoryItem.system_resource_name.like("%#Card_%"),
+        ),
+    )
+    mail_card_rows = (await session.execute(mail_card_stmt)).scalars().all()
+    granted_cards: set[int] = set()
+    for raw_val in mail_card_rows:
+        try:
+            val_d = json.loads(raw_val.decode("utf-8"))
+            if val_d.get("Prefix") == "Card":
+                granted_cards.add(int(val_d.get("Value", 0)))
+        except Exception:
+            pass
 
     for tier in eligible_tiers:
         tier_label = f"rank_rew:{category_code}:tier_{tier['tier_id']}"
@@ -1071,8 +1120,14 @@ async def check_and_grant_event_ranking_milestones(
 
         rank_to = tier["rank_to"]
         for it_prefix, it_id, it_cnt in tier["items"]:
-            if should_skip_reward_item(it_prefix, it_id, unlocked_emblems, stocks):
+            if should_skip_reward_item(
+                it_prefix, it_id, unlocked_emblems, stocks, owned_cards, granted_cards
+            ):
                 continue
+
+            if it_prefix == "Card":
+                it_cnt = 1
+                granted_cards.add(it_id)
 
             item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0
             val_bytes = json.dumps({"Prefix": it_prefix, "Value": it_id, "Count": it_cnt}).encode(
@@ -1129,11 +1184,13 @@ async def check_and_grant_gpx_milestones(
             PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
             PlayerStorageEntry.key.like("GrowthItemStock--%"),
             PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+            PlayerStorageEntry.key.like("CardStatus--%"),
         ),
     )
     storage_rows = (await session.execute(storage_stmt)).scalars().all()
     unlocked_emblems: set[int] = set()
     stocks = extract_stock_counts(storage_rows)
+    owned_cards = extract_owned_card_ids(storage_rows)
     for entry in storage_rows:
         if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
             unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
@@ -1155,7 +1212,9 @@ async def check_and_grant_gpx_milestones(
         for ct in GPX_CLASS_TIERS:
             if ct["class_id"] == class_id:
                 for it_prefix, it_id, it_cnt in ct["items"]:
-                    if should_skip_reward_item(it_prefix, it_id, unlocked_emblems, stocks):
+                    if should_skip_reward_item(
+                        it_prefix, it_id, unlocked_emblems, stocks, owned_cards
+                    ):
                         continue
 
                     item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0
@@ -1217,7 +1276,9 @@ async def check_and_grant_gpx_milestones(
                 rank_to = tier["rank_to"]
                 rank_str = f"第{rank_to}位" if rank_to <= 20 else "グループ参加"
                 for it_prefix, it_id, it_cnt in tier["items"]:
-                    if should_skip_reward_item(it_prefix, it_id, unlocked_emblems, stocks):
+                    if should_skip_reward_item(
+                        it_prefix, it_id, unlocked_emblems, stocks, owned_cards
+                    ):
                         continue
 
                     item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0

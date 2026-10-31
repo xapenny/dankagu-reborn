@@ -65,10 +65,12 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
 
     1. Map search_label and schema_key to authentic client Present Box tabs.
     2. Auto-claim / clear items that the player already owns or that exceed max possession limits
-       (e.g. duplicate emblems, maxed out 99 kaleidoscopes, maxed out 2500 materials)
-       so the present box can be received without 'Reached Possession Limit' errors.
+       (e.g. duplicate emblems, already owned character cards, duplicate card mails, maxed out 99 kaleidoscopes,
+       maxed out 2500 materials) so the present box can be received without 'Reached Possession Limit' errors.
+    3. Ensure PlayerStatus--1 cardMaxAdd_ (Field 7) is expanded (e.g. to 300) so inventory capacity is 500.
     """
     from dankagu.core.ranking_rewards import (
+        extract_owned_card_ids,
         extract_stock_counts,
         extract_unlocked_emblem_ids,
         should_skip_reward_item,
@@ -80,32 +82,50 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
         or_(
             PlayerInventoryItem.search_label.like("rank_rew:%"),
             PlayerInventoryItem.system_resource_name.like("rank_rew:%"),
+            PlayerInventoryItem.search_label == "Card",
         ),
     )
     legacy_items = (await session.execute(legacy_stmt)).scalars().all()
-    if not legacy_items:
-        return
 
-    # Load player's unlocked emblems and item stocks
+    # Load player's unlocked emblems, item stocks, cards, and PlayerStatus--1
     storage_stmt = select(PlayerStorageEntry).where(
         PlayerStorageEntry.player_id == player_id,
         or_(
             PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
             PlayerStorageEntry.key.like("GrowthItemStock--%"),
             PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+            PlayerStorageEntry.key.like("CardStatus--%"),
+            PlayerStorageEntry.key == "PlayerStatus--1",
         ),
     )
     storage_rows = (await session.execute(storage_stmt)).scalars().all()
     unlocked_emblems: set[int] = set()
     stocks = extract_stock_counts(storage_rows)
+    owned_cards = extract_owned_card_ids(storage_rows)
+    now = int(time.time())
+
     for entry in storage_rows:
         if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
             unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
+        elif entry.key == "PlayerStatus--1" and entry.value:
+            try:
+                ps_fields = parse_player_status(entry.value)
+                if ps_fields.get(7, 0) < 300:
+                    ps_fields[7] = 300
+                    entry.value = encode_player_status(ps_fields)
+                    entry.updated_at = now
+            except Exception:
+                pass
 
-    now = int(time.time())
+    if not legacy_items:
+        await session.commit()
+        return
+
+    healed_card_ids: set[int] = set()
     for leg_item in legacy_items:
         prefix = ""
         val = 0
+        val_dict: dict = {}
         try:
             val_dict = json.loads(leg_item.value.decode("utf-8"))
             prefix = str(val_dict.get("Prefix", ""))
@@ -114,10 +134,29 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
             pass
 
         # If item is an emblem already owned, or capped at max limit:
-        if should_skip_reward_item(prefix, val, unlocked_emblems, stocks):
+        if should_skip_reward_item(prefix, val, unlocked_emblems, stocks, owned_cards):
             leg_item.is_claimed = True
             leg_item.received_at = now
             continue
+
+        # Character Cards deduplication & count clamping
+        if prefix == "Card":
+            # If player already owns this card in inventory, auto-clear mail
+            if val in owned_cards:
+                leg_item.is_claimed = True
+                leg_item.received_at = now
+                continue
+            # If duplicate mail for this card in this healing pass, auto-clear duplicate
+            if val in healed_card_ids:
+                leg_item.is_claimed = True
+                leg_item.received_at = now
+                continue
+
+            # First mail for this unowned card: keep it, but clamp count to 1!
+            healed_card_ids.add(val)
+            val_dict["Count"] = 1
+            leg_item.value = json.dumps(val_dict).encode("utf-8")
+            leg_item.system_resource_num = 1
 
         if not leg_item.system_resource_name or not leg_item.system_resource_name.startswith(
             "rank_rew:"

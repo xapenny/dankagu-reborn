@@ -20,6 +20,7 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
 )
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.ranking import EventLeaderboard
+from dankagu.models.storage import PlayerStorageEntry
 from dankagu.services.player_inventory import PlayerInventoryService
 from dankagu.services.player_storage import PlayerStorageService
 from dankagu.services.ranking import RankingService, ScoreRankingService
@@ -678,6 +679,129 @@ async def test_heal_legacy_ranking_reward_auto_claims_blocked_items() -> None:
     # Claim the remaining stone gift smoothly
     rec_req = player_inventory_pb2.PlayerInventoryReceiveV1.Request(
         delete_inventory_ids=[res.inventories[0].id]
+    )
+    rec_resp = await inv_svc.ReceiveV1(rec_req, ctx)  # type: ignore[arg-type]
+    assert rec_resp is not None
+
+    reset_current_player(tok)
+
+
+@pytest.mark.asyncio
+async def test_event_card_milestone_deduplication_and_healing() -> None:
+    """Card rewards are deduplicated: skipped if owned, clamped to 1, and duplicate mails auto-healed."""
+    pid = f"test-card-heal-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="CardHealTester")
+    tok = set_current_player(pid)
+    ctx = MockContext()
+
+    storage_svc = PlayerStorageService()
+    now = int(time.time())
+    from dankagu.services.box_loot_box import encode_raw_protobuf
+    from dankagu.services.player_inventory import encode_player_status, parse_player_status
+
+    # 1. Player already owns Card 100369 in CardStatus--12345
+    card_pb = {
+        1: [(0, 12345)],
+        2: [(0, 100369)],  # card_master_id = 100369
+        3: [(0, now)],
+    }
+    ps_initial = {1: 1, 7: 0}  # cardMaxAdd_ = 0
+
+    req_storage = player_storage_pb2.PlayerStorageSetEntriesV2.Request(next_revision="rev_c1")
+    e_card = req_storage.entries.add()
+    e_card.key = "CardStatus--12345"
+    e_card.value = encode_raw_protobuf(card_pb)
+    e_card.created_at = now
+    e_card.updated_at = now
+
+    e_ps = req_storage.entries.add()
+    e_ps.key = "PlayerStatus--1"
+    e_ps.value = encode_player_status(ps_initial)
+    e_ps.created_at = now
+    e_ps.updated_at = now
+
+    await storage_svc.SetEntriesV2(req_storage, ctx)  # type: ignore[arg-type]
+
+    # 2. Register Rank 1 in Event Point 38 (which would otherwise grant 100369 and 100370 across 13 tiers)
+    ranking_svc = RankingService()
+    await ranking_svc.RegisterV1(
+        ranking_pb2.RankingRegisterV1.Request(ranking_event_id="point38", score=5000000),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    session_factory = get_sessionmaker()
+    async with session_factory() as session:
+        # Check all granted items for this player
+        stmt = select(PlayerInventoryItem).where(
+            PlayerInventoryItem.player_id == pid,
+            PlayerInventoryItem.system_resource_name.like("rank_rew:point38:%"),
+        )
+        items = (await session.execute(stmt)).scalars().all()
+        card_items = [it for it in items if "#Card_" in it.system_resource_name]
+
+        # Card 100369 was already owned, so it MUST NOT be granted!
+        assert not any("#Card_100369" in it.system_resource_name for it in card_items)
+
+        # Card 100370 was NOT owned, so it MUST be granted exactly ONCE across all 13 tiers!
+        pal_items = [it for it in card_items if "#Card_100370" in it.system_resource_name]
+        assert len(pal_items) == 1
+        pal_data = json.loads(pal_items[0].value.decode("utf-8"))
+        assert pal_data["Prefix"] == "Card"
+        assert pal_data["Value"] == 100370
+        assert pal_data["Count"] == 1  # Count is clamped to 1!
+
+    # 3. Simulate legacy unhealed state: seed 3 duplicate mails of 100370 with Count = 17, 10, 5
+    async with session_factory() as session:
+        for cnt in (17, 10, 5):
+            session.add(
+                PlayerInventoryItem(
+                    id=str(uuid.uuid4()),
+                    player_id=pid,
+                    item_type=0,
+                    schema_key="CARD",
+                    value=json.dumps({"Prefix": "Card", "Value": 100370, "Count": cnt}).encode(
+                        "utf-8"
+                    ),
+                    route=4,
+                    message="Duplicate card mail",
+                    search_label="Card",
+                    opened_at=now,
+                    expired_at=now + 86400,
+                    system_resource_name="rank_rew:point38:tier_test#Card_100370",
+                    system_resource_num=cnt,
+                    is_claimed=False,
+                    created_at=now,
+                )
+            )
+        await session.commit()
+
+    # 4. Opening mailbox triggers heal_legacy_ranking_reward_items
+    inv_svc = PlayerInventoryService()
+    res = await inv_svc.GetInventoriesV1(
+        player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    # In mailbox: exactly 1 card item for 100370 must remain, and its Count must be 1!
+    active_cards = [inv for inv in res.inventories if inv.search_label == "Card"]
+    assert len(active_cards) == 1
+    assert active_cards[0].system_resource_num == 1
+    active_data = json.loads(active_cards[0].value.decode("utf-8"))
+    assert active_data["Count"] == 1
+
+    # Verify PlayerStatus--1 was upgraded to at least 300
+    async with session_factory() as session:
+        ps_stmt = select(PlayerStorageEntry).where(
+            PlayerStorageEntry.player_id == pid,
+            PlayerStorageEntry.key == "PlayerStatus--1",
+        )
+        ps_saved = (await session.execute(ps_stmt)).scalar_one()
+        fields = parse_player_status(ps_saved.value)
+        assert fields.get(7, 0) >= 300
+
+    # 5. Successfully claim the card item
+    rec_req = player_inventory_pb2.PlayerInventoryReceiveV1.Request(
+        delete_inventory_ids=[active_cards[0].id]
     )
     rec_resp = await inv_svc.ReceiveV1(rec_req, ctx)  # type: ignore[arg-type]
     assert rec_resp is not None
