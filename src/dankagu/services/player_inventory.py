@@ -8,7 +8,7 @@ from typing import Any
 import grpc
 from google.protobuf.internal.decoder import _DecodeVarint
 from google.protobuf.internal.encoder import _EncodeVarint
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import add_stones, get_or_create_wallet
@@ -60,6 +60,129 @@ def encode_player_status(fields: dict[int, int]) -> bytes:
     return bytes(buf)
 
 
+async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
+    """Self-healing migration for ranking reward items.
+
+    1. Map search_label and schema_key to authentic client Present Box tabs.
+    2. Auto-claim / clear items that the player already owns or that exceed max possession limits
+       (e.g. duplicate emblems, already owned character cards, duplicate card mails, maxed out 99 kaleidoscopes,
+       maxed out 2500 materials) so the present box can be received without 'Reached Possession Limit' errors.
+    3. Ensure PlayerStatus--1 cardMaxAdd_ (Field 7) is expanded (e.g. to 300) so inventory capacity is 500.
+    """
+    from dankagu.core.ranking_rewards import (
+        extract_owned_card_ids,
+        extract_stock_counts,
+        extract_unlocked_emblem_ids,
+        should_skip_reward_item,
+    )
+
+    legacy_stmt = select(PlayerInventoryItem).where(
+        PlayerInventoryItem.player_id == player_id,
+        PlayerInventoryItem.is_claimed == False,  # noqa: E712
+        or_(
+            PlayerInventoryItem.search_label.like("rank_rew:%"),
+            PlayerInventoryItem.system_resource_name.like("rank_rew:%"),
+            PlayerInventoryItem.search_label == "Card",
+        ),
+    )
+    legacy_items = (await session.execute(legacy_stmt)).scalars().all()
+
+    # Load player's unlocked emblems, item stocks, cards, and PlayerStatus--1
+    storage_stmt = select(PlayerStorageEntry).where(
+        PlayerStorageEntry.player_id == player_id,
+        or_(
+            PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
+            PlayerStorageEntry.key.like("GrowthItemStock--%"),
+            PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+            PlayerStorageEntry.key.like("CardStatus--%"),
+            PlayerStorageEntry.key == "PlayerStatus--1",
+        ),
+    )
+    storage_rows = (await session.execute(storage_stmt)).scalars().all()
+    unlocked_emblems: set[int] = set()
+    stocks = extract_stock_counts(storage_rows)
+    owned_cards = extract_owned_card_ids(storage_rows)
+    now = int(time.time())
+
+    for entry in storage_rows:
+        if entry.key == "UnlockEntityStatusCollection--8" and entry.value:
+            unlocked_emblems = extract_unlocked_emblem_ids(entry.value)
+        elif entry.key == "PlayerStatus--1" and entry.value:
+            try:
+                ps_fields = parse_player_status(entry.value)
+                if ps_fields.get(7, 0) < 300:
+                    ps_fields[7] = 300
+                    entry.value = encode_player_status(ps_fields)
+                    entry.updated_at = now
+            except Exception:
+                pass
+
+    if not legacy_items:
+        await session.commit()
+        return
+
+    healed_card_ids: set[int] = set()
+    for leg_item in legacy_items:
+        prefix = ""
+        val = 0
+        val_dict: dict = {}
+        try:
+            val_dict = json.loads(leg_item.value.decode("utf-8"))
+            prefix = str(val_dict.get("Prefix", ""))
+            val = int(val_dict.get("Value", 0))
+        except Exception:
+            pass
+
+        # If item is an emblem already owned, or capped at max limit:
+        if should_skip_reward_item(prefix, val, unlocked_emblems, stocks, owned_cards):
+            leg_item.is_claimed = True
+            leg_item.received_at = now
+            continue
+
+        # Character Cards deduplication & count clamping
+        if prefix == "Card":
+            # If player already owns this card in inventory, auto-clear mail
+            if val in owned_cards:
+                leg_item.is_claimed = True
+                leg_item.received_at = now
+                continue
+            # If duplicate mail for this card in this healing pass, auto-clear duplicate
+            if val in healed_card_ids:
+                leg_item.is_claimed = True
+                leg_item.received_at = now
+                continue
+
+            # First mail for this unowned card: keep it, but clamp count to 1!
+            healed_card_ids.add(val)
+            val_dict["Count"] = 1
+            leg_item.value = json.dumps(val_dict).encode("utf-8")
+            leg_item.system_resource_num = 1
+
+        if not leg_item.system_resource_name or not leg_item.system_resource_name.startswith(
+            "rank_rew:"
+        ):
+            leg_item.system_resource_name = (
+                f"{leg_item.search_label}#{leg_item.system_resource_name}"
+            )
+        if prefix in ("VC", "VirtualCurrency", "Stone"):
+            leg_item.search_label = "VC"
+            leg_item.schema_key = "VC"
+        elif prefix == "Coin":
+            leg_item.search_label = "Coin"
+        elif prefix == "Card":
+            leg_item.search_label = "Card"
+        elif prefix in ("GachaTicket", "GachaTicketExchange"):
+            leg_item.search_label = "GachaTicket"
+        elif prefix == "SelectTicket":
+            leg_item.search_label = "SelectTicket"
+        elif prefix == "Emblem":
+            leg_item.search_label = "Other"
+            leg_item.schema_key = "EVENT_EMBLEM_DIRECT"
+        else:
+            leg_item.search_label = "Item"
+    await session.commit()
+
+
 class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
     """Servicer for player inventory items and receiving rewards."""
 
@@ -88,6 +211,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            await heal_legacy_ranking_reward_items(session, current_pid)
             stmt = select(PlayerInventoryItem).where(
                 PlayerInventoryItem.player_id == current_pid,
                 PlayerInventoryItem.is_claimed == False,  # noqa: E712
@@ -147,6 +271,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
 
         session_factory = get_sessionmaker()
         async with session_factory() as session:
+            await heal_legacy_ranking_reward_items(session, current_pid)
             base_filters = [
                 PlayerInventoryItem.player_id == current_pid,
                 PlayerInventoryItem.is_claimed == False,  # noqa: E712

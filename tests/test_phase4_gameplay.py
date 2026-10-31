@@ -343,12 +343,12 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     )
     assert status_res2.total_login_days == 2
 
-    # Verify mailbox received 41 daily cultivation support mails
+    # Verify mailbox received 42 daily cultivation support mails (including 10,000 free Mitama stones)
     box_res2 = await inv_service.GetInventoriesV1(
         player_inventory_pb2.PlayerInventoryGetInventoriesV1.Request(), ctx
     )
     new_login_gifts = [g for g in box_res2.inventories if "【Reborn 育成支援・2日目】" in g.message]
-    assert len(new_login_gifts) == 41
+    assert len(new_login_gifts) == 42
 
     exp_gift = next(g for g in new_login_gifts if g.system_resource_name == "Growth_30005")
     assert exp_gift.system_resource_num == 500
@@ -373,11 +373,23 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     coin_gift = next(g for g in new_login_gifts if g.system_resource_name == "Coin_10001")
     assert coin_gift.system_resource_num == 1000000
 
+    stone_gift = next(g for g in new_login_gifts if g.system_resource_name == "FREE_STONE")
+    assert stone_gift.system_resource_num == 10000
+
+    wallet_service = WalletService()
+    bal_before = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
+    vc_before = {vc.virtual_currency_name: vc.amount for vc in bal_before.total.virtual_currencies}
+    free_before = vc_before.get("FREE_STONE", 0)
+
     # Claim all daily rewards
     claim_req = player_inventory_pb2.PlayerInventoryReceiveV1.Request(
         delete_inventory_ids=[g.id for g in new_login_gifts]
     )
     await inv_service.ReceiveV1(claim_req, ctx)
+
+    bal_after = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
+    vc_after = {vc.virtual_currency_name: vc.amount for vc in bal_after.total.virtual_currencies}
+    assert vc_after.get("FREE_STONE", 0) == free_before + 10000
 
     # Verify storage has growth (500), hakoniwa (200), boost heal (10), and universal heroine fragment (200) persisted
     from dankagu.core.growth import decode_growth_item
