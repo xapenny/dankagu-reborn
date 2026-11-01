@@ -388,6 +388,7 @@ def create_daily_reward_mail_items(
     boost_heal_count: int = 10,
     universal_fragment_count: int = 10000,
     coin_amount: int = 1000000,
+    stone_amount: int = 10000,
 ) -> list[PlayerInventoryItem]:
     """Generate daily login reward mail items:
     - Mitama Card Growth Materials: 500 each (5 EXP orbs + 15 Blossom materials + 2 Kaleidoscope shards)
@@ -396,6 +397,7 @@ def create_daily_reward_mail_items(
     - Boost Recovery Items: 10 each (3 types)
     - Universal Heroine Fragment: 10000
     - Coins: 1,000,000
+    - Mitama Stones (Free): 10,000
     """
     now = int(time.time())
     items: list[PlayerInventoryItem] = []
@@ -496,5 +498,22 @@ def create_daily_reward_mail_items(
             search_label="Coin",
         )
     )
+
+    # 7. Mitama Stones (Free) (10,000)
+    if stone_amount > 0:
+        items.append(
+            _make_mail_item(
+                player_id=player_id,
+                prefix="VC",
+                item_id=90002,
+                count=stone_amount,
+                message=f"{day_prefix}御霊石(無償) x{stone_amount:,}",
+                now=now,
+                schema_key="VC",
+                item_type=int(ItemType.VIRTUAL_CURRENCY),
+                search_label="VC",
+                system_resource_name="FREE_STONE",
+            )
+        )
 
     return items

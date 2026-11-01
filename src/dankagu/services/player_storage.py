@@ -5,11 +5,16 @@ import time
 from typing import Any
 
 import grpc
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.ranking_rewards import (
+    check_and_grant_event_ranking_milestones,
+    check_and_grant_gpx_milestones_for_player,
+    extract_event_info_status,
+)
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
@@ -637,11 +642,13 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 )
 
             # Sanitize GpxInfoStatus and auto-sync medley ranking scores
+            clean_gpx_val = None
             gpx_phase_scores: dict[int, int] = {}
             for row in rows_to_upsert:
                 if row["key"].startswith("GpxInfoStatus"):
                     clean_val, p_scores = sanitize_gpx_info_status(row["value"])
                     row["value"] = clean_val
+                    clean_gpx_val = clean_val
                     gpx_phase_scores.update(p_scores)
 
             p5_score = gpx_phase_scores.get(1005000, 0)
@@ -664,6 +671,87 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 elif p5_score > lb_entry.score:
                     lb_entry.score = p5_score
                     lb_entry.updated_at = now
+
+                # Grant GPX milestones immediately upon achieving new peak score/rank
+                await check_and_grant_gpx_milestones_for_player(
+                    session,
+                    player_id=current_pid,
+                    score=p5_score,
+                    gpx_info_bytes=clean_gpx_val,
+                    ranking_key=ranking_key,
+                )
+
+            # Auto-sync event point and event score rankings from EventInfoStatus
+            for row in rows_to_upsert:
+                if row["key"].startswith("EventInfoStatus"):
+                    ev_id, ev_pt, ev_max_score = extract_event_info_status(row["value"])
+                    if ev_pt > 0:
+                        pt_key = f"point{ev_id}"
+                        pt_stmt = select(EventLeaderboard).where(
+                            EventLeaderboard.ranking_event_id == pt_key,
+                            EventLeaderboard.player_id == current_pid,
+                        )
+                        pt_entry = (await session.execute(pt_stmt)).scalars().first()
+                        if pt_entry is None:
+                            session.add(
+                                EventLeaderboard(
+                                    ranking_event_id=pt_key,
+                                    player_id=current_pid,
+                                    score=ev_pt,
+                                    updated_at=now,
+                                )
+                            )
+                        elif ev_pt > pt_entry.score:
+                            pt_entry.score = ev_pt
+                            pt_entry.updated_at = now
+
+                        rank_stmt = (
+                            select(func.count())
+                            .select_from(EventLeaderboard)
+                            .where(
+                                EventLeaderboard.ranking_event_id == pt_key,
+                                EventLeaderboard.score > ev_pt,
+                            )
+                        )
+                        higher_count = (await session.execute(rank_stmt)).scalar() or 0
+                        rank = higher_count + 1
+                        await check_and_grant_event_ranking_milestones(
+                            session, current_pid, pt_key, rank
+                        )
+
+                    if ev_max_score > 0:
+                        sc_key = f"score{ev_id}"
+                        sc_stmt = select(EventLeaderboard).where(
+                            EventLeaderboard.ranking_event_id == sc_key,
+                            EventLeaderboard.player_id == current_pid,
+                        )
+                        sc_entry = (await session.execute(sc_stmt)).scalars().first()
+                        if sc_entry is None:
+                            session.add(
+                                EventLeaderboard(
+                                    ranking_event_id=sc_key,
+                                    player_id=current_pid,
+                                    score=ev_max_score,
+                                    updated_at=now,
+                                )
+                            )
+                        elif ev_max_score > sc_entry.score:
+                            sc_entry.score = ev_max_score
+                            sc_entry.updated_at = now
+
+                        rank_stmt = (
+                            select(func.count())
+                            .select_from(EventLeaderboard)
+                            .where(
+                                EventLeaderboard.ranking_event_id == sc_key,
+                                EventLeaderboard.score > ev_max_score,
+                            )
+                        )
+                        higher_count = (await session.execute(rank_stmt)).scalar() or 0
+                        rank = higher_count + 1
+                        await check_and_grant_event_ranking_milestones(
+                            session, current_pid, sc_key, rank
+                        )
 
             if rows_to_upsert:
                 await batch_upsert_storage_entries(session, rows_to_upsert)
