@@ -1174,7 +1174,8 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
                     await session.execute(
                         select(ClubMember.id).where(
                             ClubMember.player_id == req.player_id,
-                            (ClubMember.slot_id == req.slot_id) | (ClubMember.club_id == req.club_id),
+                            (ClubMember.slot_id == req.slot_id)
+                            | (ClubMember.club_id == req.club_id),
                         )
                     )
                 ).scalar_one_or_none()
@@ -1358,9 +1359,7 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
 
             # Update applicant JoinClubStatus--{slot_id} to Join (3)
             leader = (
-                await session.execute(
-                    select(Player).where(Player.id == club_row.leader_player_id)
-                )
+                await session.execute(select(Player).where(Player.id == club_row.leader_player_id))
             ).scalar_one_or_none()
             leader_short_id = leader.short_id if leader else ""
             await update_player_club_status(

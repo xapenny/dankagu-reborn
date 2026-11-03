@@ -44,8 +44,8 @@ class RankingService(ranking_pb2_grpc.RankingServicer):
     ) -> ranking_pb2.RankingGetAvailableEventV1.Response:
         logger.info("🏅 [Ranking] GetAvailableEventV1")
         response = ranking_pb2.RankingGetAvailableEventV1.Response()
-        # Active events in DanKagu (38 Medley, 39 Points, 40 Mission, 41 Raid)
-        for event_id in ["38", "39", "40", "41"]:
+        # Active events in DanKagu (32 JuneBride, 38 Medley, 39 Points, 40 Mission, 41 Raid)
+        for event_id in ["32", "38", "39", "40", "41"]:
             ev = response.ranking_events.add()
             ev.id = event_id
             ev.opened_at = 1590000000

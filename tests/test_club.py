@@ -637,4 +637,3 @@ async def test_club_approve_when_applicant_slot_already_occupied_auto_resolves()
         assert not any(r.request_id == req_id for r in club_reqs.requests)
     finally:
         reset_current_player(tokens_l1)
-

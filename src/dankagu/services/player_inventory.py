@@ -27,6 +27,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     player_inventory_pb2_grpc,
 )
 from dankagu.models.inventory import PlayerInventoryItem
+from dankagu.models.ranking import EventLeaderboard
 from dankagu.models.storage import PlayerStorageEntry
 from dankagu.services.player_storage import batch_upsert_storage_entries
 
@@ -96,6 +97,8 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
             PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
             PlayerStorageEntry.key.like("CardStatus--%"),
             PlayerStorageEntry.key == "PlayerStatus--1",
+            PlayerStorageEntry.key == "PlayerBase--1",
+            PlayerStorageEntry.key == "EventEmblemRankingStatusCollection--1",
         ),
     )
     storage_rows = (await session.execute(storage_stmt)).scalars().all()
@@ -117,11 +120,76 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
             except Exception:
                 pass
 
+    from dankagu.core.ranking_rewards import (
+        SCORE38_EMBLEM_MAP,
+        resolve_event_emblem_rank,
+    )
+    from dankagu.services.player_storage import (
+        add_event_emblem_rankings_to_storage,
+        parse_event_emblem_rankings,
+        update_player_base_emblem_intvals,
+    )
+
+    event_eids_unlocked = [
+        eid
+        for eid in unlocked_emblems
+        if eid in SCORE38_EMBLEM_MAP or (3_000_000 <= eid < 4_000_000)
+    ]
+    emblem_coll_entry = next(
+        (e for e in storage_rows if e.key == "EventEmblemRankingStatusCollection--1"), None
+    )
+    current_emblem_rankings = parse_event_emblem_rankings(
+        emblem_coll_entry.value if emblem_coll_entry else None
+    )
+
+    missing_unlocked_eids = [
+        eid for eid in event_eids_unlocked if eid not in current_emblem_rankings
+    ]
+    if missing_unlocked_eids:
+        new_rankings = {}
+        for eid in missing_unlocked_eids:
+            ev_id = (eid - 3_000_000) // 100 if (3_000_000 <= eid < 4_000_000) else 38
+            sc_key = f"score{ev_id}"
+            lb_stmt = select(EventLeaderboard).where(
+                EventLeaderboard.ranking_event_id == sc_key,
+                EventLeaderboard.player_id == player_id,
+            )
+            lb_entry = (await session.execute(lb_stmt)).scalars().first()
+            actual_rank = 0
+            if lb_entry:
+                r_stmt = (
+                    select(func.count())
+                    .select_from(EventLeaderboard)
+                    .where(
+                        EventLeaderboard.ranking_event_id == sc_key,
+                        EventLeaderboard.score > lb_entry.score,
+                    )
+                )
+                actual_rank = ((await session.execute(r_stmt)).scalar() or 0) + 1
+
+            new_rankings[eid] = resolve_event_emblem_rank(eid, actual_rank)
+
+        saved_coll = await add_event_emblem_rankings_to_storage(
+            session, player_id, new_rankings, now
+        )
+        if saved_coll:
+            current_emblem_rankings.update(new_rankings)
+
+    pb_entry = next((e for e in storage_rows if e.key == "PlayerBase--1"), None)
+    if pb_entry and pb_entry.value and current_emblem_rankings:
+        new_pb, pb_changed = update_player_base_emblem_intvals(
+            pb_entry.value, current_emblem_rankings
+        )
+        if pb_changed:
+            pb_entry.value = new_pb
+            pb_entry.updated_at = now
+
     if not legacy_items:
         await session.commit()
         return
 
     healed_card_ids: set[int] = set()
+    emblem_rankings_from_mail: dict[int, int] = {}
     for leg_item in legacy_items:
         prefix = ""
         val = 0
@@ -138,6 +206,34 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
             leg_item.is_claimed = True
             leg_item.received_at = now
             continue
+
+        # Event ranking Emblem healing: fill missing EventRankNo
+        if prefix == "Emblem" and val > 0:
+            rank_no = int(val_dict.get("EventRankNo", 0))
+            if rank_no <= 0:
+                actual_rank = 0
+                ev_id = (val - 3_000_000) // 100 if (3_000_000 <= val < 4_000_000) else 38
+                sc_key = f"score{ev_id}"
+                lb_stmt = select(EventLeaderboard).where(
+                    EventLeaderboard.ranking_event_id == sc_key,
+                    EventLeaderboard.player_id == player_id,
+                )
+                lb_entry = (await session.execute(lb_stmt)).scalars().first()
+                if lb_entry:
+                    r_stmt = (
+                        select(func.count())
+                        .select_from(EventLeaderboard)
+                        .where(
+                            EventLeaderboard.ranking_event_id == sc_key,
+                            EventLeaderboard.score > lb_entry.score,
+                        )
+                    )
+                    actual_rank = ((await session.execute(r_stmt)).scalar() or 0) + 1
+                rank_no = resolve_event_emblem_rank(val, actual_rank)
+                val_dict["EventRankNo"] = rank_no
+                leg_item.value = json.dumps(val_dict).encode("utf-8")
+            if rank_no > 0:
+                emblem_rankings_from_mail[val] = rank_no
 
         # Character Cards deduplication & count clamping
         if prefix == "Card":
@@ -180,6 +276,12 @@ async def heal_legacy_ranking_reward_items(session, player_id: str) -> None:
             leg_item.schema_key = "EVENT_EMBLEM_DIRECT"
         else:
             leg_item.search_label = "Item"
+
+    if emblem_rankings_from_mail:
+        await add_event_emblem_rankings_to_storage(
+            session, player_id, emblem_rankings_from_mail, now
+        )
+
     await session.commit()
 
 
@@ -444,6 +546,7 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                 growth_by_count: dict[int, list[int]] = {}
                 generic_by_prefix_and_count: dict[tuple[int, int], list[int]] = {}
                 unlocks_by_cat: dict[int, list[int]] = {}
+                emblem_rankings_to_save: dict[int, int] = {}
 
                 for item in items:
                     parsed: dict = {}
@@ -520,6 +623,10 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                         cat_id = prefix_to_cat[prefix]
                         if f"UnlockEntityStatusCollection--{cat_id}" not in client_entry_keys:
                             unlocks_by_cat.setdefault(cat_id, []).append(val)
+                        if prefix == "Emblem":
+                            rank_no = int(parsed.get("EventRankNo", 0))
+                            if rank_no > 0:
+                                emblem_rankings_to_save[val] = rank_no
 
                     item.is_claimed = True
                     item.received_at = now
@@ -568,6 +675,23 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
                     resp_entry.value = new_val
                     resp_entry.created_at = curr_u.created_at if curr_u else now
                     resp_entry.updated_at = now
+
+                if emblem_rankings_to_save:
+                    from dankagu.services.player_storage import add_event_emblem_rankings_to_storage
+
+                    stored_coll = await add_event_emblem_rankings_to_storage(
+                        session, current_pid, emblem_rankings_to_save, now
+                    )
+                    if (
+                        stored_coll
+                        and "EventEmblemRankingStatusCollection--1" not in client_entry_keys
+                    ):
+                        resp_entry = response.entries.add()
+                        resp_entry.player_id = current_pid
+                        resp_entry.key = stored_coll.key
+                        resp_entry.value = stored_coll.value
+                        resp_entry.created_at = stored_coll.created_at
+                        resp_entry.updated_at = stored_coll.updated_at
 
                 if total_coin_to_add > 0:
                     ps_res = await session.execute(

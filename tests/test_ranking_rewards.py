@@ -807,3 +807,140 @@ async def test_event_card_milestone_deduplication_and_healing() -> None:
     assert rec_resp is not None
 
     reset_current_player(tok)
+
+
+@pytest.mark.asyncio
+async def test_event_32_score_ranking_instant_milestones() -> None:
+    """Achieving a score rank in Event 32 distributes Event 32 score emblems (3003201..3003212)."""
+    pid = f"test-ev32-score-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="Event32Tester")
+    tok = set_current_player(pid)
+    ctx = MockContext()
+
+    ranking_svc = RankingService()
+
+    # 1. Register a top score for Event 32 (score32) -> Player gets Rank 1
+    reg_req = ranking_pb2.RankingRegisterV1.Request(
+        ranking_event_id="score32",
+        score=5000000,
+    )
+    reg_res = await ranking_svc.RegisterV1(reg_req, ctx)  # type: ignore[arg-type]
+    assert reg_res.score == 5000000
+
+    # 2. Check PlayerInventoryItem table for milestone mail items
+    session_factory = get_sessionmaker()
+    async with session_factory() as session:
+        stmt = (
+            select(PlayerInventoryItem)
+            .where(
+                PlayerInventoryItem.player_id == pid,
+                PlayerInventoryItem.system_resource_name.like("rank_rew:score32:%"),
+            )
+            .order_by(PlayerInventoryItem.created_at.asc())
+        )
+        items = (await session.execute(stmt)).scalars().all()
+
+        # Score32 has 12 tiers. Rank 1 unlocks all 12 tiers!
+        assert len(items) == 12
+
+        labels = {it.system_resource_name.split("#")[0] for it in items}
+        assert "rank_rew:score32:tier_1" in labels
+        assert "rank_rew:score32:tier_4" in labels
+        assert "rank_rew:score32:tier_12" in labels
+
+        # Check Tier 1 reward contains Event 32 Rank 1 Emblem 3003201
+        tier1_item = next(
+            it for it in items if it.system_resource_name.startswith("rank_rew:score32:tier_1")
+        )
+        data = json.loads(tier1_item.value.decode("utf-8"))
+        assert data["Prefix"] == "Emblem"
+        assert data["Value"] == 3003201
+        assert data["Count"] == 1
+        assert data["EventRankNo"] == 1
+
+        # Check Tier 4 reward contains Event 32 Emblem 3003204 with rank clamped to rank_from=4
+        tier4_item = next(
+            it for it in items if it.system_resource_name.startswith("rank_rew:score32:tier_4")
+        )
+        data4 = json.loads(tier4_item.value.decode("utf-8"))
+        assert data4["Prefix"] == "Emblem"
+        assert data4["Value"] == 3003204
+        assert data4["EventRankNo"] == 4
+
+    reset_current_player(tok)
+
+
+@pytest.mark.asyncio
+async def test_event_32_point_ranking_instant_milestones() -> None:
+    """Achieving a point rank in Event 32 distributes Event 32 cards (100324, 100325)."""
+    pid = f"test-ev32-point-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="Event32PtTester")
+    tok = set_current_player(pid)
+    ctx = MockContext()
+
+    ranking_svc = RankingService()
+
+    # 1. Register a top score for Event 32 points -> Player gets Rank 1
+    reg_req = ranking_pb2.RankingRegisterV1.Request(
+        ranking_event_id="point32",
+        score=2000000,
+    )
+    reg_res = await ranking_svc.RegisterV1(reg_req, ctx)  # type: ignore[arg-type]
+    assert reg_res.score == 2000000
+
+    # 2. Check PlayerInventoryItem table for milestone mail items
+    session_factory = get_sessionmaker()
+    async with session_factory() as session:
+        stmt = (
+            select(PlayerInventoryItem)
+            .where(
+                PlayerInventoryItem.player_id == pid,
+                PlayerInventoryItem.system_resource_name.like("rank_rew:point32:%"),
+            )
+            .order_by(PlayerInventoryItem.created_at.asc())
+        )
+        items = (await session.execute(stmt)).scalars().all()
+        assert len(items) > 0
+
+        # Verify Event 32 cards are granted, NOT Event 38 cards!
+        card_values = []
+        for it in items:
+            data = json.loads(it.value.decode("utf-8"))
+            if data.get("Prefix") == "Card":
+                card_values.append(data.get("Value"))
+
+        assert 100324 in card_values
+        assert 100325 in card_values
+        assert 100369 not in card_values
+        assert 100370 not in card_values
+
+    reset_current_player(tok)
+
+
+@pytest.mark.asyncio
+async def test_event_32_box_loot_box_available() -> None:
+    """BoxLootBox GetAvailableV1 returns Event 32 box product (EventBoxReward_32_32)."""
+    from dankagu.grpc.generated.takasho.schema.fes.player_api import box_loot_box_pb2
+    from dankagu.services.box_loot_box import BoxLootBoxService
+
+    pid = f"test-ev32-box-{uuid.uuid4().hex[:8]}"
+    await ensure_player(pid, nickname="Event32BoxTester")
+    tok = set_current_player(pid)
+    ctx = MockContext()
+
+    box_svc = BoxLootBoxService()
+    req = box_loot_box_pb2.BoxLootBoxV1GetAvailableV1.Request()
+    res = await box_svc.GetAvailableV1(req, ctx)  # type: ignore[arg-type]
+
+    product_ids = [p.box_loot_box_product_id for p in res.box_loot_box_products]
+    assert "EventBoxReward_32_32" in product_ids
+
+    # Detail request for Event 32
+    det_req = box_loot_box_pb2.BoxLootBoxV1GetDetailV1.Request(
+        box_loot_box_product_ids=["EventBoxReward_32_32"]
+    )
+    det_res = await box_svc.GetDetailV1(det_req, ctx)  # type: ignore[arg-type]
+    assert len(det_res.box_loot_box_products) == 1
+    assert det_res.box_loot_box_products[0].box_loot_box_product_id == "EventBoxReward_32_32"
+
+    reset_current_player(tok)

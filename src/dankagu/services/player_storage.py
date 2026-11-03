@@ -171,6 +171,122 @@ def add_emblems_to_collection(
     return add_unlock_ids_to_collection(current_bytes, 8, emblem_ids, now)
 
 
+def parse_event_emblem_rankings(blob: bytes | None) -> dict[int, int]:
+    """Parse EventEmblemRankingStatusCollection--1 protobuf blob into {emblem_id: rank}."""
+    if not blob:
+        return {}
+    rankings: dict[int, int] = {}
+    try:
+        fields = parse_raw_protobuf(blob)
+        for _, sub_raw in fields.get(2, []):
+            if isinstance(sub_raw, (bytes, bytearray)):
+                sub = parse_raw_protobuf(sub_raw)
+                eid_list = sub.get(1, [])
+                rank_list = sub.get(2, [])
+                if eid_list and rank_list:
+                    rankings[eid_list[0][1]] = rank_list[0][1]
+    except Exception:
+        pass
+    return rankings
+
+
+def encode_event_emblem_rankings(rankings: dict[int, int], coll_id: int = 1) -> bytes:
+    """Encode {emblem_id: rank} into EventEmblemRankingStatusCollection--1 protobuf blob."""
+    sub_msgs = []
+    for eid, rank in sorted(rankings.items()):
+        sub_raw = encode_raw_protobuf(
+            {
+                1: [(0, eid)],
+                2: [(0, rank)],
+            }
+        )
+        sub_msgs.append((2, sub_raw))
+    return encode_raw_protobuf(
+        {
+            1: [(0, coll_id)],
+            2: sub_msgs,
+        }
+    )
+
+
+async def add_event_emblem_rankings_to_storage(
+    session: AsyncSession,
+    player_id: str,
+    emblem_rankings: dict[int, int],
+    now: int,
+) -> PlayerStorageEntry | None:
+    """Add or update event emblem rankings in EventEmblemRankingStatusCollection--1."""
+    if not emblem_rankings:
+        return None
+
+    stmt = select(PlayerStorageEntry).where(
+        PlayerStorageEntry.player_id == player_id,
+        PlayerStorageEntry.key == "EventEmblemRankingStatusCollection--1",
+    )
+    entry = (await session.execute(stmt)).scalar_one_or_none()
+    curr_blob = entry.value if entry else None
+    existing = parse_event_emblem_rankings(curr_blob)
+
+    updated = False
+    for eid, r in emblem_rankings.items():
+        if r > 0:
+            best_rank = r
+            if eid in existing and existing[eid] > 0:
+                best_rank = min(existing[eid], r)
+            if eid not in existing or existing[eid] != best_rank:
+                existing[eid] = best_rank
+                updated = True
+
+    if not updated and entry:
+        return entry
+
+    new_blob = encode_event_emblem_rankings(existing, coll_id=1)
+    if entry:
+        entry.value = new_blob
+        entry.updated_at = now
+        return entry
+    else:
+        new_entry = PlayerStorageEntry(
+            player_id=player_id,
+            key="EventEmblemRankingStatusCollection--1",
+            value=new_blob,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(new_entry)
+        return new_entry
+
+
+def update_player_base_emblem_intvals(
+    blob: bytes | None, emblem_rankings: dict[int, int]
+) -> tuple[bytes | None, bool]:
+    """Update Emblem1IntVal (Tag 18) and Emblem2IntVal (Tag 19) in PlayerBase--1 if equipped."""
+    if not blob or not emblem_rankings:
+        return blob, False
+    try:
+        fields = parse_raw_protobuf(blob)
+        e1_id = fields.get(5, [(0, 0)])[0][1] if 5 in fields else 0
+        e2_id = fields.get(6, [(0, 0)])[0][1] if 6 in fields else 0
+        changed = False
+        if e1_id in emblem_rankings:
+            target_val = emblem_rankings[e1_id]
+            curr_val = fields.get(18, [(0, 0)])[0][1] if 18 in fields else 0
+            if curr_val != target_val:
+                fields[18] = [(0, target_val)]
+                changed = True
+        if e2_id in emblem_rankings:
+            target_val = emblem_rankings[e2_id]
+            curr_val = fields.get(19, [(0, 0)])[0][1] if 19 in fields else 0
+            if curr_val != target_val:
+                fields[19] = [(0, target_val)]
+                changed = True
+        if changed:
+            return encode_raw_protobuf(fields), True
+    except Exception:
+        pass
+    return blob, False
+
+
 async def check_and_grant_heroine_milestones(
     session: AsyncSession, player_id: str, entries: Any, now: int
 ) -> PlayerStorageEntry | None:
@@ -455,6 +571,10 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             bytes.fromhex("080110914e18002000"),
         )
         self.template_entries.setdefault(
+            "EventInfoStatus-V32-32",
+            bytes.fromhex("08201000180032040101010138ca84d1d60658ca84d1d60670037803"),
+        )
+        self.template_entries.setdefault(
             "EventInfoStatus-V38-38",
             bytes.fromhex("08261000180032040101010138ca84d1d60658ca84d1d60670037803"),
         )
@@ -526,6 +646,120 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 result = await session.execute(stmt)
                 db_entries = result.scalars().all()
                 db_entry_map = {e.key: e for e in db_entries}
+
+                now = int(time.time())
+                needs_emblem_rankings = any(
+                    c.key.startswith("EventEmblemRankingStatusCollection--")
+                    or (
+                        c.matching_type == Criterion.MatchingType.EXACT
+                        and c.key == "EventEmblemRankingStatusCollection--1"
+                    )
+                    for c in criteria_list
+                )
+                needs_player_base = any(
+                    c.key.startswith("PlayerBase--")
+                    or (
+                        c.matching_type == Criterion.MatchingType.EXACT and c.key == "PlayerBase--1"
+                    )
+                    for c in criteria_list
+                )
+
+                if needs_emblem_rankings or needs_player_base:
+                    u_key = "UnlockEntityStatusCollection--8"
+                    u_entry = db_entry_map.get(u_key)
+                    if not u_entry:
+                        u_res = await session.execute(
+                            select(PlayerStorageEntry).where(
+                                PlayerStorageEntry.player_id == current_pid,
+                                PlayerStorageEntry.key == u_key,
+                            )
+                        )
+                        u_entry = u_res.scalar_one_or_none()
+
+                    from dankagu.core.ranking_rewards import (
+                        SCORE38_EMBLEM_MAP,
+                        extract_unlocked_emblem_ids,
+                        resolve_event_emblem_rank,
+                    )
+
+                    unlocked_eids = extract_unlocked_emblem_ids(u_entry.value if u_entry else None)
+                    event_eids = [
+                        eid
+                        for eid in unlocked_eids
+                        if eid in SCORE38_EMBLEM_MAP or (3_000_000 <= eid < 4_000_000)
+                    ]
+
+                    existing_coll = db_entry_map.get("EventEmblemRankingStatusCollection--1")
+                    if not existing_coll:
+                        c_res = await session.execute(
+                            select(PlayerStorageEntry).where(
+                                PlayerStorageEntry.player_id == current_pid,
+                                PlayerStorageEntry.key == "EventEmblemRankingStatusCollection--1",
+                            )
+                        )
+                        existing_coll = c_res.scalar_one_or_none()
+                        if existing_coll:
+                            db_entry_map[existing_coll.key] = existing_coll
+
+                    rankings = parse_event_emblem_rankings(
+                        existing_coll.value if existing_coll else None
+                    )
+                    missing_eids = [eid for eid in event_eids if eid not in rankings]
+
+                    if missing_eids:
+                        new_rankings = {}
+                        for eid in missing_eids:
+                            ev_id = (
+                                (eid - 3_000_000) // 100 if (3_000_000 <= eid < 4_000_000) else 38
+                            )
+                            sc_key = f"score{ev_id}"
+                            lb_stmt = select(EventLeaderboard).where(
+                                EventLeaderboard.ranking_event_id == sc_key,
+                                EventLeaderboard.player_id == current_pid,
+                            )
+                            lb_entry = (await session.execute(lb_stmt)).scalars().first()
+                            actual_rank = 0
+                            if lb_entry:
+                                r_stmt = (
+                                    select(func.count())
+                                    .select_from(EventLeaderboard)
+                                    .where(
+                                        EventLeaderboard.ranking_event_id == sc_key,
+                                        EventLeaderboard.score > lb_entry.score,
+                                    )
+                                )
+                                actual_rank = ((await session.execute(r_stmt)).scalar() or 0) + 1
+
+                            new_rankings[eid] = resolve_event_emblem_rank(eid, actual_rank)
+
+                        saved_coll = await add_event_emblem_rankings_to_storage(
+                            session, current_pid, new_rankings, now
+                        )
+                        if saved_coll:
+                            await session.commit()
+                            db_entry_map[saved_coll.key] = saved_coll
+                            rankings.update(new_rankings)
+
+                    pb_entry = db_entry_map.get("PlayerBase--1")
+                    if not pb_entry and needs_player_base:
+                        pb_res = await session.execute(
+                            select(PlayerStorageEntry).where(
+                                PlayerStorageEntry.player_id == current_pid,
+                                PlayerStorageEntry.key == "PlayerBase--1",
+                            )
+                        )
+                        pb_entry = pb_res.scalar_one_or_none()
+                        if pb_entry:
+                            db_entry_map[pb_entry.key] = pb_entry
+
+                    if pb_entry and pb_entry.value and rankings:
+                        new_pb, pb_changed = update_player_base_emblem_intvals(
+                            pb_entry.value, rankings
+                        )
+                        if pb_changed:
+                            pb_entry.value = new_pb
+                            pb_entry.updated_at = now
+                            await session.commit()
 
         response = player_storage_pb2.PlayerStorageGetEntriesV2.Response()
         response.revision = StorageRevisionManager.get_revision(current_pid)
@@ -752,6 +986,52 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                         await check_and_grant_event_ranking_milestones(
                             session, current_pid, sc_key, rank
                         )
+
+            # Ensure equipped event emblem ranking numbers are preserved in PlayerBase--1
+            coll_row = next(
+                (r for r in rows_to_upsert if r["key"] == "EventEmblemRankingStatusCollection--1"),
+                None,
+            )
+            pb_row = next((r for r in rows_to_upsert if r["key"] == "PlayerBase--1"), None)
+
+            rankings_for_pb: dict[int, int] = {}
+            if coll_row and coll_row["value"]:
+                rankings_for_pb.update(parse_event_emblem_rankings(coll_row["value"]))
+
+            if pb_row and pb_row["value"]:
+                if not rankings_for_pb:
+                    r_blob = (
+                        await session.execute(
+                            select(PlayerStorageEntry.value).where(
+                                PlayerStorageEntry.player_id == current_pid,
+                                PlayerStorageEntry.key == "EventEmblemRankingStatusCollection--1",
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    rankings_for_pb.update(parse_event_emblem_rankings(r_blob))
+
+                if rankings_for_pb:
+                    new_pb, pb_changed = update_player_base_emblem_intvals(
+                        pb_row["value"], rankings_for_pb
+                    )
+                    if pb_changed:
+                        pb_row["value"] = new_pb
+            elif rankings_for_pb:
+                pb_db = (
+                    await session.execute(
+                        select(PlayerStorageEntry).where(
+                            PlayerStorageEntry.player_id == current_pid,
+                            PlayerStorageEntry.key == "PlayerBase--1",
+                        )
+                    )
+                ).scalar_one_or_none()
+                if pb_db and pb_db.value:
+                    new_pb, pb_changed = update_player_base_emblem_intvals(
+                        pb_db.value, rankings_for_pb
+                    )
+                    if pb_changed:
+                        pb_db.value = new_pb
+                        pb_db.updated_at = now
 
             if rows_to_upsert:
                 await batch_upsert_storage_entries(session, rows_to_upsert)
