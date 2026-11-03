@@ -36,6 +36,8 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     club_player_join_request_pb2_grpc,
     club_player_pb2,
     club_player_pb2_grpc,
+    club_product_pb2,
+    club_product_pb2_grpc,
     club_scalar_pb2,
     club_scalar_pb2_grpc,
     club_space_storage_pb2,
@@ -77,6 +79,7 @@ from dankagu.models.club import (
 )
 from dankagu.models.player import Player
 from dankagu.models.storage import PlayerStorageEntry
+from dankagu.services.club_product_data import get_club_product_price
 from dankagu.services.fes_player import query_player_storage_by_keys
 
 logger = logging.getLogger("dankagu.services.club")
@@ -2143,6 +2146,115 @@ class ClubScalarService(club_scalar_pb2_grpc.ClubScalarServicer):
             )
 
 
+class ClubProductService(club_product_pb2_grpc.ClubProductServicer):
+    """Servicer for club shop products and item exchanges."""
+
+    async def GetAvailable(
+        self,
+        request: club_product_pb2.ClubProductGetAvailable.Request,
+        context: grpc.aio.ServicerContext,
+    ) -> club_product_pb2.ClubProductGetAvailable.Response:
+        logger.info("🛍️ [ClubProduct] GetAvailable called")
+        return club_product_pb2.ClubProductGetAvailable.Response(
+            products=[],
+            next_page_token="",
+        )
+
+    async def Purchase(
+        self,
+        request: club_product_pb2.ClubProductPurchase.Request,
+        context: grpc.aio.ServicerContext,
+    ) -> club_product_pb2.ClubProductPurchase.Response:
+        player_id = get_current_player_id()
+        scalar_key = request.scalar_key or "ClubPoint"
+        logger.info(
+            "🛍️ [ClubProduct] Purchase: player_id=%s, club_id=%s, product_id=%s, scalar_key=%s, entries_count=%d",
+            player_id,
+            request.club_id,
+            request.club_product_id,
+            scalar_key,
+            len(request.entries),
+        )
+        now = int(time.time())
+        price = get_club_product_price(request.club_product_id)
+
+        session_factory = get_sessionmaker()
+        async with session_factory() as session:
+            # 1. Fetch current ClubScalar balance
+            stmt_scalar = select(ClubScalar.value).where(
+                ClubScalar.club_id == request.club_id,
+                ClubScalar.key == scalar_key,
+            )
+            current_points = (await session.execute(stmt_scalar)).scalar_one_or_none() or 0
+            new_points = max(0, current_points - price)
+
+            # 2. Update ClubScalar balance
+            stmt_update_scalar = (
+                pg_insert(ClubScalar)
+                .values(
+                    club_id=request.club_id,
+                    key=scalar_key,
+                    value=new_points,
+                    updated_at=now,
+                )
+                .on_conflict_do_update(
+                    index_elements=[ClubScalar.club_id, ClubScalar.key],
+                    set_={
+                        "value": new_points,
+                        "updated_at": now,
+                    },
+                )
+            )
+            await session.execute(stmt_update_scalar)
+
+            # 3. Persist ClubStorage entries (e.g. ClubStoragePurchaseEntry)
+            next_rev_int = 1
+            try:
+                next_rev_int = int(request.next_revision)
+            except (ValueError, TypeError):
+                next_rev_int = now
+
+            for e in request.entries:
+                stmt_storage = (
+                    pg_insert(ClubStorage)
+                    .values(
+                        club_id=request.club_id,
+                        key=e.key,
+                        value=e.value,
+                        revision=next_rev_int,
+                        updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[ClubStorage.club_id, ClubStorage.key],
+                        set_={
+                            "value": e.value,
+                            "revision": next_rev_int,
+                            "updated_at": now,
+                        },
+                    )
+                )
+                await session.execute(stmt_storage)
+
+            await session.commit()
+
+        revision = request.next_revision or str(now)
+        logger.info(
+            "🛍️ [ClubProduct] Purchase complete: club_id=%s, deducted=%d, new_points=%d, revision=%s",
+            request.club_id,
+            price,
+            new_points,
+            revision,
+        )
+        return club_product_pb2.ClubProductPurchase.Response(
+            scalar=club_scalar_v1_pb2.ClubScalar(
+                club_id=request.club_id,
+                key=scalar_key,
+                value=new_points,
+            ),
+            revision=revision,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Registration Entry Point
 # ---------------------------------------------------------------------------
@@ -2409,7 +2521,30 @@ def register_club_servicers(server: grpc.aio.Server) -> None:
         )
     )
 
+    # 9. ClubProduct
+    product_servicer = ClubProductService()
+    product_handlers = {
+        "GetAvailable": takasho_unary_handler(
+            product_servicer.GetAvailable,
+            club_product_pb2.ClubProductGetAvailable.Request,
+            club_product_pb2.ClubProductGetAvailable.Response,
+        ),
+        "Purchase": takasho_unary_handler(
+            product_servicer.Purchase,
+            club_product_pb2.ClubProductPurchase.Request,
+            club_product_pb2.ClubProductPurchase.Response,
+        ),
+    }
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                "takasho.schema.fes.player_api.club_product.ClubProduct",
+                product_handlers,
+            ),
+        )
+    )
+
     logger.info(
         "🏰 Registered Takasho Club servicers "
-        "(Club, ClubPlayer, ClubPlayerJoinRequest, ClubChat, ClubAchievement, ClubStorage, ClubSpaceStorage, ClubScalar)"
+        "(Club, ClubPlayer, ClubPlayerJoinRequest, ClubChat, ClubAchievement, ClubStorage, ClubSpaceStorage, ClubScalar, ClubProduct)"
     )

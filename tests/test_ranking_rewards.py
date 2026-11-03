@@ -190,7 +190,7 @@ async def test_gpx_class_and_group_instant_milestones() -> None:
         # 1. Check Class milestone (Class 4 Bronze milestone granted)
         c_stmt = select(PlayerInventoryItem).where(
             PlayerInventoryItem.player_id == pid,
-            PlayerInventoryItem.system_resource_name.like("rank_rew:gpx_class:c4%"),
+            PlayerInventoryItem.system_resource_name.like("rank_rew:gpx_class:c4#VC%"),
         )
         class_item = (await session.execute(c_stmt)).scalars().first()
         assert class_item is not None

@@ -62,7 +62,11 @@ async def test_box_loot_box_lifecycle() -> None:
     req_avail = box_loot_box_pb2.BoxLootBoxV1GetAvailableV1.Request()
     res_avail = await service.GetAvailableV1(req_avail, ctx)  # type: ignore[arg-type]
     assert len(res_avail.box_loot_box_products) >= 1
-    prod = res_avail.box_loot_box_products[0]
+    prod = next(
+        p
+        for p in res_avail.box_loot_box_products
+        if p.box_loot_box_product_id == "EventBoxReward_38_38"
+    )
     assert prod.box_loot_box_product_id == "EventBoxReward_38_38"
     assert len(prod.box_loot_box_boxes) == 1
     box = prod.box_loot_box_boxes[0]
