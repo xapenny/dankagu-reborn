@@ -38,7 +38,10 @@ STARTER_STORAGE_ENTRIES = {
     "PlayerSetting--1": bytes.fromhex(
         "08014207b28d0600000000520500000000005a050000000000600a7a0601efd39ca40f8001efd39ca40f8801efd39ca40f90010e"
     ),
-    # Active Event Initial Statuses (Events 38, 39, 40, 41)
+    # Active Event Initial Statuses (Events 32, 38, 39, 40, 41)
+    "EventInfoStatus-V32-32": bytes.fromhex(
+        "08201000180032040101010138ca84d1d60658ca84d1d60670037803"
+    ),
     "EventInfoStatus-V38-38": bytes.fromhex(
         "08261000180032040101010138ca84d1d60658ca84d1d60670037803"
     ),
@@ -122,3 +125,17 @@ async def seed_starter_player(session: AsyncSession, player: Player) -> None:
 
     StorageRevisionManager.set_revision("1", player_id=player.id)
     logger.info("🌱 Seeded starter data for player %s (%s)", player.id, player.user_id)
+
+
+EVENT_IDS: tuple[int, ...] = tuple(range(1, 42))
+
+
+def unplayed_event_value(event_id: int) -> bytes:
+    """Return pristine unplayed EventInfoStatus protobuf bytes for a given event ID."""
+    tag1 = (
+        bytes([0x08, event_id])
+        if event_id < 128
+        else bytes([0x08, (event_id & 0x7F) | 0x80, event_id >> 7])
+    )
+    tail = bytes.fromhex("1000180032040101010138ca84d1d60658ca84d1d60670037803")
+    return tag1 + tail

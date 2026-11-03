@@ -24,6 +24,7 @@ from dankagu.grpc.generated.takasho.schema.fes.player_api import (
     club_chat_pb2,
     club_pb2,
     club_player_pb2,
+    club_product_pb2,
     club_scalar_pb2,
     club_space_storage_pb2,
     club_storage_pb2,
@@ -44,6 +45,7 @@ from dankagu.services.club import (
     ClubChatService,
     ClubPlayerJoinRequestService,
     ClubPlayerService,
+    ClubProductService,
     ClubScalarService,
     ClubService,
     ClubSpaceStorageService,
@@ -535,5 +537,207 @@ async def test_club_scalar_points_and_achievement_increment():
         await ClubAchievementService().UnlockAndIncrementClubScalar(ach_req, DummyContext())
         res2 = await ClubScalarService().Get(get_scalar_req, DummyContext())
         assert res2.scalar.value == 100200
+    finally:
+        reset_current_player(tokens)
+
+
+# ---------------------------------------------------------------------------
+# 7. Club Join Conflict & Slot Collision Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_club_approve_when_applicant_slot_already_occupied_auto_resolves():
+    """Verify that approving an applicant who already joined another club in that slot
+
+    auto-resolves cleanly without throwing a unique constraint violation error (20027-2).
+    """
+    await init_db()
+
+    # 1. Leader 1 creates Club 1 (Manual approval)
+    leader1 = await ensure_player(nickname="Leader1")
+    tokens_l1 = set_current_player(leader1)
+    try:
+        club1_id = (
+            await _create_club(f"Manual {uuid.uuid4().hex[:8]}", approval_policy=1)
+        ).club.club_id
+    finally:
+        reset_current_player(tokens_l1)
+
+    # 2. Leader 2 creates Club 2 (Auto approval)
+    leader2 = await ensure_player(nickname="Leader2")
+    tokens_l2 = set_current_player(leader2)
+    try:
+        club2_id = (
+            await _create_club(f"Auto {uuid.uuid4().hex[:8]}", approval_policy=2)
+        ).club.club_id
+    finally:
+        reset_current_player(tokens_l2)
+
+    # 3. Applicant applies to Club 1 (Slot 0 is free, request status=0)
+    applicant = await ensure_player(nickname="ConflictApplicant")
+    tokens_a = set_current_player(applicant)
+    try:
+        req_resp = await ClubPlayerJoinRequestService().Create(
+            join_pb2.ClubPlayerJoinRequestCreate.Request(club_id=club1_id), DummyContext()
+        )
+        req_id = req_resp.request.request_id
+        assert req_id
+
+        # 4. Applicant joins Club 2 (Auto approval occupies Slot 0!)
+        auto_resp = await ClubPlayerJoinRequestService().Create(
+            join_pb2.ClubPlayerJoinRequestCreate.Request(club_id=club2_id), DummyContext()
+        )
+        assert auto_resp.request.request_id
+    finally:
+        reset_current_player(tokens_a)
+
+    # 5. Leader 1 approves the application to Club 1
+    # Previously, this crashed with UniqueViolationError on uq_player_slot
+    tokens_l1 = set_current_player(leader1)
+    try:
+        resp = await ClubPlayerJoinRequestService().Approve(
+            join_pb2.ClubPlayerJoinRequestApprove.Request(request_id=req_id), DummyContext()
+        )
+        assert resp.request_id == req_id
+
+        # Verify in DB: request was auto-resolved as superseded (status=2)
+        async with get_sessionmaker()() as session:
+            req_row = await session.get(ClubJoinRequest, req_id)
+            assert req_row.status == 2
+
+            # Verify applicant was NOT added to Club 1
+            from sqlalchemy import select
+
+            from dankagu.models.club import ClubMember
+
+            c1_member = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.club_id == club1_id, ClubMember.player_id == applicant
+                    )
+                )
+            ).scalar_one_or_none()
+            assert c1_member is None
+
+            # Verify applicant is still active member of Club 2
+            c2_member = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.club_id == club2_id, ClubMember.player_id == applicant
+                    )
+                )
+            ).scalar_one_or_none()
+            assert c2_member is not None
+            assert c2_member.slot_id == 0
+
+        # Verify GetMultiByClub filters out stale/conflicted requests
+        club_reqs = await ClubPlayerJoinRequestService().GetMultiByClub(
+            join_pb2.ClubPlayerJoinRequestGetMultiByClub.Request(club_id=club1_id),
+            DummyContext(),
+        )
+        assert not any(r.request_id == req_id for r in club_reqs.requests)
+    finally:
+        reset_current_player(tokens_l1)
+
+
+# ---------------------------------------------------------------------------
+# 9. ClubProductService Tests (Club Shop / サークル交換所)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_club_product_get_available_and_purchase():
+    await init_db()
+    shopper = await ensure_player(nickname="ClubShopper")
+    tokens = set_current_player(shopper)
+    try:
+        club_name = f"ShopClub_{uuid.uuid4().hex[:8]}"
+        create_resp = await _create_club(club_name)
+        club_id = create_resp.club.club_id
+
+        from sqlalchemy import select
+
+        from dankagu.models.club import ClubScalar, ClubStorage
+
+        # Verify default initial ClubPoint is 100,000
+        async with get_sessionmaker()() as session:
+            init_scalar = (
+                await session.execute(
+                    select(ClubScalar).where(
+                        ClubScalar.club_id == club_id, ClubScalar.key == "ClubPoint"
+                    )
+                )
+            ).scalar_one()
+            assert init_scalar.value == 100000
+
+        product_svc = ClubProductService()
+
+        # 1. GetAvailable test
+        avail_resp = await product_svc.GetAvailable(
+            club_product_pb2.ClubProductGetAvailable.Request(),
+            DummyContext(),
+        )
+        assert avail_resp is not None
+
+        # 2. Purchase test: product "5:1" has price 2000 points
+        req = club_product_pb2.ClubProductPurchase.Request(
+            club_id=club_id,
+            club_product_id="5:1",
+            scalar_key="ClubPoint",
+            next_revision="123456",
+            entries=[
+                storage_v1_pb2.ClubStorageEntry(
+                    key="ClubStoragePurchaseEntry_5_1",
+                    value=b"test_purchase_binary_state",
+                )
+            ],
+        )
+        purch_resp = await product_svc.Purchase(req, DummyContext())
+
+        # Response assertions
+        assert purch_resp.scalar.club_id == club_id
+        assert purch_resp.scalar.key == "ClubPoint"
+        assert purch_resp.scalar.value == 98000  # 100000 - 2000
+        assert purch_resp.revision == "123456"
+
+        # Database assertions
+        async with get_sessionmaker()() as session:
+            scalar_row = (
+                await session.execute(
+                    select(ClubScalar).where(
+                        ClubScalar.club_id == club_id, ClubScalar.key == "ClubPoint"
+                    )
+                )
+            ).scalar_one()
+            assert scalar_row.value == 98000
+
+            storage_row = (
+                await session.execute(
+                    select(ClubStorage).where(
+                        ClubStorage.club_id == club_id,
+                        ClubStorage.key == "ClubStoragePurchaseEntry_5_1",
+                    )
+                )
+            ).scalar_one()
+            assert storage_row.value == b"test_purchase_binary_state"
+            assert storage_row.revision == 123456
+
+        # 3. Second purchase test: product "5:101" has price 200 points
+        req2 = club_product_pb2.ClubProductPurchase.Request(
+            club_id=club_id,
+            club_product_id="5:101",
+            scalar_key="ClubPoint",
+            next_revision="123457",
+            entries=[
+                storage_v1_pb2.ClubStorageEntry(
+                    key="ClubStoragePurchaseEntry_5_101",
+                    value=b"test_purchase_binary_state_2",
+                )
+            ],
+        )
+        purch_resp2 = await product_svc.Purchase(req2, DummyContext())
+        assert purch_resp2.scalar.value == 97800  # 98000 - 200
+        assert purch_resp2.revision == "123457"
     finally:
         reset_current_player(tokens)

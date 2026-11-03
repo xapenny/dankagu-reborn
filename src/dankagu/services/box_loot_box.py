@@ -342,12 +342,11 @@ class BoxLootBoxService(box_loot_box_pb2_grpc.BoxLootBoxServicer):
         catalog = get_event_box_rewards()
         session_factory = get_sessionmaker()
         async with session_factory() as session:
-            # Active event 38 by default or events in catalog
-            for ev_id_str in ["38"]:
-                if ev_id_str in catalog:
-                    prod = await self._build_product_proto(session, current_pid, int(ev_id_str))
-                    p = response.box_loot_box_products.add()
-                    p.CopyFrom(prod)
+            # Return active event box loot products in catalog (e.g., 32, 38)
+            for ev_id_str in catalog:
+                prod = await self._build_product_proto(session, current_pid, int(ev_id_str))
+                p = response.box_loot_box_products.add()
+                p.CopyFrom(prod)
 
         return response
 

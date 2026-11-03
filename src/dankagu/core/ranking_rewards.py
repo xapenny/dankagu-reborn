@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dankagu.config import settings
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.ranking import EventLeaderboard
 from dankagu.models.storage import PlayerStorageEntry
@@ -22,8 +25,96 @@ from dankagu.models.storage import PlayerStorageEntry
 logger = logging.getLogger("dankagu.ranking_rewards")
 
 # Pre-compiled ranking reward tiers extracted from authentic master tables
-# (EventRankingReward-score38.raw, EventRankingReward-point38.raw,
+# (EventRankingReward-score32.raw, EventRankingReward-score38.raw,
+#  EventRankingReward-point32.raw, EventRankingReward-point38.raw,
 #  GpxRankingReward-class1.raw, GpxRankingReward-group1.raw)
+
+SCORE32_TIERS: list[dict[str, Any]] = [
+    {
+        "tier_id": 1,
+        "rank_from": 1,
+        "rank_to": 1,
+        "achievement_key": "EventRankingReward_score32_1",
+        "items": [["Emblem", 3003201, 1]],
+    },
+    {
+        "tier_id": 2,
+        "rank_from": 2,
+        "rank_to": 2,
+        "achievement_key": "EventRankingReward_score32_2",
+        "items": [["Emblem", 3003202, 1]],
+    },
+    {
+        "tier_id": 3,
+        "rank_from": 3,
+        "rank_to": 3,
+        "achievement_key": "EventRankingReward_score32_3",
+        "items": [["Emblem", 3003203, 1]],
+    },
+    {
+        "tier_id": 4,
+        "rank_from": 4,
+        "rank_to": 10,
+        "achievement_key": "EventRankingReward_score32_4",
+        "items": [["Emblem", 3003204, 1]],
+    },
+    {
+        "tier_id": 5,
+        "rank_from": 11,
+        "rank_to": 100,
+        "achievement_key": "EventRankingReward_score32_5",
+        "items": [["Emblem", 3003205, 1]],
+    },
+    {
+        "tier_id": 6,
+        "rank_from": 101,
+        "rank_to": 500,
+        "achievement_key": "EventRankingReward_score32_6",
+        "items": [["Emblem", 3003206, 1]],
+    },
+    {
+        "tier_id": 7,
+        "rank_from": 501,
+        "rank_to": 1000,
+        "achievement_key": "EventRankingReward_score32_7",
+        "items": [["Emblem", 3003207, 1]],
+    },
+    {
+        "tier_id": 8,
+        "rank_from": 1001,
+        "rank_to": 5000,
+        "achievement_key": "EventRankingReward_score32_8",
+        "items": [["Emblem", 3003208, 1]],
+    },
+    {
+        "tier_id": 9,
+        "rank_from": 5001,
+        "rank_to": 10000,
+        "achievement_key": "EventRankingReward_score32_9",
+        "items": [["Emblem", 3003209, 1]],
+    },
+    {
+        "tier_id": 10,
+        "rank_from": 10001,
+        "rank_to": 50000,
+        "achievement_key": "EventRankingReward_score32_10",
+        "items": [["Emblem", 3003210, 1]],
+    },
+    {
+        "tier_id": 11,
+        "rank_from": 50001,
+        "rank_to": 100000,
+        "achievement_key": "EventRankingReward_score32_11",
+        "items": [["Emblem", 3003211, 1]],
+    },
+    {
+        "tier_id": 12,
+        "rank_from": 100001,
+        "rank_to": 500000,
+        "achievement_key": "EventRankingReward_score32_12",
+        "items": [["Emblem", 3003212, 1]],
+    },
+]
 
 SCORE38_TIERS: list[dict[str, Any]] = [
     {
@@ -111,6 +202,208 @@ SCORE38_TIERS: list[dict[str, Any]] = [
         "items": [["Emblem", 3003812, 1]],
     },
 ]
+
+SCORE32_EMBLEM_MAP: dict[int, dict[str, Any]] = {
+    t["items"][0][1]: {
+        "tier_id": t["tier_id"],
+        "rank_from": t["rank_from"],
+        "rank_to": t["rank_to"],
+        "event_id": 32,
+        "ranking_key": "score32",
+    }
+    for t in SCORE32_TIERS
+    if t.get("items") and t["items"][0][0] == "Emblem"
+}
+
+SCORE38_EMBLEM_MAP: dict[int, dict[str, Any]] = {
+    t["items"][0][1]: {
+        "tier_id": t["tier_id"],
+        "rank_from": t["rank_from"],
+        "rank_to": t["rank_to"],
+        "event_id": 38,
+        "ranking_key": "score38",
+    }
+    for t in SCORE38_TIERS
+    if t.get("items") and t["items"][0][0] == "Emblem"
+}
+
+EVENT_EMBLEM_MAP: dict[int, dict[str, Any]] = {
+    **SCORE32_EMBLEM_MAP,
+    **SCORE38_EMBLEM_MAP,
+}
+
+
+def resolve_event_emblem_rank(emblem_id: int, actual_rank: int = 0) -> int:
+    """Resolve the appropriate rank number for an event emblem."""
+    info = EVENT_EMBLEM_MAP.get(emblem_id)
+    if not info:
+        # Generic event emblem pattern: 3000000 + ev_id * 100 + tier_id
+        if 3_000_000 <= emblem_id < 4_000_000:
+            tier_id = emblem_id % 100
+            ev_id = (emblem_id - 3_000_000) // 100
+            if 1 <= tier_id <= len(SCORE38_TIERS):
+                info = {
+                    "tier_id": tier_id,
+                    "rank_from": SCORE38_TIERS[tier_id - 1]["rank_from"],
+                    "rank_to": SCORE38_TIERS[tier_id - 1]["rank_to"],
+                    "event_id": ev_id,
+                    "ranking_key": f"score{ev_id}",
+                }
+    if not info:
+        return actual_rank if actual_rank > 0 else 0
+
+    rank_from = int(info["rank_from"])
+    rank_to = int(info["rank_to"])
+    if actual_rank > 0 and rank_from <= actual_rank <= rank_to:
+        return actual_rank
+    return rank_from
+
+
+POINT32_TIERS: list[dict[str, Any]] = [
+    {
+        "tier_id": 1,
+        "rank_from": 1,
+        "rank_to": 1,
+        "achievement_key": "EventRankingReward_point32_1",
+        "items": [
+            ["Card", 100324, 12],
+            ["Card", 100325, 17],
+            ["Growth", 32004, 1],
+            ["Growth", 32003, 2],
+            ["Growth", 30005, 50],
+        ],
+    },
+    {
+        "tier_id": 2,
+        "rank_from": 2,
+        "rank_to": 2,
+        "achievement_key": "EventRankingReward_point32_2",
+        "items": [
+            ["Card", 100324, 12],
+            ["Card", 100325, 17],
+            ["Growth", 32004, 1],
+            ["Growth", 32003, 1],
+            ["Growth", 30005, 40],
+        ],
+    },
+    {
+        "tier_id": 3,
+        "rank_from": 3,
+        "rank_to": 3,
+        "achievement_key": "EventRankingReward_point32_3",
+        "items": [
+            ["Card", 100324, 12],
+            ["Card", 100325, 17],
+            ["Growth", 32004, 1],
+            ["Growth", 32003, 1],
+            ["Growth", 30005, 30],
+        ],
+    },
+    {
+        "tier_id": 4,
+        "rank_from": 4,
+        "rank_to": 10,
+        "achievement_key": "EventRankingReward_point32_4",
+        "items": [
+            ["Card", 100324, 12],
+            ["Card", 100325, 17],
+            ["Growth", 32003, 1],
+            ["Growth", 30005, 20],
+            ["GenericItem", 32006, 40],
+            ["GenericItem", 32005, 40],
+        ],
+    },
+    {
+        "tier_id": 5,
+        "rank_from": 11,
+        "rank_to": 100,
+        "achievement_key": "EventRankingReward_point32_5",
+        "items": [
+            ["Card", 100324, 12],
+            ["Card", 100325, 17],
+            ["Growth", 32003, 1],
+            ["Growth", 30005, 20],
+            ["GenericItem", 32006, 30],
+            ["GenericItem", 32005, 30],
+        ],
+    },
+    {
+        "tier_id": 6,
+        "rank_from": 101,
+        "rank_to": 1000,
+        "achievement_key": "EventRankingReward_point32_6",
+        "items": [
+            ["Card", 100324, 12],
+            ["Card", 100325, 17],
+            ["Growth", 32003, 1],
+            ["Growth", 30005, 20],
+            ["GenericItem", 32006, 20],
+            ["GenericItem", 32005, 20],
+        ],
+    },
+    {
+        "tier_id": 7,
+        "rank_from": 1001,
+        "rank_to": 5000,
+        "achievement_key": "EventRankingReward_point32_7",
+        "items": [
+            ["Card", 100324, 5],
+            ["Card", 100325, 10],
+            ["Growth", 30005, 10],
+            ["GenericItem", 32006, 10],
+            ["GenericItem", 32005, 10],
+        ],
+    },
+    {
+        "tier_id": 8,
+        "rank_from": 5001,
+        "rank_to": 10000,
+        "achievement_key": "EventRankingReward_point32_8",
+        "items": [
+            ["Card", 100324, 5],
+            ["Card", 100325, 10],
+            ["Growth", 30005, 10],
+            ["GenericItem", 32006, 5],
+            ["GenericItem", 32005, 5],
+        ],
+    },
+    {
+        "tier_id": 9,
+        "rank_from": 10001,
+        "rank_to": 20000,
+        "achievement_key": "EventRankingReward_point32_9",
+        "items": [["Card", 100324, 3], ["Card", 100325, 8], ["Growth", 30005, 5]],
+    },
+    {
+        "tier_id": 10,
+        "rank_from": 20001,
+        "rank_to": 50000,
+        "achievement_key": "EventRankingReward_point32_10",
+        "items": [["Card", 100324, 1], ["Card", 100325, 5], ["Growth", 30005, 3]],
+    },
+    {
+        "tier_id": 11,
+        "rank_from": 50001,
+        "rank_to": 100000,
+        "achievement_key": "EventRankingReward_point32_11",
+        "items": [["Card", 100325, 3]],
+    },
+    {
+        "tier_id": 12,
+        "rank_from": 100001,
+        "rank_to": 200000,
+        "achievement_key": "EventRankingReward_point32_12",
+        "items": [["Card", 100325, 2]],
+    },
+    {
+        "tier_id": 13,
+        "rank_from": 200001,
+        "rank_to": 3000000,
+        "achievement_key": "EventRankingReward_point32_13",
+        "items": [["Card", 100325, 1]],
+    },
+]
+
 
 POINT38_TIERS: list[dict[str, Any]] = [
     {
@@ -256,6 +549,78 @@ POINT38_TIERS: list[dict[str, Any]] = [
         "items": [["Card", 100370, 1]],
     },
 ]
+
+_EVENT_RANKING_CATALOG_CACHE: dict[str, list[dict[str, Any]]] | None = None
+
+
+def get_event_ranking_tiers(category_code: str) -> list[dict[str, Any]]:
+    """Return ranking reward tiers for given category code (e.g. 'score32', 'point32', 'score38')."""
+    global _EVENT_RANKING_CATALOG_CACHE
+    code = category_code.lower().strip()
+
+    # Fast path for pre-compiled constants
+    if code == "score32":
+        return SCORE32_TIERS
+    if code == "point32":
+        return POINT32_TIERS
+    if code == "score38":
+        return SCORE38_TIERS
+    if code == "point38":
+        return POINT38_TIERS
+
+    if _EVENT_RANKING_CATALOG_CACHE is None:
+        p = Path(settings.data_dir) / "metadata" / "event_ranking_rewards.json"
+        if p.exists():
+            try:
+                _EVENT_RANKING_CATALOG_CACHE = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.error("Failed to load event_ranking_rewards.json: %s", e)
+                _EVENT_RANKING_CATALOG_CACHE = {}
+        else:
+            _EVENT_RANKING_CATALOG_CACHE = {}
+
+    if _EVENT_RANKING_CATALOG_CACHE and code in _EVENT_RANKING_CATALOG_CACHE:
+        return _EVENT_RANKING_CATALOG_CACHE[code]
+
+    # Synthesize fallback tiers if not found in catalog
+    match = re.search(r"\d+", code)
+    ev_id = int(match.group(0)) if match else 32
+    if "point" in code:
+        return POINT32_TIERS
+
+    # Synthesize 12 score tiers using standard ranges and emblem IDs: 3000000 + ev_id * 100 + tier_id
+    return [
+        {
+            "tier_id": t["tier_id"],
+            "rank_from": t["rank_from"],
+            "rank_to": t["rank_to"],
+            "achievement_key": f"EventRankingReward_score{ev_id}_{t['tier_id']}",
+            "items": [["Emblem", 3_000_000 + ev_id * 100 + t["tier_id"], 1]],
+        }
+        for t in SCORE38_TIERS
+    ]
+
+
+def parse_ranking_event_id(ranking_event_id: str) -> tuple[str, int, str]:
+    """Parse ranking_event_id string into (reward_type, event_id, category_code).
+
+    Examples:
+        'point32' -> ('point', 32, 'point32')
+        'score32' -> ('score', 32, 'score32')
+        'RE_32_score32' -> ('score', 32, 'score32')
+        'RE_38_point38' -> ('point', 38, 'point38')
+        '32' -> ('score', 32, 'score32')
+    """
+    clean = ranking_event_id.lower().strip()
+    reward_type = "point" if "point" in clean else "score"
+    matches = re.findall(r"\d+", clean)
+    if matches:
+        ev_id = int(matches[-1])
+    else:
+        ev_id = 32
+    category_code = f"{reward_type}{ev_id}"
+    return reward_type, ev_id, category_code
+
 
 GPX_CLASS_TIERS: list[dict[str, Any]] = [
     {
@@ -1037,19 +1402,11 @@ async def check_and_grant_event_ranking_milestones(
     if current_rank <= 0:
         return 0
 
-    clean_key = ranking_event_id.lower()
-    tiers: list[dict[str, Any]] = []
-    category_code = ""
-    category_title = "イベントポイントランキング"
-
-    if "point" in clean_key:
-        tiers = POINT38_TIERS
-        category_code = "point38"
-        category_title = "イベントポイントランキング"
-    else:
-        tiers = SCORE38_TIERS
-        category_code = "score38"
-        category_title = "イベントランキング"
+    reward_type, ev_id, category_code = parse_ranking_event_id(ranking_event_id)
+    tiers = get_event_ranking_tiers(category_code)
+    category_title = (
+        "イベントポイントランキング" if reward_type == "point" else "イベントランキング"
+    )
 
     # 1. Identify all eligible tiers
     eligible_tiers = [t for t in tiers if current_rank <= t["rank_to"]]
@@ -1083,7 +1440,7 @@ async def check_and_grant_event_ranking_milestones(
         or_(
             PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
             PlayerStorageEntry.key.like("GrowthItemStock--%"),
-            PlayerStorageEntry.key.like("ItemStockStatus--13032%"),
+            PlayerStorageEntry.key.like(f"ItemStockStatus--13{ev_id:03d}%"),
             PlayerStorageEntry.key.like("CardStatus--%"),
         ),
     )
@@ -1113,8 +1470,13 @@ async def check_and_grant_event_ranking_milestones(
         except Exception:
             pass
 
+    emblem_rankings_to_save: dict[int, int] = {}
     for tier in eligible_tiers:
         tier_label = f"rank_rew:{category_code}:tier_{tier['tier_id']}"
+        for it_prefix, it_id, _ in tier["items"]:
+            if it_prefix == "Emblem" and current_rank > 0:
+                emblem_rankings_to_save[it_id] = resolve_event_emblem_rank(it_id, current_rank)
+
         if tier_label in existing_labels:
             continue
 
@@ -1130,9 +1492,10 @@ async def check_and_grant_event_ranking_milestones(
                 granted_cards.add(it_id)
 
             item_type = 1 if it_prefix in ("VC", "VirtualCurrency", "Stone") else 0
-            val_bytes = json.dumps({"Prefix": it_prefix, "Value": it_id, "Count": it_cnt}).encode(
-                "utf-8"
-            )
+            val_data: dict[str, Any] = {"Prefix": it_prefix, "Value": it_id, "Count": it_cnt}
+            if it_prefix == "Emblem" and current_rank > 0:
+                val_data["EventRankNo"] = resolve_event_emblem_rank(it_id, current_rank)
+            val_bytes = json.dumps(val_data).encode("utf-8")
 
             msg = f"【{category_title}】{rank_to:,}位以内達成報酬！"
             if rank_to <= 3:
@@ -1158,6 +1521,11 @@ async def check_and_grant_event_ranking_milestones(
             new_items_count += 1
 
         existing_labels.add(tier_label)
+
+    if emblem_rankings_to_save:
+        from dankagu.services.player_storage import add_event_emblem_rankings_to_storage
+
+        await add_event_emblem_rankings_to_storage(session, player_id, emblem_rankings_to_save, now)
 
     return new_items_count
 
