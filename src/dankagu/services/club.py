@@ -14,7 +14,7 @@ import uuid
 import grpc
 from google.protobuf.internal.decoder import _DecodeVarint
 from google.protobuf.internal.encoder import _VarintBytes
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -562,6 +562,17 @@ class ClubService(club_pb2_grpc.ClubServicer):
                 )
             )
 
+            # Invalidate any other pending join requests by this player for this slot
+            await session.execute(
+                update(ClubJoinRequest)
+                .where(
+                    ClubJoinRequest.player_id == current_pid,
+                    ClubJoinRequest.slot_id == slot_id,
+                    ClubJoinRequest.status == 0,
+                )
+                .values(status=2, updated_at=now)
+            )
+
             await session.commit()
 
             proto_club = await build_club_proto(session, new_club)
@@ -1065,6 +1076,18 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
                     created_at=now,
                 )
                 session.add(welcome_msg)
+
+                # Invalidate any other pending join requests by this player for this slot
+                await session.execute(
+                    update(ClubJoinRequest)
+                    .where(
+                        ClubJoinRequest.player_id == current_pid,
+                        ClubJoinRequest.slot_id == slot_id,
+                        ClubJoinRequest.status == 0,
+                    )
+                    .values(status=2, updated_at=now)
+                )
+
                 await session.commit()
 
                 proto_club = await build_club_proto(session, club_row)
@@ -1142,6 +1165,30 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
             )
             rows = (await session.execute(stmt)).all()
 
+            # Filter out stale requests where applicant already occupied that slot or is already in this club
+            now = int(time.time())
+            valid_rows = []
+            has_cleaned = False
+            for req, player in rows:
+                occupied = (
+                    await session.execute(
+                        select(ClubMember.id).where(
+                            ClubMember.player_id == req.player_id,
+                            (ClubMember.slot_id == req.slot_id) | (ClubMember.club_id == req.club_id),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if occupied:
+                    # Player already in this club or already joined another club on this slot
+                    req.status = 2  # SUPERSEDED
+                    req.updated_at = now
+                    has_cleaned = True
+                    continue
+                valid_rows.append((req, player))
+
+            if has_cleaned:
+                await session.commit()
+
             club_row = (
                 await session.execute(select(Club).where(Club.id == request.club_id))
             ).scalar_one_or_none()
@@ -1149,7 +1196,7 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
 
             requests_list = []
             keys = list(request.player_storage_keys)
-            for req, player in rows:
+            for req, player in valid_rows:
                 entries = []
                 if keys:
                     entries = await query_player_storage_entries(session, player.id, keys)
@@ -1220,59 +1267,138 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
                 )
             ).scalar_one_or_none()
             if not req or req.status != 0:
-                context.abort(grpc.StatusCode.NOT_FOUND, "Request not found or already processed")
+                # Already processed or missing: return success so client UI cleans up gracefully
+                return club_player_join_request_pb2.ClubPlayerJoinRequestApprove.Response(
+                    request_id=request.request_id
+                )
 
-            req.status = 1  # APPROVED
-            req.updated_at = now
-
-            # Check if club still exists and has space
+            # Check target club
             club_row = (
                 await session.execute(select(Club).where(Club.id == req.club_id))
             ).scalar_one_or_none()
-            if club_row and club_row.member_count < club_row.max_members:
-                # Add to club_members
-                member = ClubMember(
-                    club_id=req.club_id,
-                    player_id=req.player_id,
-                    slot_id=req.slot_id,
-                    role=3,  # MEMBER
-                    joined_at=now,
-                    last_logged_in_at=now,
-                )
-                session.add(member)
-                club_row.member_count += 1
+            if not club_row:
+                context.abort(grpc.StatusCode.NOT_FOUND, "Club not found")
 
-                # Update applicant JoinClubStatus--{slot_id} to Join (3)
-                leader = (
-                    await session.execute(
-                        select(Player).where(Player.id == club_row.leader_player_id)
+            # Check 1: Is applicant already a member of this club?
+            already_member = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.club_id == req.club_id,
+                        ClubMember.player_id == req.player_id,
                     )
-                ).scalar_one_or_none()
-                leader_short_id = leader.short_id if leader else ""
-                await update_player_club_status(
-                    session=session,
-                    player_id=req.player_id,
-                    slot_id=req.slot_id,
-                    status=3,  # Join
-                    club_id=club_row.id,
-                    club_name=club_row.name,
-                    leader_short_id=leader_short_id,
-                    last_position_id=3,
+                )
+            ).scalar_one_or_none()
+            if already_member:
+                logger.info(
+                    "ℹ️ [ClubJoinRequest] Applicant %s is already a member of club %s",
+                    req.player_id,
+                    req.club_id,
+                )
+                req.status = 1  # APPROVED
+                req.updated_at = now
+                await session.commit()
+                return club_player_join_request_pb2.ClubPlayerJoinRequestApprove.Response(
+                    request_id=request.request_id
                 )
 
-                # Post welcome chat
-                applicant = (
-                    await session.execute(select(Player).where(Player.id == req.player_id))
-                ).scalar_one_or_none()
-                nickname = applicant.nickname or applicant.name if applicant else "Player"
-                welcome_msg = ClubChatMessage(
-                    club_id=req.club_id,
-                    player_id=req.player_id,
-                    message_type=2,
-                    content=format_chat_message_content(f"{nickname} がクラブに参加しました！"),
-                    created_at=now,
+            # Check 2: Does applicant's requested slot already belong to another club?
+            slot_occupied_by = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.player_id == req.player_id,
+                        ClubMember.slot_id == req.slot_id,
+                    )
                 )
-                session.add(welcome_msg)
+            ).scalar_one_or_none()
+            if slot_occupied_by:
+                logger.warning(
+                    "⚠️ [ClubJoinRequest] Applicant %s requested slot %s, which is already occupied by club %s. Auto-resolving request %s as superseded.",
+                    req.player_id,
+                    req.slot_id,
+                    slot_occupied_by.club_id,
+                    req.id,
+                )
+                req.status = 2  # REJECTED / SUPERSEDED
+                req.updated_at = now
+                await session.commit()
+                return club_player_join_request_pb2.ClubPlayerJoinRequestApprove.Response(
+                    request_id=request.request_id
+                )
+
+            # Check 3: Is the club full?
+            if club_row.member_count >= club_row.max_members:
+                logger.warning(
+                    "⚠️ [ClubJoinRequest] Club %s is full (%s/%s). Cannot approve request %s.",
+                    club_row.id,
+                    club_row.member_count,
+                    club_row.max_members,
+                    req.id,
+                )
+                req.status = 2  # REJECTED
+                req.updated_at = now
+                await session.commit()
+                return club_player_join_request_pb2.ClubPlayerJoinRequestApprove.Response(
+                    request_id=request.request_id
+                )
+
+            # All checks pass -> Add to club_members
+            req.status = 1  # APPROVED
+            req.updated_at = now
+
+            member = ClubMember(
+                club_id=req.club_id,
+                player_id=req.player_id,
+                slot_id=req.slot_id,
+                role=3,  # MEMBER
+                joined_at=now,
+                last_logged_in_at=now,
+            )
+            session.add(member)
+            club_row.member_count += 1
+
+            # Update applicant JoinClubStatus--{slot_id} to Join (3)
+            leader = (
+                await session.execute(
+                    select(Player).where(Player.id == club_row.leader_player_id)
+                )
+            ).scalar_one_or_none()
+            leader_short_id = leader.short_id if leader else ""
+            await update_player_club_status(
+                session=session,
+                player_id=req.player_id,
+                slot_id=req.slot_id,
+                status=3,  # Join
+                club_id=club_row.id,
+                club_name=club_row.name,
+                leader_short_id=leader_short_id,
+                last_position_id=3,
+            )
+
+            # Invalidate any other pending join requests by this player for this slot
+            await session.execute(
+                update(ClubJoinRequest)
+                .where(
+                    ClubJoinRequest.player_id == req.player_id,
+                    ClubJoinRequest.slot_id == req.slot_id,
+                    ClubJoinRequest.status == 0,
+                    ClubJoinRequest.id != req.id,
+                )
+                .values(status=2, updated_at=now)
+            )
+
+            # Post welcome chat
+            applicant = (
+                await session.execute(select(Player).where(Player.id == req.player_id))
+            ).scalar_one_or_none()
+            nickname = applicant.nickname or applicant.name if applicant else "Player"
+            welcome_msg = ClubChatMessage(
+                club_id=req.club_id,
+                player_id=req.player_id,
+                message_type=2,
+                content=format_chat_message_content(f"{nickname} がクラブに参加しました！"),
+                created_at=now,
+            )
+            session.add(welcome_msg)
 
             await session.commit()
             return club_player_join_request_pb2.ClubPlayerJoinRequestApprove.Response(
@@ -1299,14 +1425,23 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
             req.status = 2  # REJECTED
             req.updated_at = now
 
-            # Reset applicant JoinClubStatus--{slot_id} to Open (1)
-            await update_player_club_status(
-                session=session,
-                player_id=req.player_id,
-                slot_id=req.slot_id,
-                status=1,  # Open / Withdrawn
-                withdrawed_at=now,
-            )
+            # Reset applicant JoinClubStatus--{slot_id} to Open (1) ONLY if not active in this slot
+            active_member = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.player_id == req.player_id,
+                        ClubMember.slot_id == req.slot_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if not active_member:
+                await update_player_club_status(
+                    session=session,
+                    player_id=req.player_id,
+                    slot_id=req.slot_id,
+                    status=1,  # Open / Withdrawn
+                    withdrawed_at=now,
+                )
 
             await session.commit()
             return club_player_join_request_pb2.ClubPlayerJoinRequestReject.Response(
@@ -1330,13 +1465,22 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
             if req:
                 req.status = 3  # CANCELLED
                 req.updated_at = now
-                await update_player_club_status(
-                    session=session,
-                    player_id=req.player_id,
-                    slot_id=req.slot_id,
-                    status=1,  # Open / Withdrawn
-                    withdrawed_at=now,
-                )
+                active_member = (
+                    await session.execute(
+                        select(ClubMember).where(
+                            ClubMember.player_id == req.player_id,
+                            ClubMember.slot_id == req.slot_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if not active_member:
+                    await update_player_club_status(
+                        session=session,
+                        player_id=req.player_id,
+                        slot_id=req.slot_id,
+                        status=1,  # Open / Withdrawn
+                        withdrawed_at=now,
+                    )
                 await session.commit()
             return club_player_join_request_pb2.ClubPlayerJoinRequestCancel.Response()
 
@@ -1356,13 +1500,22 @@ class ClubPlayerJoinRequestService(club_player_join_request_pb2_grpc.ClubPlayerJ
             for r in rows:
                 r.status = 2
                 r.updated_at = now
-                await update_player_club_status(
-                    session=session,
-                    player_id=r.player_id,
-                    slot_id=r.slot_id,
-                    status=1,  # Open / Withdrawn
-                    withdrawed_at=now,
-                )
+                active_member = (
+                    await session.execute(
+                        select(ClubMember).where(
+                            ClubMember.player_id == r.player_id,
+                            ClubMember.slot_id == r.slot_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if not active_member:
+                    await update_player_club_status(
+                        session=session,
+                        player_id=r.player_id,
+                        slot_id=r.slot_id,
+                        status=1,  # Open / Withdrawn
+                        withdrawed_at=now,
+                    )
             await session.commit()
             return club_player_join_request_pb2.ClubPlayerJoinRequestRejectAll.Response()
 

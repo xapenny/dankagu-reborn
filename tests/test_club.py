@@ -537,3 +537,104 @@ async def test_club_scalar_points_and_achievement_increment():
         assert res2.scalar.value == 100200
     finally:
         reset_current_player(tokens)
+
+
+# ---------------------------------------------------------------------------
+# 7. Club Join Conflict & Slot Collision Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_club_approve_when_applicant_slot_already_occupied_auto_resolves():
+    """Verify that approving an applicant who already joined another club in that slot
+
+    auto-resolves cleanly without throwing a unique constraint violation error (20027-2).
+    """
+    await init_db()
+
+    # 1. Leader 1 creates Club 1 (Manual approval)
+    leader1 = await ensure_player(nickname="Leader1")
+    tokens_l1 = set_current_player(leader1)
+    try:
+        club1_id = (
+            await _create_club(f"Manual {uuid.uuid4().hex[:8]}", approval_policy=1)
+        ).club.club_id
+    finally:
+        reset_current_player(tokens_l1)
+
+    # 2. Leader 2 creates Club 2 (Auto approval)
+    leader2 = await ensure_player(nickname="Leader2")
+    tokens_l2 = set_current_player(leader2)
+    try:
+        club2_id = (
+            await _create_club(f"Auto {uuid.uuid4().hex[:8]}", approval_policy=2)
+        ).club.club_id
+    finally:
+        reset_current_player(tokens_l2)
+
+    # 3. Applicant applies to Club 1 (Slot 0 is free, request status=0)
+    applicant = await ensure_player(nickname="ConflictApplicant")
+    tokens_a = set_current_player(applicant)
+    try:
+        req_resp = await ClubPlayerJoinRequestService().Create(
+            join_pb2.ClubPlayerJoinRequestCreate.Request(club_id=club1_id), DummyContext()
+        )
+        req_id = req_resp.request.request_id
+        assert req_id
+
+        # 4. Applicant joins Club 2 (Auto approval occupies Slot 0!)
+        auto_resp = await ClubPlayerJoinRequestService().Create(
+            join_pb2.ClubPlayerJoinRequestCreate.Request(club_id=club2_id), DummyContext()
+        )
+        assert auto_resp.request.request_id
+    finally:
+        reset_current_player(tokens_a)
+
+    # 5. Leader 1 approves the application to Club 1
+    # Previously, this crashed with UniqueViolationError on uq_player_slot
+    tokens_l1 = set_current_player(leader1)
+    try:
+        resp = await ClubPlayerJoinRequestService().Approve(
+            join_pb2.ClubPlayerJoinRequestApprove.Request(request_id=req_id), DummyContext()
+        )
+        assert resp.request_id == req_id
+
+        # Verify in DB: request was auto-resolved as superseded (status=2)
+        async with get_sessionmaker()() as session:
+            req_row = await session.get(ClubJoinRequest, req_id)
+            assert req_row.status == 2
+
+            # Verify applicant was NOT added to Club 1
+            from sqlalchemy import select
+
+            from dankagu.models.club import ClubMember
+
+            c1_member = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.club_id == club1_id, ClubMember.player_id == applicant
+                    )
+                )
+            ).scalar_one_or_none()
+            assert c1_member is None
+
+            # Verify applicant is still active member of Club 2
+            c2_member = (
+                await session.execute(
+                    select(ClubMember).where(
+                        ClubMember.club_id == club2_id, ClubMember.player_id == applicant
+                    )
+                )
+            ).scalar_one_or_none()
+            assert c2_member is not None
+            assert c2_member.slot_id == 0
+
+        # Verify GetMultiByClub filters out stale/conflicted requests
+        club_reqs = await ClubPlayerJoinRequestService().GetMultiByClub(
+            join_pb2.ClubPlayerJoinRequestGetMultiByClub.Request(club_id=club1_id),
+            DummyContext(),
+        )
+        assert not any(r.request_id == req_id for r in club_reqs.requests)
+    finally:
+        reset_current_player(tokens_l1)
+
