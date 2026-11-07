@@ -1622,8 +1622,11 @@ class ClubChatService(club_chat_pb2_grpc.ClubChatServicer):
                 )
                 messages.append(proto_msg)
 
-            # Return in chronological order
-            messages.reverse()
+            # Return in descending order (newest first, index 0 = latest message).
+            # Note: The client's UiScrollList in ClubUIChatLayer is configured with
+            # is_bottom_front = true, which positions index 0 at the bottom and
+            # index N-1 at the top, naturally creating a bottom-pinned chronological chat
+            # and allowing Hakoniwa's GetPostedTopMessage() to read index 0 as the latest message.
             return club_chat_pb2.ClubChatGet.Response(message=messages)
 
     async def GetMessagesCount(
