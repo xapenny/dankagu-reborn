@@ -374,7 +374,7 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
     assert coin_gift.system_resource_num == 1000000
 
     stone_gift = next(g for g in new_login_gifts if g.system_resource_name == "FREE_STONE")
-    assert stone_gift.system_resource_num == 10000
+    assert stone_gift.system_resource_num == 30000
 
     wallet_service = WalletService()
     bal_before = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
@@ -389,7 +389,7 @@ async def test_daily_login_tracking_and_bonus(sample_player: Player) -> None:
 
     bal_after = await wallet_service.GetBalancesV2(wallet_pb2.WalletGetBalancesV2.Request(), ctx)
     vc_after = {vc.virtual_currency_name: vc.amount for vc in bal_after.total.virtual_currencies}
-    assert vc_after.get("FREE_STONE", 0) == free_before + 10000
+    assert vc_after.get("FREE_STONE", 0) == free_before + 30000
 
     # Verify storage has growth (500), hakoniwa (200), boost heal (10), and universal heroine fragment (200) persisted
     from dankagu.core.growth import decode_growth_item
