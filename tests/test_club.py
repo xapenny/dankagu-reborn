@@ -410,8 +410,9 @@ async def test_club_chat_messages_and_count():
             club_chat_pb2.ClubChatGet.Request(club_id=club_id, max_results=10), DummyContext()
         )
         assert len(chat_history.message) == 2
-        assert "Hello club members!" in chat_history.message[0].content
-        assert "stamp_01" in chat_history.message[1].content
+        # Newest first (index 0 is the latest message)
+        assert "stamp_01" in chat_history.message[0].content
+        assert "Hello club members!" in chat_history.message[1].content
     finally:
         reset_current_player(tokens)
 

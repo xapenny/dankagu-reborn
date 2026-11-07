@@ -63,7 +63,7 @@ flowchart TD
     subgraph gRPC_Svc["Takasho gRPC — grpc.aio (50051 plaintext, 50052 TLS)"]
         Interceptor["TakashoAsyncInterceptor<br/>(Envoy headers, logging,<br/>auto-mock fallback)"]
         Codec["takasho_unary_handler<br/>+ TakashoPacker"]
-        Servicers["27 servicer registrations<br/>131 handler bindings"]
+        Servicers["28 servicer registrations<br/>43 service namespaces<br/>157 handler bindings"]
     end
 
     subgraph Assets["Portal and Asset CDN — FastAPI (8080, plain HTTP)"]
@@ -130,19 +130,19 @@ Measured against the shipped code:
 |---|---|
 | Takasho framing codec (cipher + Deflate + HMAC) | Complete, with known-answer tests |
 | LCX REST auth surface | Identity, transfer, IAP, push, subscription, currency-exchange and analytics routes, with an `/identity/*` catch-all |
-| gRPC servicer registrations | **27** (`grpc/server.py`) |
-| RPC handler bindings wired | 131 `takasho_unary_handler` bindings in `services/` |
+| gRPC servicer registrations | **28** (`grpc/server.py`) exposing **43 service namespaces** |
+| RPC handler bindings wired | **157** `takasho_unary_handler` bindings in `services/` |
 | RPCs answered by the auto-mock fallback | The remainder — empty but valid responses |
 | On-demand manifest generation | Archives synthesized at startup |
-| Persistence | **32 tables** (accounts, sessions, wallet, inventory, gacha, social, ranking, club, master data, KV/storage) |
-| Schema migrations | 9 Alembic revisions (`0001_baseline` … `0009_performance_indexes`) |
-| Test suite | **166 tests across 24 modules**, run against PostgreSQL in CI |
+| Persistence | **33 tables** (accounts, sessions, wallet, inventory, gacha, social, ranking, club, master data, KV/storage) |
+| Schema migrations | **10 Alembic revisions** (`0001_baseline` … `0010_club_tables`) |
+| Test suite | **201 tests across 26 modules**, run against PostgreSQL in CI |
 
 Implemented gameplay domains: login bonus, wallet and purchases, loot box (gacha)
-and step-up loot box, player inventory and growth, achievements, reconstruction
-spots, restoration, friends, MySpace and photo album, event and song rankings,
-FES player data, player KVS/preferences. The **club** system (servicers, models)
-is in progress and not yet covered by a migration.
+and step-up loot box, event box gacha, player inventory and growth,
+achievements, reconstruction spots, restoration, friends, MySpace and photo album,
+event and song rankings with instant milestone mailbox delivery, Medley Grand Prix,
+full Club ecosystem with 9 specialized services, FES player data, and player KVS.
 
 ---
 
@@ -162,7 +162,7 @@ user-id-token), `/auth/user-access-token`, `/push/*`, `/subs/*`,
 compliant JWTs (`accessToken`, `lcxUserIdToken`, `signInSessionToken`).
 Token signing fails closed if `DANKAGU_JWT_SECRET` is unset.
 
-**Takasho gRPC engine.** A coroutine-based `grpc.aio` server exposing 26 service
+**Takasho gRPC engine.** A coroutine-based `grpc.aio` server exposing 43 service
 namespaces across the `common_featureset` and `fes` families, wired through
 `add_generic_rpc_handlers` so every method passes through the packer codec. An
 async interceptor injects the Envoy and Takasho metadata headers the protocol
@@ -182,10 +182,12 @@ handled by the database, and credentials are redacted from logs.
 master data states, and receipts make IAP purchases idempotent. Gacha pools live
 in the database; a pull never rolls from an empty pool, multi-pulls are
 de-duplicated, and duplicate cards are kept as one collection entry with a copy
-count.
+count. Event box gacha provides 13-tier box progression per event with infinite loop boxes, spendable event point deductions, and reset capabilities.
 
 **Social and ranking.** Friends (with gated player search), MySpace, photo
-album, song and event leaderboards, and per-caller reconstruction-spot responses.
+album, song and event leaderboards, and per-caller reconstruction-spot responses. Event score/point rankings and Medley Grand Prix support instant milestone mailbox rewards upon tier achievement, granting exclusive title emblems, event cards, VC, and items with automated self-healing.
+
+**Club system.** A complete multi-service implementation spanning 9 Takasho club services (`Club`, `ClubPlayer`, `ClubPlayerJoinRequest`, `ClubChat`, `ClubAchievement`, `ClubStorage`, `ClubSpaceStorage`, `ClubScalar`, `ClubProduct`). Supports Danmaku Kagura's 3-slot simultaneous membership model with Slot 0 leader isolation, applicant slot collision healing, in-club chat with stamp counters, 3D Club Space preset multi-lock storage, ClubPoint scalar energy, and club shop product exchange with atomic point deduction and storage persistence.
 
 **Schema migrations.** Alembic revisions live under `src/dankagu/db/migrations/`
 and are applied under a PostgreSQL advisory lock before any listener binds;
@@ -321,13 +323,14 @@ dankagu-reborn/
 │   │   ├── growth.py          #   Card growth / cultivation
 │   │   ├── gacha_seed.py      #   Gacha pool seeding
 │   │   ├── master_seed.py     #   Master-data seeding
+│   │   ├── ranking_rewards.py #   Milestone ranking & GPX mailbox reward engine
 │   │   ├── starter.py         #   New-player starter data
 │   │   ├── storage_state.py   #   PlayerStorage state helpers
 │   │   ├── redaction.py       #   Credential redaction for logs
 │   │   └── net.py             #   LAN IP detection
 │   ├── db/
 │   │   ├── migrate.py         #   Migration runner (advisory lock, legacy stamping)
-│   │   └── migrations/        #   Alembic revisions 0001-0009
+│   │   └── migrations/        #   Alembic revisions 0001-0010
 │   ├── lcx/
 │   │   ├── app.py             #   FastAPI app factory and request logging
 │   │   ├── router.py          #   Auth and identity routes
@@ -337,13 +340,13 @@ dankagu-reborn/
 │   │   ├── codec.py           #   Packer-aware unary handler wrapper
 │   │   ├── interceptors.py    #   Envoy/Takasho metadata + auto-mock fallback
 │   │   └── generated/         #   BUILD OUTPUT — regenerate with compile_protos.py
-│   ├── services/              #   27 servicer registrations (storage, wallet, loot box, friends, ...)
-│   ├── models/                #   SQLAlchemy ORM models (32 tables)
+│   ├── services/              #   28 servicer registrations / 43 namespaces (storage, club, ranking, ...)
+│   ├── models/                #   SQLAlchemy ORM models (33 tables)
 │   └── assets/
 │       ├── server.py          #   Asset routes, CA routes, status, fallback resolver
 │       ├── generator.py       #   arg_m_* / arg_t_* manifest synthesis
 │       └── portal.py          #   Setup portal UI
-└── tests/                     # 166 tests across 24 modules
+└── tests/                     # 201 tests across 26 modules
 ```
 
 ---
