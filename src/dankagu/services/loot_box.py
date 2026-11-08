@@ -536,7 +536,11 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                         .values(card_ids=json.dumps(drawn_cards))
                     )
 
-                if not replayed and gacha_id in GACHA_EXCHANGE_TICKETS and (is_ten_pull or pull_count == 10):
+                if (
+                    not replayed
+                    and gacha_id in GACHA_EXCHANGE_TICKETS
+                    and (is_ten_pull or pull_count == 10)
+                ):
                     from dankagu.models.storage import PlayerKeyValue
                     from dankagu.services.box_loot_box import encode_raw_protobuf
                     from dankagu.services.player_storage import _upsert_entry
@@ -614,7 +618,9 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             inv.schema_key = "ITEM"
             inv.value = item_payload
             inv.route = 3  # Route.LootBox
-            inv.message = "ポイント夢見くじで取得した商品です" if is_pt else "夢見くじで獲得した商品です"
+            inv.message = (
+                "ポイント夢見くじで取得した商品です" if is_pt else "夢見くじで獲得した商品です"
+            )
             inv.search_label = "Card"
             inv.opened_at = now
             inv.expired_at = 4102498799
