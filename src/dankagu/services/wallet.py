@@ -30,27 +30,21 @@ class WalletService(wallet_pb2_grpc.WalletServicer):
             return
 
         from google.protobuf import json_format
-        from sqlalchemy import select
 
-        from dankagu.models.master import MasterSystemTemplate
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(
-                    select(MasterSystemTemplate).where(MasterSystemTemplate.key == "wallet")
+            tmpl_data = metadata.get_wallet_template()
+            if tmpl_data:
+                resp = wallet_pb2.WalletGetBalancesV2.Response()
+                json_format.ParseDict(tmpl_data, resp, ignore_unknown_fields=True)
+                self.cached_response = resp
+                logger.info(
+                    "💰 Loaded wallet template with %d player key values from metadata",
+                    len(self.cached_response.total.player_key_values),
                 )
-                tmpl = result.scalar_one_or_none()
-                if tmpl and tmpl.data:
-                    resp = wallet_pb2.WalletGetBalancesV2.Response()
-                    json_format.ParseDict(tmpl.data, resp, ignore_unknown_fields=True)
-                    self.cached_response = resp
-                    logger.info(
-                        "💰 Loaded wallet template with %d player key values from PostgreSQL",
-                        len(self.cached_response.total.player_key_values),
-                    )
         except Exception as e:
-            logger.error("Failed to load wallet template from database: %s", e)
+            logger.error("Failed to load wallet template from metadata: %s", e)
 
         if self.cached_response is None:
             self.cached_response = wallet_pb2.WalletGetBalancesV2.Response()

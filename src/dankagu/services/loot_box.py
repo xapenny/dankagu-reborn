@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 
 import grpc
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from dankagu.core.economy import (
     get_or_create_wallet,
     get_player_key_value,
 )
+from dankagu.core.metadata import GachaBanner, GachaCard, metadata
 from dankagu.core.session import get_current_player_id
 from dankagu.grpc.codec import takasho_unary_handler
 from dankagu.grpc.errors import fail_internal_on_error
@@ -27,8 +28,6 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     loot_box_pb2,
     loot_box_pb2_grpc,
 )
-from dankagu.models.gacha import GachaBanner, GachaCard
-from dankagu.models.master import MasterLootBoxProduct
 from dankagu.models.receipt import PurchaseReceipt
 
 logger = logging.getLogger("dankagu.services.loot_box")
@@ -57,38 +56,19 @@ _CARDS_BY_ID: dict[int, GachaCard] = {}
 _GACHA_CACHE_INITIALIZED = False
 
 
-async def load_gacha_cache_from_db(session: AsyncSession) -> None:
-    """Load card pool and banner configurations from database into memory."""
+async def load_gacha_cache_from_db(session: AsyncSession | None = None) -> None:
+    """Load card pool and banner configurations from metadata repository into memory."""
     global _CARDS_BY_RARITY, _BY_ELEMENT, _BANNERS, _CARDS_BY_ID, _GACHA_CACHE_INITIALIZED
 
-    cards_stmt = select(GachaCard).where(GachaCard.enabled)
-    cards = (await session.execute(cards_stmt)).scalars().all()
-
-    banners_stmt = select(GachaBanner).where(GachaBanner.enabled)
-    banners = (await session.execute(banners_stmt)).scalars().all()
-
-    by_rarity: dict[int, list[int]] = {1: [], 2: [], 3: [], 4: []}
-    by_elem: dict[int, dict[int, list[int]]] = {1: {}, 2: {}, 3: {}}
-    cards_map: dict[int, GachaCard] = {}
-    banners_map: dict[int, GachaBanner] = {}
-
-    for c in cards:
-        cards_map[c.id] = c
-        by_rarity.setdefault(c.rarity, []).append(c.id)
-        if c.element in (1, 2, 3):
-            by_elem.setdefault(c.element, {}).setdefault(c.rarity, []).append(c.id)
-
-    for b in banners:
-        banners_map[b.id] = b
-
-    _CARDS_BY_RARITY = by_rarity
-    _BY_ELEMENT = by_elem
-    _CARDS_BY_ID = cards_map
-    _BANNERS = banners_map
+    metadata.load_all()
+    _CARDS_BY_RARITY = metadata.cards_by_rarity
+    _BY_ELEMENT = metadata.cards_by_element
+    _BANNERS = metadata.banners
+    _CARDS_BY_ID = metadata.cards
     _GACHA_CACHE_INITIALIZED = True
 
     logger.info(
-        "🃏 Loaded gacha cache from database: %d SSR, %d SR, %d R, %d N cards across %d banners",
+        "🃏 Loaded gacha cache from metadata: %d SSR, %d SR, %d R, %d N cards across %d banners",
         len(_CARDS_BY_RARITY.get(4, [])),
         len(_CARDS_BY_RARITY.get(3, [])),
         len(_CARDS_BY_RARITY.get(2, [])),
@@ -195,13 +175,13 @@ async def _master_price(session: AsyncSession, product_id: str) -> MasterPrice |
     (``G_159_*``, for instance) stay on the built-in heuristic; inventing a price for
     them here would be worse than leaving the status quo in place.
     """
-    row = await session.get(MasterLootBoxProduct, product_id)
-    if row is None or not isinstance(row.data, dict):
+    raw_data = metadata.get_loot_box_product(product_id)
+    if raw_data is None or not isinstance(raw_data, dict):
         return None
 
-    product = row.data.get("lootProduct")
+    product = raw_data.get("lootProduct")
     if not isinstance(product, dict):
-        product = row.data
+        product = raw_data
 
     raw_pull_count = product.get("totalLotNum")
     try:
@@ -245,26 +225,21 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             return
 
         from google.protobuf import json_format
-        from sqlalchemy import select
 
-        from dankagu.models.master import MasterLootBoxProduct
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(select(MasterLootBoxProduct))
-                rows = result.scalars().all()
-                for r in rows:
-                    resp = loot_box_pb2.LootBoxV3GetAvailableV1.Response()
-                    p = resp.loot_box_products.add()
-                    json_format.ParseDict(r.data, p, ignore_unknown_fields=True)
-                    self.all_template_products.append(p)
-                logger.info(
-                    "🎁 Loaded %d gacha products from PostgreSQL",
-                    len(self.all_template_products),
-                )
+            for data in metadata.get_all_loot_box_products():
+                resp = loot_box_pb2.LootBoxV3GetAvailableV1.Response()
+                p = resp.loot_box_products.add()
+                json_format.ParseDict(data, p, ignore_unknown_fields=True)
+                self.all_template_products.append(p)
+            logger.info(
+                "🎁 Loaded %d gacha products from metadata",
+                len(self.all_template_products),
+            )
         except Exception as e:
-            logger.error("Failed to load loot box products from database: %s", e)
+            logger.error("Failed to load loot box templates from metadata: %s", e)
 
     async def GetAvailableV1(
         self,
@@ -502,7 +477,7 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                         now,
                     )
 
-                banner = await session.get(GachaBanner, gacha_id)
+                banner = _BANNERS.get(gacha_id)
                 has_guaranteed_ssr = (
                     (banner.guaranteed_ssr if banner else False)
                     or gacha_id in (1, 3, 163, 167, 171)

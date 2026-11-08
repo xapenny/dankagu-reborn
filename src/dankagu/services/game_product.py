@@ -16,6 +16,7 @@ from dankagu.core.economy import (
     deduct_stones,
     get_or_create_wallet,
 )
+from dankagu.core.metadata import metadata
 from dankagu.core.session import get_current_player_id
 from dankagu.core.storage_state import StorageRevisionManager
 from dankagu.grpc.codec import takasho_unary_handler
@@ -27,7 +28,6 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.resource.game_produ
     GameProduct as ProtoGameProduct,
 )
 from dankagu.models.inventory import PlayerInventoryItem
-from dankagu.models.master import MasterGameProduct
 from dankagu.models.storage import PlayerKeyValue
 from dankagu.services.box_loot_box import encode_raw_protobuf
 from dankagu.services.player_storage import _upsert_entry, batch_upsert_storage_entries
@@ -46,12 +46,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
             return
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(select(MasterGameProduct))
-                rows = result.scalars().all()
-                raw_list = [r.data for r in rows]
-
+            raw_list = metadata.get_game_products()
             chunk_size = 100
             chunks = [raw_list[i : i + chunk_size] for i in range(0, len(raw_list), chunk_size)]
             for page_idx, chunk in enumerate(chunks, start=1):
@@ -81,7 +76,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
                 self.pages[cur_token] = resp
 
             logger.info(
-                "🛍️ Loaded %d pages of game products from PostgreSQL (root has %d items)",
+                "🛍️ Loaded %d pages of game products from metadata (root has %d items)",
                 len(self.pages),
                 len(
                     self.pages.get(
@@ -90,7 +85,7 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
                 ),
             )
         except Exception as e:
-            logger.error("Failed to load game products from database: %s", e)
+            logger.error("Failed to load game products from metadata: %s", e)
 
     def _find_product(self, product_id: str) -> ProtoGameProduct | None:
         """Find a game product by its ID across all cached pages."""
@@ -120,13 +115,10 @@ class GameProductService(game_product_pb2_grpc.GameProductServicer):
     ) -> tuple[ProtoGameProduct | None, PlayerInventoryItem | None, int, int, dict[str, int]]:
         prod = self._find_product(product_id)
         if not prod:
-            res = await session.execute(
-                select(MasterGameProduct).where(MasterGameProduct.id == product_id)
-            )
-            row = res.scalar_one_or_none()
-            if row and row.data:
+            raw_data = metadata.get_game_product(product_id)
+            if raw_data:
                 prod = ProtoGameProduct()
-                json_format.ParseDict(row.data, prod, ignore_unknown_fields=True)
+                json_format.ParseDict(raw_data, prod, ignore_unknown_fields=True)
 
         free_remaining, paid_remaining = 0, 0
         pkv_dict: dict[str, int] = {}

@@ -17,9 +17,9 @@ from sqlalchemy import select
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import get_or_create_wallet
 from dankagu.core.identity import resolve_or_create_player
+from dankagu.core.metadata import metadata
 from dankagu.core.session import set_current_player
 from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import loot_box_pb2
-from dankagu.models.master import MasterLootBoxProduct
 from dankagu.models.player import Player
 from dankagu.models.receipt import PurchaseReceipt
 from dankagu.models.wallet import WalletBalance
@@ -55,26 +55,20 @@ def _request(product_id: str, transaction_id: str, purchase_num: int = 0):
 
 
 async def _seed_master_product(product_id: str, amount: int, resource_type: str | None, lot: int):
-    async with get_sessionmaker()() as session:
-        row = await session.get(MasterLootBoxProduct, product_id)
-        data = {
-            "lootProduct": {
-                "lootBoxProductId": product_id,
-                "totalLotNum": lot,
-                "consumeResourceSets": [
-                    {
-                        "consumeResourceSetId": f"{product_id}_RSet1",
-                        "resourceType": resource_type,
-                        "amount": str(amount),
-                    }
-                ],
-            }
+    data = {
+        "lootProduct": {
+            "lootBoxProductId": product_id,
+            "totalLotNum": lot,
+            "consumeResourceSets": [
+                {
+                    "consumeResourceSetId": f"{product_id}_RSet1",
+                    "resourceType": resource_type,
+                    "amount": str(amount),
+                }
+            ],
         }
-        if row is None:
-            session.add(MasterLootBoxProduct(id=product_id, data=data))
-        else:
-            row.data = data
-        await session.commit()
+    }
+    metadata.register_loot_box_product(product_id, data)
 
 
 async def _wallet(player_id: str) -> tuple[int, int]:

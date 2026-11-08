@@ -27,29 +27,22 @@ class AnnouncementService(announcement_pb2_grpc.AnnouncementServicer):
             return
 
         from google.protobuf import json_format
-        from sqlalchemy import select
 
-        from dankagu.core.database import get_sessionmaker
-        from dankagu.models.master import MasterAnnouncement
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(
-                    select(MasterAnnouncement).where(MasterAnnouncement.enabled.is_(True))
-                )
-                rows = result.scalars().all()
-                resp = announcement_pb2.AnnouncementGetAvailableV1.Response()
-                for r in rows:
-                    ann = resp.announcements.add()
-                    json_format.ParseDict(r.data, ann, ignore_unknown_fields=True)
-                self.cached_announcements = resp
-                logger.info(
-                    "📢 Loaded %d enabled announcements from PostgreSQL",
-                    len(self.cached_announcements.announcements),
-                )
+            available = metadata.get_available_announcements()
+            resp = announcement_pb2.AnnouncementGetAvailableV1.Response()
+            for r in available:
+                ann = resp.announcements.add()
+                json_format.ParseDict(r, ann, ignore_unknown_fields=True)
+            self.cached_announcements = resp
+            logger.info(
+                "📢 Loaded %d enabled announcements from metadata",
+                len(self.cached_announcements.announcements),
+            )
         except Exception as e:
-            logger.error("Failed to load announcements from database: %s", e)
+            logger.error("Failed to load announcements from metadata: %s", e)
 
         if self.cached_announcements is None:
             self.cached_announcements = announcement_pb2.AnnouncementGetAvailableV1.Response()
