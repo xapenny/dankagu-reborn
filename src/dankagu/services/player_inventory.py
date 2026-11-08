@@ -28,7 +28,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
 )
 from dankagu.models.inventory import PlayerInventoryItem
 from dankagu.models.ranking import EventLeaderboard
-from dankagu.models.storage import PlayerStorageEntry
+from dankagu.models.storage import PlayerKeyValue, PlayerStorageEntry
 from dankagu.services.player_storage import batch_upsert_storage_entries
 
 logger = logging.getLogger("dankagu.services.player_inventory")
@@ -720,6 +720,10 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
             free_stones = wallet.free_stones
             paid_stones = wallet.paid_stones
 
+            stmt_pkv = select(PlayerKeyValue).where(PlayerKeyValue.player_id == current_pid)
+            pkv_rows = (await session.execute(stmt_pkv)).scalars().all()
+            pkv_dict = {row.key: row.value for row in pkv_rows}
+
             revision = await StorageRevisionManager.set_revision_and_save(
                 request.next_revision, player_id=current_pid, session=session
             )
@@ -733,6 +737,15 @@ class PlayerInventoryService(player_inventory_pb2_grpc.PlayerInventoryServicer):
         vc_paid = response.wallet.virtual_currencies.add()
         vc_paid.virtual_currency_name = "PAID_STONE"
         vc_paid.amount = paid_stones
+
+        for k, v in pkv_dict.items():
+            pkv_w = response.wallet.player_key_values.add()
+            pkv_w.key = k
+            pkv_w.amount = v
+
+            pkv_r = response.player_key_values.add()
+            pkv_r.key = k
+            pkv_r.amount = v
 
         response.revision = revision
         return response

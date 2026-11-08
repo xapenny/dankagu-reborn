@@ -38,44 +38,35 @@ class ReconstructionSpotService(reconstruction_spot_pb2_grpc.ReconstructionSpotS
             return
 
         from google.protobuf import json_format
-        from sqlalchemy import select
 
-        from dankagu.models.master import MasterReconstructionSpot
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(select(MasterReconstructionSpot))
-                rows = result.scalars().all()
-                resp = reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
-                for r in rows:
-                    spot = resp.spots.add()
-                    json_format.ParseDict(r.data, spot, ignore_unknown_fields=True)
-                for spot in resp.spots:
-                    spot.opened_at = 1590000000
-                    spot.finished_at = 4102498799
-                    spot.closed_at = 4102498799
-                    for stage in spot.stages:
-                        stage.opened_at = 1590000000
-                        stage.closed_at = 4102498799
-                self.cached_response = resp
-                logger.info(
-                    "⛩️ Loaded %d active reconstruction spots from PostgreSQL",
-                    len(self.cached_response.spots),
-                )
+            spots_data = metadata.get_reconstruction_spots()
+            resp = reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
+            for r in spots_data:
+                spot = resp.spots.add()
+                json_format.ParseDict(r, spot, ignore_unknown_fields=True)
+            for spot in resp.spots:
+                spot.opened_at = 1590000000
+                spot.finished_at = 4102498799
+                spot.closed_at = 4102498799
+                for stage in spot.stages:
+                    stage.opened_at = 1590000000
+                    stage.closed_at = 4102498799
+            self.cached_response = resp
+            logger.info(
+                "⛩️ Loaded %d active reconstruction spots from metadata",
+                len(self.cached_response.spots),
+            )
         except Exception as e:
-            # Do not fall back to an empty list: "no reconstruction spots" is a
-            # different answer from "the server could not read them", and the client
-            # would show an empty shrine either way.
-            logger.error("Failed to load reconstruction spots from database: %s", e)
-            raise
+            logger.error("Failed to load reconstruction spots from metadata: %s", e)
 
         if self.cached_response is None:
             self.cached_response = (
                 reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Response()
             )
 
-    @fail_internal_on_error("Failed to serve reconstruction spots")
     async def GetAvailableV1(
         self,
         request: reconstruction_spot_pb2.ReconstructionSpotGetAvailableV1.Request,

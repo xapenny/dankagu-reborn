@@ -1,5 +1,7 @@
 """Takasho OndemandMaster servicer for client boot and asset manifests."""
 
+import logging
+
 import grpc
 
 from dankagu.config import settings
@@ -8,6 +10,8 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     ondemand_master_pb2,
     ondemand_master_pb2_grpc,
 )
+
+logger = logging.getLogger("dankagu.services.ondemand_master")
 
 
 class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
@@ -32,39 +36,37 @@ class OndemandMasterService(ondemand_master_pb2_grpc.OndemandMasterServicer):
 
         import json
 
-        from sqlalchemy import select
-
-        from dankagu.core.database import get_sessionmaker
-        from dankagu.models.master import MasterOndemandEntry
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(select(MasterOndemandEntry))
-                rows = result.scalars().all()
-                for r in rows:
-                    k = r.key
-                    d = dict(r.value)
-                    if k == "Gacha-163":
-                        d["GachaBannerID"] = 165
-                    elif k == "Gacha-167":
-                        d["GachaBannerID"] = 169
-                    elif k == "Gacha-171":
-                        d["GachaBannerID"] = 173
-                    elif k == "Gacha-3":
-                        d["StartDashHours"] = 999999
-                    val_bytes = json.dumps(d, ensure_ascii=False).encode("utf-8")
-                    self._gacha_entries.setdefault(k, []).append(val_bytes)
+            entries = metadata.get_ondemand_entries()
+            for k, raw_v in entries.items():
+                d = dict(raw_v)
+                if k == "Gacha-163":
+                    d["GachaBannerID"] = 165
+                elif k == "Gacha-167":
+                    d["GachaBannerID"] = 169
+                elif k == "Gacha-171":
+                    d["GachaBannerID"] = 173
+                elif k == "Gacha-3":
+                    d["StartDashHours"] = 999999
+                val_bytes = json.dumps(d, ensure_ascii=False).encode("utf-8")
+                self._gacha_entries.setdefault(k, []).append(val_bytes)
 
-                # Add alias keys if client requests them
-                if "Gacha-163" in self._gacha_entries:
-                    self._gacha_entries["Gacha-165"] = self._gacha_entries["Gacha-163"]
-                if "Gacha-167" in self._gacha_entries:
-                    self._gacha_entries["Gacha-169"] = self._gacha_entries["Gacha-167"]
-                if "Gacha-171" in self._gacha_entries:
-                    self._gacha_entries["Gacha-173"] = self._gacha_entries["Gacha-171"]
-        except Exception:
-            pass
+            # Add alias keys if client requests them
+            if "Gacha-163" in self._gacha_entries:
+                self._gacha_entries["Gacha-165"] = self._gacha_entries["Gacha-163"]
+            if "Gacha-167" in self._gacha_entries:
+                self._gacha_entries["Gacha-169"] = self._gacha_entries["Gacha-167"]
+            if "Gacha-171" in self._gacha_entries:
+                self._gacha_entries["Gacha-173"] = self._gacha_entries["Gacha-171"]
+
+            logger.info(
+                "📦 Loaded %d ondemand gacha template entries from metadata",
+                len(self._gacha_entries),
+            )
+        except Exception as e:
+            logger.error("Failed to load ondemand gacha templates from metadata: %s", e)
 
     async def GetEntriesV1(
         self,

@@ -71,6 +71,11 @@ PERSONAL_STORAGE_PREFIXES = (
     "MissionControlStatus--",
     "ShopPurchaseStatusCollection--",
     "ShopNewStatusCollection--",
+    "ShopProductPurchaseHistory--",
+    "PKVSStatus--",
+    "GachaTicketExchangeStatus--",
+    "PlayerKeyValue:",
+    "SelectTicket--",
     "UnlockEntityStatusCollection--",
     "DanmakuPassSeasonStatus-",
     "EventEmblemRankingStatusCollection--",
@@ -499,25 +504,20 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
         if self._templates_loaded:
             return
 
-        from sqlalchemy import select
-
-        from dankagu.models.master import MasterDefaultStorage
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(select(MasterDefaultStorage))
-                rows = result.scalars().all()
-                for r in rows:
-                    if r.key.startswith(PERSONAL_STORAGE_PREFIXES):
-                        continue
-                    self.template_entries[r.key] = r.value
-                logger.info(
-                    "💾 Loaded %d shared storage templates from PostgreSQL",
-                    len(self.template_entries),
-                )
+            default_map = metadata.get_default_storage()
+            for k, val_bytes in default_map.items():
+                if k.startswith(PERSONAL_STORAGE_PREFIXES):
+                    continue
+                self.template_entries[k] = val_bytes
+            logger.info(
+                "💾 Loaded %d shared storage templates from metadata",
+                len(self.template_entries),
+            )
         except Exception as e:
-            logger.error("Failed to load default storage templates from database: %s", e)
+            logger.error("Failed to load default storage templates from metadata: %s", e)
 
         # Baseline entries used when no operator-supplied template covers them
         self.template_entries.setdefault(

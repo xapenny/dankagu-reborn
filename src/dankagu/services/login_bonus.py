@@ -25,39 +25,29 @@ class LoginBonusService(login_bonus_pb2_grpc.LoginBonusServicer):
             return
 
         from google.protobuf import json_format
-        from sqlalchemy import select
 
-        from dankagu.core.database import get_sessionmaker
-        from dankagu.models.master import MasterSystemTemplate
+        from dankagu.core.metadata import metadata
 
         try:
-            session_factory = get_sessionmaker()
-            async with session_factory() as session:
-                result = await session.execute(
-                    select(MasterSystemTemplate).where(MasterSystemTemplate.key == "login_bonus")
-                )
-                tmpl = result.scalar_one_or_none()
-                if tmpl and tmpl.data:
-                    if "available" in tmpl.data:
-                        self.available_response = (
-                            login_bonus_pb2.LoginBonusGetAvailableV1.Response()
-                        )
-                        json_format.ParseDict(
-                            tmpl.data["available"],
-                            self.available_response,
-                            ignore_unknown_fields=True,
-                        )
-                    if "countup" in tmpl.data:
-                        self.countup_response = (
-                            login_bonus_pb2.LoginBonusCountUpProgressV1.Response()
-                        )
-                        json_format.ParseDict(
-                            tmpl.data["countup"],
-                            self.countup_response,
-                            ignore_unknown_fields=True,
-                        )
+            tmpl_data = metadata.get_login_bonus_template()
+            if tmpl_data:
+                if "available" in tmpl_data:
+                    self.available_response = login_bonus_pb2.LoginBonusGetAvailableV1.Response()
+                    json_format.ParseDict(
+                        tmpl_data["available"],
+                        self.available_response,
+                        ignore_unknown_fields=True,
+                    )
+                if "countup" in tmpl_data:
+                    self.countup_response = login_bonus_pb2.LoginBonusCountUpProgressV1.Response()
+                    json_format.ParseDict(
+                        tmpl_data["countup"],
+                        self.countup_response,
+                        ignore_unknown_fields=True,
+                    )
+                logger.info("🎁 Loaded login bonus templates from metadata")
         except Exception as e:
-            logger.error("Failed to load login bonus template from database: %s", e)
+            logger.error("Failed to load login bonus templates from metadata: %s", e)
 
     async def GetAvailableLoginBonusV1(
         self,

@@ -828,22 +828,13 @@ async def _product_catalogue(db: AsyncSession, store: str) -> list[dict[str, Any
     if cached is not None:
         return cached
 
-    from dankagu.models.master import MasterGameProduct
-
-    result = await db.execute(
-        select(MasterGameProduct.id, MasterGameProduct.data).where(
-            MasterGameProduct.id.like("ShopProduct%")
-        )
-    )
-    rows = result.all()
+    from dankagu.core.metadata import metadata
 
     products: list[dict[str, Any]] = []
-    for product_id, raw in rows:
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-        except Exception:
-            data = {}
-        products.append(_store_product_entity(product_id, data, store))
+    for raw in metadata.get_game_products():
+        product_id = str(raw.get("game_product_id") or raw.get("id", ""))
+        if product_id.startswith("ShopProduct"):
+            products.append(_store_product_entity(product_id, raw, store))
     _product_cache[store] = products
     logger.info("🛒 [IAP] built the catalogue: %d product(s) for store=%s", len(products), store)
     return products

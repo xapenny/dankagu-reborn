@@ -87,17 +87,13 @@ async def create_all_tables() -> None:
 
 
 async def seed_runtime_data() -> None:
-    """Populate master/gacha rows when their tables are empty (idempotent) and warm caches."""
-    from dankagu.core.gacha_seed import seed_gacha_data_if_empty
-    from dankagu.core.master_seed import seed_master_data_if_empty
+    """Warm in-memory metadata caches and initialize revision manager."""
+    from dankagu.core.metadata import metadata
     from dankagu.core.storage_state import StorageRevisionManager
-    from dankagu.services.loot_box import ensure_gacha_cache_loaded
+    from dankagu.services.loot_box import load_gacha_cache_from_db
 
-    session_factory = get_sessionmaker()
-    async with session_factory() as session:
-        await seed_gacha_data_if_empty(session)
-        await seed_master_data_if_empty(session)
-        await ensure_gacha_cache_loaded(session)
+    metadata.load_all()
+    await load_gacha_cache_from_db()
     await StorageRevisionManager.initialize()
 
 
