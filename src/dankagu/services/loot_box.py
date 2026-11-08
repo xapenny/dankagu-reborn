@@ -36,6 +36,15 @@ logger = logging.getLogger("dankagu.services.loot_box")
 # Fallback gacha IDs if database cache has not yet initialized
 VALID_GACHA_IDS = {1, 3, 159, 160, 161, 163, 167, 171, 4087, 80001}
 
+GACHA_EXCHANGE_TICKETS = {
+    159: {"id": 159, "pkvs": "selectTicket_159", "shop_id": 50006},
+    160: {"id": 160, "pkvs": "selectTicket_160", "shop_id": 50007},
+    161: {"id": 161, "pkvs": "selectTicket_161", "shop_id": 50008},
+    163: {"id": 163, "pkvs": "selectTicket_163", "shop_id": 50003},
+    167: {"id": 167, "pkvs": "selectTicket_167", "shop_id": 50004},
+    171: {"id": 171, "pkvs": "selectTicket_171", "shop_id": 50005},
+}
+
 # Card handed out when the database holds no gacha rows at all (fresh install / CI),
 # so that a purchase can never fail on an empty candidate pool.
 STARTER_CARD_ID = 100001
@@ -314,10 +323,9 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
         pid = request.loot_box_product_id
         parts = pid.split("_")
         gacha_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 159
-        is_ten_pull = "_10_" in pid or request.purchase_num == 10
-        pull_count = (
-            request.purchase_num if request.purchase_num > 0 else (10 if is_ten_pull else 1)
-        )
+        quantity = max(1, request.purchase_num) if request.purchase_num > 0 else 1
+        is_ten_pull = "_10_" in pid or quantity >= 10
+        pull_count = 10 if (is_ten_pull and "_10_" in pid) else quantity
         is_pt = (
             "_PT_" in pid
             or request.resource_type == loot_box_pb2.LootBoxV3PurchaseV1.Request.PLAYER_KEY_VALUE
@@ -340,12 +348,19 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             # default gacha id 159 is not a product that exists at all.
             master_price = await _master_price(session, pid)
             if master_price is not None:
-                pull_count = master_price.pull_count or pull_count
+                base_pulls = master_price.pull_count or (10 if is_ten_pull else 1)
+                pull_count = base_pulls * quantity
+                is_ten_pull = "_10_" in pid or pull_count >= 10
                 if master_price.stone_cost:
-                    stone_cost, point_cost, is_vc, is_pt = master_price.stone_cost, 0, True, False
+                    stone_cost = master_price.stone_cost * quantity
+                    point_cost, is_vc, is_pt = 0, True, False
                 elif master_price.point_cost:
-                    stone_cost, point_cost, is_vc, is_pt = 0, master_price.point_cost, False, True
+                    stone_cost = 0
+                    is_vc, is_pt = False, True
+                    point_cost = master_price.point_cost * quantity
                 else:
+                    stone_cost = stone_cost * quantity
+                    point_cost = point_cost * quantity
                     # Master describes a ticket/key consumption here, not a price
                     # (``G_1_10_TT_L`` consumes the ``tutorial`` key with amount -1).
                     # Charging nothing would hand out free ten-pulls, so keep the
@@ -365,6 +380,16 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                     pid,
                 )
 
+            if is_pt:
+                if quantity > 1 or is_ten_pull or "_10_" in pid:
+                    pull_count = 10
+                    point_cost = 50
+                    is_ten_pull = True
+                else:
+                    pull_count = 1
+                    point_cost = 5
+                    is_ten_pull = False
+
             logger.info(
                 "🎁 [LootBox] PurchaseV1 player=%s product=%s (gacha=%d, count=%d, "
                 "stone_cost=%d, pt_cost=%d, tx=%s)",
@@ -383,6 +408,8 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             transaction_id = (request.transaction_id or "").strip()
             replayed = False
             drawn_cards: list[int] = []
+            ticket_key: str | None = None
+            ticket_amount: int | None = None
             if transaction_id:
                 inserted = await session.execute(
                     pg_insert(PurchaseReceipt)
@@ -455,6 +482,26 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                         session, current_pid, "point", default=8612
                     )
 
+                if is_pt and point_remaining is not None:
+                    from dankagu.services.box_loot_box import encode_raw_protobuf
+                    from dankagu.services.player_storage import _upsert_entry
+
+                    pkvs_bytes = encode_raw_protobuf(
+                        {
+                            1: [(0, 60001)],
+                            2: [(0, now)],
+                            3: [(0, max(point_remaining, 99999))],
+                        }
+                    )
+                    await _upsert_entry(session, current_pid, "PKVSStatus--60001", pkvs_bytes, now)
+                    await _upsert_entry(
+                        session,
+                        current_pid,
+                        "PlayerKeyValue:point",
+                        str(point_remaining).encode("utf-8"),
+                        now,
+                    )
+
                 banner = await session.get(GachaBanner, gacha_id)
                 has_guaranteed_ssr = (
                     (banner.guaranteed_ssr if banner else False)
@@ -487,6 +534,50 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
                             PurchaseReceipt.transaction_id == transaction_id,
                         )
                         .values(card_ids=json.dumps(drawn_cards))
+                    )
+
+                if not replayed and gacha_id in GACHA_EXCHANGE_TICKETS and (is_ten_pull or pull_count == 10):
+                    from dankagu.models.storage import PlayerKeyValue
+                    from dankagu.services.box_loot_box import encode_raw_protobuf
+                    from dankagu.services.player_storage import _upsert_entry
+
+                    t_info = GACHA_EXCHANGE_TICKETS[gacha_id]
+                    ticket_key = t_info["pkvs"]
+                    pkv_stmt = pg_insert(PlayerKeyValue).values(
+                        player_id=current_pid,
+                        key=ticket_key,
+                        value=1,
+                        expired_at=4102412400,
+                        updated_at=now,
+                    )
+                    pkv_stmt = pkv_stmt.on_conflict_do_update(
+                        index_elements=[PlayerKeyValue.player_id, PlayerKeyValue.key],
+                        set_={"value": PlayerKeyValue.value + 1, "updated_at": now},
+                    ).returning(PlayerKeyValue.value)
+                    res_pkv = await session.execute(pkv_stmt)
+                    row_pkv = res_pkv.first()
+                    ticket_amount = row_pkv[0] if row_pkv else 1
+
+                    await _upsert_entry(
+                        session,
+                        current_pid,
+                        f"PlayerKeyValue:{ticket_key}",
+                        str(ticket_amount).encode("utf-8"),
+                        now,
+                    )
+                    ticket_proto = encode_raw_protobuf(
+                        {
+                            1: [(0, gacha_id)],
+                            2: [(0, gacha_id)],
+                            3: [(0, ticket_amount)],
+                        }
+                    )
+                    await _upsert_entry(
+                        session,
+                        current_pid,
+                        f"GachaTicketExchangeStatus--{gacha_id}",
+                        ticket_proto,
+                        now,
                     )
 
             await session.commit()
@@ -523,7 +614,7 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             inv.schema_key = "ITEM"
             inv.value = item_payload
             inv.route = 3  # Route.LootBox
-            inv.message = "夢見くじで獲得した商品です"
+            inv.message = "ポイント夢見くじで取得した商品です" if is_pt else "夢見くじで獲得した商品です"
             inv.search_label = "Card"
             inv.opened_at = now
             inv.expired_at = 4102498799
@@ -575,6 +666,11 @@ class LootBoxService(loot_box_pb2_grpc.LootBoxV3Servicer):
             pkv = response.wallet.player_key_values.add()
             pkv.key = "point"
             pkv.amount = point_remaining
+
+        if ticket_key and ticket_amount is not None:
+            pkv_t = response.wallet.player_key_values.add()
+            pkv_t.key = ticket_key
+            pkv_t.amount = ticket_amount
 
         return response
 

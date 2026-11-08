@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import grpc
+from sqlalchemy import select
 
 from dankagu.core.database import get_sessionmaker
 from dankagu.core.economy import get_or_create_wallet, get_player_key_value
@@ -13,6 +14,7 @@ from dankagu.grpc.generated.takasho.schema.common_featureset.player_api import (
     wallet_pb2,
     wallet_pb2_grpc,
 )
+from dankagu.models.storage import PlayerKeyValue
 
 logger = logging.getLogger("dankagu.services.wallet")
 
@@ -68,6 +70,11 @@ class WalletService(wallet_pb2_grpc.WalletServicer):
         async with session_factory() as session:
             wallet = await get_or_create_wallet(session, player_id)
             point_amount = await get_player_key_value(session, player_id, "point", default=8612)
+
+            stmt = select(PlayerKeyValue).where(PlayerKeyValue.player_id == player_id)
+            pkv_rows = (await session.execute(stmt)).scalars().all()
+            db_pkvs = {row.key: row.value for row in pkv_rows}
+            db_pkvs["point"] = point_amount
             await session.commit()
             free_amount = wallet.free_stones
             paid_amount = wallet.paid_stones
@@ -92,16 +99,17 @@ class WalletService(wallet_pb2_grpc.WalletServicer):
             vc2.virtual_currency_name = "PAID_STONE"
             vc2.amount = paid_amount
 
-        found_point = False
+        seen_keys = set()
         for pkv in response_total.player_key_values:
-            if pkv.key == "point":
-                pkv.amount = point_amount
-                found_point = True
-                break
-        if not found_point:
-            pkv = response_total.player_key_values.add()
-            pkv.key = "point"
-            pkv.amount = point_amount
+            if pkv.key in db_pkvs:
+                pkv.amount = db_pkvs[pkv.key]
+                seen_keys.add(pkv.key)
+
+        for key, amount in db_pkvs.items():
+            if key not in seen_keys:
+                pkv = response_total.player_key_values.add()
+                pkv.key = key
+                pkv.amount = amount
 
     async def GetBalancesV2(
         self,
