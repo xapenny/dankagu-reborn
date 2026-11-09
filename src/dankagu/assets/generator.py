@@ -177,14 +177,14 @@ def generate_all_manifest_assets(force: bool = True) -> dict[str, Path]:
         {
             "category": "4",
             "salt": 2858,
-            "hash_path": "4/40/3760-2-09c0a174a12a74e8861fbd674e5015f99839871c",
+            "hash_path": "4/40/3760-2-6e317ef0a64306e6a64ee90c4c1f669ccbfbfbbd",
             "name": "arg_m_db_r_00003760",
         },
         # DB (Category 1 - alternate hash path)
         {
             "category": "4",
             "salt": 2858,
-            "hash_path": "4/40/3760-2-6e317ef0a64306e6a64ee90c4c1f669ccbfbfbbd",
+            "hash_path": "4/40/3760-2-09c0a174a12a74e8861fbd674e5015f99839871c",
             "name": "arg_m_db_r_00003760_alt",
         },
         # Common Main (Category 2)
