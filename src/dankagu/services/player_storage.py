@@ -1030,22 +1030,22 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
             )
             pb_row = next((r for r in rows_to_upsert if r["key"] == "PlayerBase--1"), None)
 
+            has_event_info = any(r["key"].startswith("EventInfoStatus") for r in rows_to_upsert)
             rankings_for_pb: dict[int, int] = {}
             if coll_row and coll_row["value"]:
                 rankings_for_pb.update(parse_event_emblem_rankings(coll_row["value"]))
+            elif (pb_row and pb_row["value"]) or has_event_info:
+                r_blob = (
+                    await session.execute(
+                        select(PlayerStorageEntry.value).where(
+                            PlayerStorageEntry.player_id == current_pid,
+                            PlayerStorageEntry.key == "EventEmblemRankingStatusCollection--1",
+                        )
+                    )
+                ).scalar_one_or_none()
+                rankings_for_pb.update(parse_event_emblem_rankings(r_blob))
 
             if pb_row and pb_row["value"]:
-                if not rankings_for_pb:
-                    r_blob = (
-                        await session.execute(
-                            select(PlayerStorageEntry.value).where(
-                                PlayerStorageEntry.player_id == current_pid,
-                                PlayerStorageEntry.key == "EventEmblemRankingStatusCollection--1",
-                            )
-                        )
-                    ).scalar_one_or_none()
-                    rankings_for_pb.update(parse_event_emblem_rankings(r_blob))
-
                 if rankings_for_pb:
                     new_pb, pb_changed = update_player_base_emblem_intvals(
                         pb_row["value"], rankings_for_pb

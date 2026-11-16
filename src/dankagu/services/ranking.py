@@ -106,8 +106,9 @@ class RankingService(ranking_pb2_grpc.RankingServicer):
             granted = await check_and_grant_event_ranking_milestones(
                 session, player_id, request.ranking_event_id, rank
             )
-            if granted > 0:
+            if granted > 0 or session.new or session.dirty:
                 await session.commit()
+            if granted > 0:
                 logger.info(
                     "🎁 [Ranking] Granted %d milestone reward(s) to %s (rank %d in %s)",
                     granted,
@@ -163,8 +164,9 @@ class RankingService(ranking_pb2_grpc.RankingServicer):
                 granted = await check_and_grant_event_ranking_milestones(
                     session, player_id, request.ranking_event_id, rank
                 )
-                if granted > 0:
+                if granted > 0 or session.new or session.dirty:
                     await session.commit()
+                if granted > 0:
                     logger.info(
                         "🎁 [Ranking] GetMyRankV1 granted %d milestone reward(s) to %s (rank %d)",
                         granted,
