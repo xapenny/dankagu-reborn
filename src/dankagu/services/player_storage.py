@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dankagu.core.database import get_sessionmaker
+from dankagu.core.milestone_emblems import evaluate_milestone_emblems
 from dankagu.core.ranking_rewards import (
     check_and_grant_event_ranking_milestones,
     check_and_grant_gpx_milestones_for_player,
@@ -292,50 +293,22 @@ def update_player_base_emblem_intvals(
     return blob, False
 
 
-async def check_and_grant_heroine_milestones(
+async def check_and_grant_milestone_emblems(
     session: AsyncSession, player_id: str, entries: Any, now: int
 ) -> PlayerStorageEntry | None:
-    """Auto-grant heroine milestone titles (Lv 50: 1000000+cid, Lv 100: 1100000+cid).
+    """Auto-grant milestone and performance titles.
 
-    Ensures UnlockEntityStatusCollection--8 contains the unlocked titles.
-    Titles are NOT queued to player_inventories because titles have MaxCount=1 and
-    the client's EmblemProxy.CheckFully checks haveCount + addCount > 1, which blocks
-    claiming if already unlocked.
+    Evaluates Danmaku Rate, Ura Kagura Lunatic clears/FC/AB, character levels,
+    expeditions, and spot reconstructions. Ensures UnlockEntityStatusCollection--8
+    contains all unlocked titles.
     """
-    emblems_to_grant: set[int] = set()
+    emblems_to_grant = evaluate_milestone_emblems(entries)
     has_unlock_8_in_entries = False
 
     for entry in entries:
-        k = entry.key
-        v = entry.value
-        if not v:
-            continue
-        if k == "UnlockEntityStatusCollection--8":
+        if getattr(entry, "key", None) == "UnlockEntityStatusCollection--8":
             has_unlock_8_in_entries = True
-        elif k.startswith("HeroineStatus--"):
-            try:
-                fields = parse_raw_protobuf(v)
-                chara_id = fields.get(2, [(0, 0)])[0][1]
-                exp = fields.get(8, [(0, 0)])[0][1]
-                if chara_id > 0:
-                    if exp >= 49:
-                        emblems_to_grant.add(1000000 + chara_id)
-                    if exp >= 99:
-                        emblems_to_grant.add(1100000 + chara_id)
-            except Exception as e:
-                logger.debug("Failed parsing HeroineStatus: %s", e)
-        elif k.startswith("CharacterStatus--"):
-            try:
-                fields = parse_raw_protobuf(v)
-                chara_id = fields.get(1, [(0, 0)])[0][1]
-                exp = fields.get(4, [(0, 0)])[0][1]
-                if chara_id > 0:
-                    if exp >= 49:
-                        emblems_to_grant.add(1000000 + chara_id)
-                    if exp >= 99:
-                        emblems_to_grant.add(1100000 + chara_id)
-            except Exception as e:
-                logger.debug("Failed parsing CharacterStatus: %s", e)
+            break
 
     if not emblems_to_grant:
         return None
@@ -366,6 +339,9 @@ async def check_and_grant_heroine_milestones(
             return new_u8
 
     return None
+
+
+check_and_grant_heroine_milestones = check_and_grant_milestone_emblems
 
 
 def sanitize_gpx_info_status(raw_bytes: bytes) -> tuple[bytes, dict[int, int]]:
@@ -648,6 +624,66 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 db_entry_map = {e.key: e for e in db_entries}
 
                 now = int(time.time())
+                needs_unlock_8 = any(
+                    c.key.startswith("UnlockEntityStatusCollection--")
+                    or (
+                        c.matching_type == Criterion.MatchingType.EXACT
+                        and c.key == "UnlockEntityStatusCollection--8"
+                    )
+                    for c in criteria_list
+                )
+
+                if needs_unlock_8:
+                    u_key = "UnlockEntityStatusCollection--8"
+                    u_entry = db_entry_map.get(u_key)
+                    if not u_entry:
+                        u_res = await session.execute(
+                            select(PlayerStorageEntry).where(
+                                PlayerStorageEntry.player_id == current_pid,
+                                PlayerStorageEntry.key == u_key,
+                            )
+                        )
+                        u_entry = u_res.scalar_one_or_none()
+
+                    from dankagu.core.ranking_rewards import extract_unlocked_emblem_ids
+
+                    existing_eids = extract_unlocked_emblem_ids(u_entry.value if u_entry else None)
+
+                    cond_stmt = select(PlayerStorageEntry.key, PlayerStorageEntry.value).where(
+                        PlayerStorageEntry.player_id == current_pid,
+                        or_(
+                            PlayerStorageEntry.key == "PlayerPublicStatus--1",
+                            PlayerStorageEntry.key.like("PlayMusicRecord--%"),
+                            PlayerStorageEntry.key.like("HeroineStatus--%"),
+                            PlayerStorageEntry.key.like("CharacterStatus--%"),
+                            PlayerStorageEntry.key.like("SpotStatus--%"),
+                            PlayerStorageEntry.key.like(
+                                "ExpeditionMissionRecordEntityCollecttion--%"
+                            ),
+                        ),
+                    )
+                    cond_rows = (await session.execute(cond_stmt)).all()
+                    earned_eids = evaluate_milestone_emblems(cond_rows)
+                    missing_eids = earned_eids - existing_eids
+
+                    if missing_eids:
+                        curr_val = u_entry.value if u_entry else None
+                        updated_val = add_emblems_to_collection(curr_val, list(missing_eids), now)
+                        if u_entry:
+                            u_entry.value = updated_val
+                            u_entry.updated_at = now
+                        else:
+                            u_entry = PlayerStorageEntry(
+                                player_id=current_pid,
+                                key=u_key,
+                                value=updated_val,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                            session.add(u_entry)
+                        await session.commit()
+                        db_entry_map[u_key] = u_entry
+
                 needs_emblem_rankings = any(
                     c.key.startswith("EventEmblemRankingStatusCollection--")
                     or (
@@ -1033,6 +1069,30 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                         pb_db.value = new_pb
                         pb_db.updated_at = now
 
+            # Union-merge existing DB & newly earned emblems if client uploaded UnlockEntityStatusCollection--8
+            u8_row = next(
+                (r for r in rows_to_upsert if r["key"] == "UnlockEntityStatusCollection--8"),
+                None,
+            )
+            if u8_row and u8_row["value"]:
+                from dankagu.core.ranking_rewards import extract_unlocked_emblem_ids
+
+                db_u8_val = (
+                    await session.execute(
+                        select(PlayerStorageEntry.value).where(
+                            PlayerStorageEntry.player_id == current_pid,
+                            PlayerStorageEntry.key == "UnlockEntityStatusCollection--8",
+                        )
+                    )
+                ).scalar_one_or_none()
+                merge_ids = extract_unlocked_emblem_ids(db_u8_val) | evaluate_milestone_emblems(
+                    request.entries
+                )
+                if merge_ids:
+                    u8_row["value"] = add_emblems_to_collection(
+                        u8_row["value"], list(merge_ids), now
+                    )
+
             if rows_to_upsert:
                 await batch_upsert_storage_entries(session, rows_to_upsert)
 
@@ -1064,7 +1124,7 @@ class PlayerStorageService(player_storage_pb2_grpc.PlayerStorageServicer):
                 )
                 await session.execute(mat_stmt)
 
-            # Auto-grant heroine & character milestone titles (Lv 50 / Lv 100)
+            # Auto-grant milestone and performance titles (Rate, Lunatic AB/FC, Lv 50/100, etc.)
             u8_entry = await check_and_grant_heroine_milestones(
                 session, current_pid, request.entries, now
             )
